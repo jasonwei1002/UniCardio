@@ -131,7 +131,8 @@ class diff_CSDI(nn.Module):
                     channels=self.channels,
                     diffusion_embedding_dim=config["diffusion_embedding_dim"],
                     nheads=config["nheads"],
-                    device = device,
+                    device=device,
+                    length=length,
                 )
                 for _ in range(config["layers"])
             ]
@@ -223,7 +224,7 @@ class diff_CSDI(nn.Module):
     
     
 class ResidualBlock(nn.Module):
-    def __init__(self, channels, diffusion_embedding_dim, nheads, device):
+    def __init__(self, channels, diffusion_embedding_dim, nheads, device, length):
         super().__init__()
         self.diffusion_projection = nn.Linear(diffusion_embedding_dim, channels).to(device)
         self.cond_projection = Conv1d_with_init(channels, 2 * channels, 1).to(device)
@@ -231,36 +232,35 @@ class ResidualBlock(nn.Module):
         self.output_projection = Conv1d_with_init(channels, 2 * channels, 1).to(device)
 
         self.time_layer = get_torch_trans(heads=nheads, layers=1, channels=channels).to(device)
-        self.feature_layer = get_torch_trans(heads=nheads, layers=1, channels=channels).to(device)
         self.device = device
 
+        pe = self._build_time_embedding(pos=length, d_model=channels)
+        self.register_buffer('pe', pe)
+
+    def _build_time_embedding(self, pos, d_model):
+        pe = torch.zeros(pos, d_model)
+        position = torch.arange(pos).unsqueeze(1)
+        div_term = 1 / torch.pow(10000.0, torch.arange(0, d_model, 2).float() / d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe
 
     def forward_time(self, y, base_shape, mask):
         B, channel, L = base_shape
         y = self.time_layer(y.permute(2, 0, 1), mask = mask).permute(1, 2, 0)
         y = y.reshape(B, channel, L).reshape(B, channel, L)
         return y
-    
-    def time_embedding(self, pos, d_model=128):
-        pe = torch.zeros(pos, d_model)
-        position = torch.arange(pos).unsqueeze(1)  # Shape: [pos, 1]
-        div_term = 1 / torch.pow(10000.0, torch.arange(0, d_model, 2).float() / d_model)  # Shape: [d_model // 2]
 
-        pe[:, 0::2] = torch.sin(position * div_term)  # Broadcasting to [pos, d_model // 2]
-        pe[:, 1::2] = torch.cos(position * div_term)  # Broadcasting to [pos, d_model // 2]
-
-        return pe
     def forward(self, x, diffusion_emb, mask):
         B, channel, L = x.shape
         base_shape = x.shape
         diffusion_emb = self.diffusion_projection(diffusion_emb).unsqueeze(-1)  # (B,channel,1)
-        
+
         y = x + diffusion_emb
         y = self.forward_time(y, base_shape, mask.to(self.device)) # (B, Channel, L)
         y = self.mid_projection(y)  # (B,2*channel,L)
-        
-        time_embed = self.time_embedding(pos = L, d_model = channel).to(self.device) #(B,L,channel)
-        time_embed = time_embed.unsqueeze(0).repeat(B, 1, 1).permute(0,2,1)  # Shape: [B, 2, 3]
+
+        time_embed = self.pe.unsqueeze(0).expand(B, -1, -1).permute(0, 2, 1)  # (B,channel,L)
         time_info = self.cond_projection(time_embed)  # (B,2*channel,L)
         y = y + time_info
 

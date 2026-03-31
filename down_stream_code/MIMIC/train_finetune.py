@@ -278,6 +278,8 @@ test_loader = DataLoader(test_dataset, batch_size = 1024, shuffle = True)
 batch = next(iter(train_loader))
 Model = CSDI_base(config, device, L = 500*4).to(device)
 Model = torch.nn.DataParallel(Model).to(device)
-Model.load_state_dict(torch.load("no_compress799.pth"))
+ckpt = torch.load("no_compress799.pth")
+ckpt = {k.removeprefix('module.'): v for k, v in ckpt.items() if 'feature_layer' not in k}
+Model.module.load_state_dict(ckpt, strict=False)
 
 train(Model,config['train'],train_loader,valid_loader=val_loader,valid_epoch_interval=10)

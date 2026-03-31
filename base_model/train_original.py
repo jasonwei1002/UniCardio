@@ -14,7 +14,7 @@ import yaml
 from diffusion_model_no_compress_final import diff_CSDI, CSDI_base
 from utils_together_original import train
 from self_process import imputation_pattern, AddNoise
-os.CUDA_VISIBLE_DEVICES = '1,2,3,4,5,6,7' # Number of GPUs to use, you can change this based on your setup
+os.CUDA_VISIBLE_DEVICES = '1' # Number of GPUs to use, you can change this based on your setup
 device = torch.device("cuda")
 signal = np.load('Final_sig_combined.npy')
 print(signal.shape)

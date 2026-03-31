@@ -13,16 +13,18 @@ import yaml
 import sys
 from diffusion_model_no_compress_final import CSDI_base
 import matplotlib.pyplot as plt
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1, 2, 3,5,6,7'
 device = torch.device("cuda")
-file_path = 'base_no_compress_original.yaml'
+file_path = '/home/lyj/wcn-project/UniCardio/base_model/base_no_compress_original.yaml'
 with open(file_path, 'r') as file:
     config = yaml.safe_load(file)
 
-batch = torch.load('batch.pth')
+batch = torch.load('/home/lyj/wcn-project/UniCardio/base_model/batch.pth')
 Model = CSDI_base(config, device, L = 500*4).to(device)
 Model = torch.nn.DataParallel(Model).to(device)
-Model.load_state_dict(torch.load("no_compress799.pth"))
+ckpt = torch.load("/home/lyj/wcn-project/UniCardio/base_model/no_compress799.pth")
+ckpt = {k.removeprefix('module.'): v for k, v in ckpt.items() if 'feature_layer' not in k}
+Model.module.load_state_dict(ckpt, strict=False)
 
 
 ################################################
@@ -87,9 +89,9 @@ Model.eval()
 batch0 = batch[0][:,0,None,:]
 t = time.time()
 with torch.no_grad():
-    results = Model(batch0.to(device), n_samples = 50, model_flag = '02', borrow_mode = 2, DDIM_flag = 0, sample_steps = 6, train_gen_flag = 1)
-median_results = (results[0].median(dim = 1).values.detach().cpu().numpy()[:,0,:])
-mean_results = (results[0].mean(dim = 1).detach().cpu().numpy()[:,0,:])
+    results, _ = Model(batch0.to(device), n_samples = 50, model_flag = '02', borrow_mode = 2, DDIM_flag = 1, sample_steps = 6, train_gen_flag = 1)
+median_results = (results.median(dim = 1).values.detach().cpu().numpy()[:,0,:])
+mean_results = (results.mean(dim = 1).detach().cpu().numpy()[:,0,:])
 truth = (batch[0][:,0,1000:1500].detach().cpu().numpy())
 
 # mask = batch[3]

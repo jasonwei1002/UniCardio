@@ -88,9 +88,6 @@ mkl-service==2.4.0
 mkl_fft @ file:///croot/mkl_fft_1725370245198/work
 mkl_random @ file:///croot/mkl_random_1725370241878/work
 ml-dtypes==0.4.1
-mmcv==2.2.0
-mmcv-full==1.7.2
-mmengine==0.7.4
 model-index==0.1.11
 moviepy @ git+https://github.com/Zulko/moviepy.git@0f6f6d4d9b96c69d109975549fe6293931f1a19d
 mpmath @ file:///croot/mpmath_1690848262763/work
@@ -130,7 +127,6 @@ nvidia-nvtx-cu12==12.1.105
 omegaconf==2.3.0
 opencv-python==4.10.0.84
 opendatalab==0.0.10
-openmim==0.3.9
 openxlab==0.1.2
 opt_einsum==3.4.0
 optree==0.13.0
