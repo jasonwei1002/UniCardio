@@ -1,0 +1,4 @@
+# Euler ODE sampler configuration.
+
+n_steps: 8
+n_samples: 50

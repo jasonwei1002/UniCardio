@@ -7,6 +7,7 @@ from .rectified_flow import (
     sample_t_logit_normal,
 )
 from .sampler import euler_sample
+from .trainer import train
 
 __all__ = [
     "SimpleCSVLogger",
@@ -14,4 +15,5 @@ __all__ = [
     "euler_sample",
     "rf_train_step",
     "sample_t_logit_normal",
+    "train",
 ]

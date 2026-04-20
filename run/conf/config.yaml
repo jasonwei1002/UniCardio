@@ -1,0 +1,26 @@
+# UniCardio Rectified Flow main configuration
+#
+# Hydra composes this with data/default, model/unicardio_rf, trainer/default,
+# sampler/euler8. Override any value from the CLI, e.g.
+#   python run/pipeline/train.py trainer.epochs=10 device=cpu
+
+defaults:
+  - data: default
+  - model: unicardio_rf
+  - trainer: default
+  - sampler: euler8
+  - _self_
+
+seed: 42
+device: cuda
+deterministic: false
+output_dir: ${hydra:runtime.output_dir}
+
+hydra:
+  run:
+    dir: run/outputs/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: run/outputs/sweep_${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}
+  job:
+    chdir: false

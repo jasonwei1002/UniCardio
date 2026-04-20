@@ -1,0 +1,22 @@
+# Dataset configuration.
+#
+# Data loader applies a one-time channel permute [2, 0, 1] (PPG/BP/ECG ->
+# ECG/PPG/ABP) plus BP normalization (x - 100) / 50 on model slot 2.
+
+data_path: ${oc.env:UNICARDIO_DATA,/Volumes/Disk/projects/UniCardio/data/Final_sig_combined.npy}
+slot_length: 500
+
+# Matches the original random split (random_state=42): 20k val, 20k test,
+# remainder for training.
+val_size: 20000
+test_size: 20000
+split_seed: 42
+
+batch_size: 128
+num_workers: 8
+pin_memory: true
+
+# BP normalization constants (kept here so evaluation can denormalize without
+# touching code).
+bp_offset: 100.0
+bp_scale: 50.0
