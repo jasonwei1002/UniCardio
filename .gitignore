@@ -1,4 +1,38 @@
+# Model checkpoints & data
 *.pth
 *.npy
 *.pt
-CLAUDE.md
+*.mat
+*.h5
+*.hdf5
+
+# Training outputs
+base_model/check/
+base_model/train*.log
+run/outputs/
+outputs/
+
+# Pytest
+.pytest_cache/
+
+# Large data directories
+PulseDB/*
+down_stream_code/AF/*.mat
+down_stream_code/BP/*.mat
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
