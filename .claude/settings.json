@@ -1,0 +1,47 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 base_model/train_original.py*)",
+      "Bash(python3 base_model/test_final.py*)",
+      "Bash(python3 base_model/self_process.py*)"
+    ],
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(rm base_model/check/*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PROJECT_DIR}/.claude/hooks/scripts/hooks.py",
+            "timeout": 5000,
+            "async": true,
+            "once": true,
+            "statusMessage": "Loading training status..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PROJECT_DIR}/.claude/hooks/scripts/hooks.py",
+            "timeout": 3000,
+            "async": true,
+            "statusMessage": "Checking model integrity..."
+          }
+        ]
+      }
+    ]
+  },
+  "plansDirectory": "./reports",
+  "statusLine": {
+    "type": "command",
+    "command": "bash /data2/wcn/UniCardio/glm-usage.sh"
+  }
+}

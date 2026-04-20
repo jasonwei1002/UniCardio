@@ -1,4 +1,4 @@
-"""Regression metrics for multimodal signal reconstruction."""
+"""面向多模态信号重建的回归指标。"""
 
 from __future__ import annotations
 
@@ -14,13 +14,13 @@ def _to_numpy(x: Tensor | np.ndarray) -> np.ndarray:
 
 
 def rmse(pred: Tensor | np.ndarray, target: Tensor | np.ndarray) -> float:
-    """Root-mean-squared error over all elements."""
+    """对所有元素求均方根误差。"""
     p, t = _to_numpy(pred), _to_numpy(target)
     return float(np.sqrt(np.mean((p - t) ** 2)))
 
 
 def mae(pred: Tensor | np.ndarray, target: Tensor | np.ndarray) -> float:
-    """Mean absolute error over all elements."""
+    """对所有元素求平均绝对误差。"""
     p, t = _to_numpy(pred), _to_numpy(target)
     return float(np.mean(np.abs(p - t)))
 
@@ -28,7 +28,7 @@ def mae(pred: Tensor | np.ndarray, target: Tensor | np.ndarray) -> float:
 def ks_statistic(
     pred: Tensor | np.ndarray, target: Tensor | np.ndarray
 ) -> float:
-    """Two-sample Kolmogorov-Smirnov statistic on the flattened value distributions."""
+    """在展平后的取值分布上计算两样本 Kolmogorov-Smirnov 统计量。"""
     try:
         from scipy.stats import ks_2samp
     except ImportError as e:  # pragma: no cover

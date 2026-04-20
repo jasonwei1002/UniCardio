@@ -1,6 +1,6 @@
-"""Evaluation entrypoint: load a checkpoint and score all 5 tasks.
+"""评估入口：加载 checkpoint 并对全部 5 个任务打分。
 
-Example:
+示例：
     python run/pipeline/evaluate.py \
         +checkpoint=run/outputs/2026-04-20_21-00-00/checkpoints/best.pt \
         device=cpu data.num_workers=0 eval.limit_batches=4
@@ -45,7 +45,7 @@ def _resolve_device(name: str) -> torch.device:
 def _maybe_denormalize(
     tensor: torch.Tensor, target_slot: int
 ) -> torch.Tensor:
-    """Undo BP normalization so ABP metrics are in physical units (mmHg)."""
+    """对 ABP 做 BP 反归一化，使指标以物理单位（mmHg）给出。"""
     if target_slot == int(Slot.ABP):
         return bp_denormalize(tensor)
     return tensor
@@ -94,6 +94,7 @@ def main(cfg: DictConfig) -> None:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
+    # 必须通过 +checkpoint=... 显式传入 checkpoint 路径。
     if "checkpoint" not in cfg:
         raise ValueError(
             "Pass +checkpoint=path/to/best.pt to evaluate.py."

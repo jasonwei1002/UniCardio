@@ -1,9 +1,8 @@
-"""Dataloader factory: load, permute channels, normalize BP, split, wrap.
+"""DataLoader 构造器：加载 -> 通道置换 -> BP 归一化 -> 划分 -> 封装。
 
-This is the single place in the codebase that touches the file-vs-model slot
-mismatch. After :func:`load_and_preprocess`, every tensor is in model slot
-order ``(ECG=0, PPG=1, ABP=2)`` and the ABP channel (slot 2) is in
-normalized units ``(x - 100) / 50``.
+代码库中**唯一**处理文件顺序与模型 slot 顺序不一致问题的地方。
+调用 :func:`load_and_preprocess` 后，所有张量都处于模型 slot 顺序
+``(ECG=0, PPG=1, ABP=2)``，且 ABP 通道（slot 2）已归一化为 ``(x - 100) / 50``。
 """
 
 from __future__ import annotations
@@ -24,14 +23,14 @@ logger = logging.getLogger(__name__)
 
 
 def load_and_preprocess(data_path: str | Path) -> np.ndarray:
-    """Load the raw ``.npy`` file, permute channels, normalize ABP.
+    """加载原始 ``.npy`` 文件，执行通道置换并归一化 ABP。
 
     Args:
-        data_path: Path to ``Final_sig_combined.npy`` (shape ``(N, 3, L)``).
+        data_path: ``Final_sig_combined.npy`` 的路径（形状 ``(N, 3, L)``）。
 
     Returns:
-        ``float32`` array of shape ``(N, 3, L)`` in model slot order with
-        BP already normalized.
+        形状为 ``(N, 3, L)`` 的 ``float32`` 数组，已按模型 slot 顺序排列，
+        且 BP 通道已归一化。
     """
     arr = np.load(Path(data_path))
     if arr.ndim != 3 or arr.shape[1] != 3:
@@ -40,10 +39,10 @@ def load_and_preprocess(data_path: str | Path) -> np.ndarray:
         )
     arr = arr.astype(np.float32, copy=False)
 
-    # File order (PPG, BP, ECG) -> model order (ECG, PPG, ABP).
+    # 文件顺序 (PPG, BP, ECG) -> 模型顺序 (ECG, PPG, ABP)。
     arr = arr[:, list(FILE_TO_MODEL_PERMUTATION), :]
 
-    # BP is now at slot 2 (ABP). Normalize to model units (x - 100) / 50.
+    # 此时 BP 位于 slot 2（ABP），归一化到模型量纲 (x - 100) / 50。
     arr[:, 2, :] = bp_normalize(arr[:, 2, :])
     return arr
 
@@ -54,7 +53,7 @@ def _split_three_way(
     test_size: int,
     split_seed: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Reproduce the two-step split from ``base_model/train_original.py``."""
+    """复现 ``base_model/train_original.py`` 中两步切分的逻辑。"""
     train, temp = train_test_split(
         signals, test_size=val_size + test_size, random_state=split_seed
     )
@@ -69,16 +68,16 @@ def build_loaders(
     *,
     num_workers_override: int | None = None,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
-    """Construct ``(train, val, test)`` loaders from a config mapping.
+    """根据配置字典构造 ``(train, val, test)`` 三个 DataLoader。
 
     Args:
-        cfg: Data config with keys ``data_path``, ``val_size``, ``test_size``,
-            ``split_seed``, ``batch_size``, ``num_workers``, ``pin_memory``.
-        num_workers_override: If provided, overrides ``cfg['num_workers']``.
-            Useful when smoke-testing on CPU where workers add startup lag.
+        cfg: 数据配置，需包含 ``data_path``、``val_size``、``test_size``、
+            ``split_seed``、``batch_size``、``num_workers``、``pin_memory`` 等键。
+        num_workers_override: 若提供则覆盖 ``cfg['num_workers']``。在 CPU
+            smoke test 等场景下，worker 启动延迟较大，可设为 0。
 
     Returns:
-        Tuple of three :class:`DataLoader` instances.
+        三个 :class:`DataLoader` 实例组成的元组。
     """
     signals = load_and_preprocess(cfg["data_path"])
     val_size = int(cfg.get("val_size", 20_000))

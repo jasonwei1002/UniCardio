@@ -1,8 +1,8 @@
-"""BP signal normalization.
+"""BP 信号归一化。
 
-The raw ABP channel in Final_sig_combined.npy is in mmHg (~50-200 range) and
-cannot be rescaled to [-1, 1] without distorting the physical mean. We shift
-to zero-centered values around a nominal 100 mmHg with a 50 mmHg scale.
+Final_sig_combined.npy 中 ABP 通道的原始数值单位为 mmHg（范围约 50~200），
+若直接缩放到 [-1, 1] 会扭曲其物理均值。这里以标称 100 mmHg 作为偏移、
+50 mmHg 作为尺度，把信号中心化到 0 附近。
 """
 
 from __future__ import annotations
@@ -19,10 +19,10 @@ Array = Union[np.ndarray, torch.Tensor]
 
 
 def bp_normalize(x: Array) -> Array:
-    """Normalize raw BP (mmHg) to model-space: ``(x - 100) / 50``."""
+    """将原始 BP（mmHg）归一化到模型空间：``(x - 100) / 50``。"""
     return (x - BP_OFFSET) / BP_SCALE
 
 
 def bp_denormalize(x: Array) -> Array:
-    """Inverse of :func:`bp_normalize`; returns values in mmHg."""
+    """:func:`bp_normalize` 的逆运算，返回 mmHg 量纲的数值。"""
     return x * BP_SCALE + BP_OFFSET

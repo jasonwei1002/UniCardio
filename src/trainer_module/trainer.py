@@ -1,10 +1,9 @@
-"""Training loop: task-weighted sampling, Adam + MultiStepLR, per-epoch ckpt.
+"""训练循环：按权重采样任务、Adam + MultiStepLR、按 epoch 保存 checkpoint。
 
-One optimizer step per batch. Each batch independently samples a task from
-``TASK_LIST`` (weighted) and calls :func:`rf_train_step` on that task. Per-task
-running averages are written to CSV at epoch end, alongside LR and epoch wall
-time. Validation (every ``val_every`` epochs) computes mean RF loss across the
-5 tasks on the validation split and tracks ``best.pt``.
+每个 batch 进行一次优化器更新：先从 ``TASK_LIST`` 中按权重随机采样一个任务，
+再对该任务调用 :func:`rf_train_step`。每个 epoch 结束时把按任务的滑动均值、
+学习率、epoch 耗时写入 CSV。验证（每 ``val_every`` 个 epoch 触发一次）会在
+验证集上计算 5 个任务的平均 RF 损失，并以此维护 ``best.pt``。
 """
 
 from __future__ import annotations
@@ -97,7 +96,7 @@ def _evaluate(
     t_std: float,
     max_batches: int | None = None,
 ) -> dict[str, float]:
-    """Compute mean RF loss per task on the validation loader."""
+    """在验证集上按任务计算平均 RF loss。"""
     model.eval()
     sums = {t.name: 0.0 for t in TASK_LIST}
     counts = {t.name: 0 for t in TASK_LIST}
@@ -127,15 +126,15 @@ def train(
     device: torch.device,
     output_dir: str | Path,
 ) -> None:
-    """Run the full Rectified-Flow training loop.
+    """执行完整的 Rectified Flow 训练循环。
 
     Args:
-        model: :class:`UniCardioRF` (or wrapped with :class:`nn.DataParallel`).
-        cfg: Trainer config section (either OmegaConf DictConfig or dict).
-        train_loader: DataLoader yielding ``(signal,)`` with shape ``(B, 3, L)``.
-        val_loader: Optional validation loader with identical output contract.
-        device: Torch device.
-        output_dir: Run directory (Hydra creates this).
+        model: :class:`UniCardioRF`（或由 :class:`nn.DataParallel` 等包裹过的版本）。
+        cfg: 训练器配置（OmegaConf DictConfig 或普通 dict 均可）。
+        train_loader: 产出 ``(signal,)`` 的 DataLoader，signal 形状 ``(B, 3, L)``。
+        val_loader: 可选的验证 loader，需满足相同的输出契约。
+        device: PyTorch device。
+        output_dir: 本次运行的输出目录（由 Hydra 创建）。
     """
     if isinstance(cfg, DictConfig):
         cfg_dict = OmegaConf.to_container(cfg, resolve=True)
@@ -244,7 +243,7 @@ def train(
             **per_task,
         }
 
-        # Validation.
+        # 验证阶段。
         if val_loader is not None and (epoch + 1) % val_every == 0:
             val_losses = _evaluate(
                 model, val_loader, device, t_mean=t_mean, t_std=t_std

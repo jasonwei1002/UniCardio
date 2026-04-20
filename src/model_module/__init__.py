@@ -1,4 +1,4 @@
-"""UniCardio Rectified Flow model components."""
+"""UniCardio Rectified Flow 模型组件。"""
 
 from .attention_masks import build_task_mask
 from .backbone import UniCardioBackbone

@@ -1,7 +1,7 @@
-# UniCardio Rectified Flow main configuration
+# UniCardio Rectified Flow 主配置
 #
-# Hydra composes this with data/default, model/unicardio_rf, trainer/default,
-# sampler/euler8. Override any value from the CLI, e.g.
+# Hydra 会将本文件与 data/default、model/unicardio_rf、trainer/default、
+# sampler/euler8 组合起来。任何字段都可在命令行覆盖，例如：
 #   python run/pipeline/train.py trainer.epochs=10 device=cpu
 
 defaults:

@@ -1,10 +1,9 @@
-"""Top-level Rectified Flow model wrapping :class:`UniCardioBackbone`.
+"""包裹 :class:`UniCardioBackbone` 的顶层 Rectified Flow 模型。
 
-Design choice: the loss is intentionally *not* computed inside the model.
-``UniCardioRF.forward(x_full, t, task)`` returns the raw velocity prediction
-``(B, 1, L)`` for the target slot; loss, x_t construction, and sampling live in
-``src.trainer_module`` so this module stays easy to test, checkpoint, and
-swap for a different backbone later.
+设计决定：模型内部**不**计算 loss。``UniCardioRF.forward(x_full, t, task)``
+只返回 target slot 的原始速度预测 ``(B, 1, L)``；loss、x_t 的构造、采样
+都放在 ``src.trainer_module`` 中，使本模块更易测试、checkpoint 以及在
+将来替换不同 backbone。
 """
 
 from __future__ import annotations
@@ -20,11 +19,10 @@ from .tasks import TaskSpec
 
 
 class UniCardioRF(nn.Module):
-    """Rectified-Flow wrapper around :class:`UniCardioBackbone`.
+    """包裹 :class:`UniCardioBackbone` 的 Rectified Flow 模型。
 
-    The wrapper builds the task-specific attention mask lazily (cached by
-    :func:`build_task_mask`) and forwards to the backbone with the correct
-    target slot.
+    该 wrapper 会按需构造任务专属的注意力 mask（由 :func:`build_task_mask`
+    缓存），并以正确的 target slot 调用 backbone。
     """
 
     def __init__(
@@ -40,16 +38,16 @@ class UniCardioRF(nn.Module):
         t: Tensor,
         task: TaskSpec,
     ) -> Tensor:
-        """Predict velocity for ``task.target_slot``.
+        """预测 ``task.target_slot`` 的速度。
 
         Args:
-            x_full: ``(B, 1, 3 * L_slot)`` — condition slots plus the target
-                slot populated with ``x_t``.
-            t: ``(B,)`` — continuous flow time in ``[0, 1]``.
-            task: :class:`TaskSpec` identifying which slot is the target.
+            x_full: ``(B, 1, 3 * L_slot)`` —— condition slot + 填充了 ``x_t``
+                的 target slot 拼接后的张量。
+            t: ``(B,)`` —— 取值于 ``[0, 1]`` 的连续 flow 时间。
+            task: :class:`TaskSpec`，指定哪一个 slot 是 target。
 
         Returns:
-            Velocity prediction ``(B, 1, L_slot)`` for the target slot only.
+            target slot 的速度预测 ``(B, 1, L_slot)``。
         """
         mask = build_task_mask(
             task.name,

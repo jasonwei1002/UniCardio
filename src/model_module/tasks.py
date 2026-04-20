@@ -1,14 +1,13 @@
-"""Task specification for 5-task multimodal reconstruction.
+"""5 个多模态重建任务的任务规范。
 
-Slot convention (model order, distinct from the on-disk file order PPG/BP/ECG):
+Slot 约定（模型顺序，区别于磁盘文件中的 PPG/BP/ECG 顺序）：
 
     ECG = 0
     PPG = 1
     ABP = 2
 
-The data loader applies a one-time channel permutation ``[2, 0, 1]`` so all
-downstream code (model, masks, loss, sampler, metrics) speaks exclusively in
-model slot indices.
+数据加载器会执行一次 ``[2, 0, 1]`` 的通道置换，因此下游所有代码（模型、
+mask、损失、采样器、指标）都只使用模型 slot 索引。
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ from enum import IntEnum
 
 
 class Slot(IntEnum):
-    """Model-space slot indices for the three cardiovascular modalities."""
+    """三种心血管模态在模型空间中的 slot 索引。"""
 
     ECG = 0
     PPG = 1
@@ -27,13 +26,13 @@ class Slot(IntEnum):
 
 @dataclass(frozen=True)
 class TaskSpec:
-    """Immutable description of one reconstruction direction.
+    """单个重建方向的不可变描述。
 
     Attributes:
-        name: Short string ID (used for logging, mask cache key).
-        cond_slots: Slots that provide clean conditioning signals.
-        target_slot: Slot the model generates.
-        task_id: Integer index in ``TASK_LIST`` (for optional task embedding).
+        name: 字符串 ID（用于日志和 mask 缓存键）。
+        cond_slots: 提供干净条件信号的 slot。
+        target_slot: 模型需要生成的 slot。
+        task_id: 在 ``TASK_LIST`` 中的整数索引（可用于可选的 task embedding）。
     """
 
     name: str
@@ -79,7 +78,7 @@ TASK_LIST: list[TaskSpec] = list(TASK_SPECS.values())
 
 
 def get_task(name: str) -> TaskSpec:
-    """Lookup helper that raises a clear error for unknown task IDs."""
+    """按名称查询任务，未知任务 ID 时抛出可读错误。"""
     if name not in TASK_SPECS:
         raise KeyError(
             f"Unknown task '{name}'. Known tasks: {sorted(TASK_SPECS.keys())}"

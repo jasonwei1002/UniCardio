@@ -1,4 +1,4 @@
-"""Rectified-Flow training utilities: loss, sampler, logger, trainer."""
+"""Rectified Flow 训练相关工具：损失、采样器、日志、训练循环。"""
 
 from .csv_logger import SimpleCSVLogger
 from .rectified_flow import (

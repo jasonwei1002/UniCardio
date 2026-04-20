@@ -1,10 +1,9 @@
-"""Euler ODE sampler for Rectified Flow inference.
+"""Rectified Flow 推断阶段的 Euler ODE 采样器。
 
-Given clean condition slots and a task, integrate the learned velocity field
-from ``t = 1`` (pure noise) to ``t = 0`` (data) with a fixed number of Euler
-steps. Default ``n_steps = 8`` follows the Rectified Flow paper's observation
-that 4-16 steps already match quality of many-step diffusion samplers on
-comparable tasks; tune via the sampler config.
+给定干净的条件 slot 和任务描述后，用学到的速度场做 Euler 积分，从
+``t = 1``（纯噪声）积到 ``t = 0``（数据），步数固定。
+默认 ``n_steps = 8`` 参照 Rectified Flow 论文的观察：4~16 步已经能在
+同类任务上逼近多步扩散采样器的质量，可通过 sampler 配置继续调整。
 """
 
 from __future__ import annotations
@@ -28,20 +27,20 @@ def euler_sample(
     device: str | torch.device | None = None,
     return_trajectory: bool = False,
 ) -> Tensor | Tuple[Tensor, Tensor]:
-    """Sample the target slot via an Euler ODE integration of ``v_theta``.
+    """通过对 ``v_theta`` 做 Euler 积分采样 target slot。
 
     Args:
-        model: Trained :class:`UniCardioRF` (or equivalent interface).
-        conditions: ``(B, 3, L)`` — condition slots contain clean signals;
-            the target slot's contents are ignored (replaced by ``x_t``).
-        task: :class:`TaskSpec` describing which slot to sample.
-        n_steps: Number of Euler steps over ``t ∈ [1, 0]``.
-        device: Target device; defaults to ``conditions.device``.
-        return_trajectory: If True, also return the full trajectory of shape
-            ``(n_steps + 1, B, 1, L)`` for diagnostics.
+        model: 训练好的 :class:`UniCardioRF`（或具备相同接口的模型）。
+        conditions: ``(B, 3, L)`` —— condition slot 填入干净信号；target slot
+            的内容会被忽略（由 ``x_t`` 覆盖）。
+        task: :class:`TaskSpec`，描述要采样的 slot。
+        n_steps: 在 ``t ∈ [1, 0]`` 上积分的 Euler 步数。
+        device: 目标设备；默认为 ``conditions.device``。
+        return_trajectory: 为 True 时，额外返回形状为
+            ``(n_steps + 1, B, 1, L)`` 的完整轨迹，便于诊断。
 
     Returns:
-        Either ``x_0 ≈ (B, 1, L)`` or ``(x_0, trajectory)``.
+        ``x_0 ≈ (B, 1, L)``，或者 ``(x_0, trajectory)``。
     """
     if conditions.dim() != 3 or conditions.size(1) != 3:
         raise ValueError(
@@ -64,7 +63,7 @@ def euler_sample(
 
     for i in range(n_steps):
         t_cur, t_next = ts[i], ts[i + 1]
-        dt = t_next - t_cur  # negative
+        dt = t_next - t_cur  # 为负值
         t_b = torch.full((B,), float(t_cur), device=device)
         x_full = assemble_x_full(conditions, x, target_slot=target, L=L)
         v = model(x_full, t_b, task)

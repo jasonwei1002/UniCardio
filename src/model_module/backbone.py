@@ -1,18 +1,17 @@
-"""3-slot Rectified-Flow backbone for UniCardio.
+"""UniCardio 的 3-slot Rectified Flow 主干网络。
 
-This replaces the 4-slot ``diff_CSDI`` module from the original diffusion
-codebase. Key differences:
+替换了原扩散代码库中的 4-slot ``diff_CSDI`` 模块。主要差异：
 
-* 3 slots (ECG=0, PPG=1, ABP=2) — the zero-padded placeholder slot and the
-  associated ``borrow_mode`` output-head routing have been removed.
-* Continuous time conditioning via :class:`FlowTimeEmbedding` (``t ∈ [0, 1]``)
-  instead of integer-step ``DiffusionEmbedding``.
-* Mask is passed in from the caller (built per task elsewhere) rather than
-  being selected from a hand-coded set of 7 pre-registered masks.
+* 3 个 slot（ECG=0、PPG=1、ABP=2）——去掉了原先零填充的占位 slot 以及
+  相关的 ``borrow_mode`` 输出头路由。
+* 使用 :class:`FlowTimeEmbedding`（``t ∈ [0, 1]``）做连续时间条件，取代
+  原本基于整数步数的 ``DiffusionEmbedding``。
+* mask 由调用方传入（在别处按任务构造），不再从 7 个硬编码的预注册 mask
+  中选择。
 
-Architectural pieces preserved verbatim: :class:`SignalEncoder`,
-:class:`ResidualBlock`, per-slot :class:`LayerNorm`, per-slot 2-stage output
-head, skip-sum aggregation with ``1 / sqrt(n_layers)`` scaling.
+原样保留的结构：:class:`SignalEncoder`、:class:`ResidualBlock`、
+按 slot 划分的 :class:`LayerNorm`、每个 slot 的 2 级输出头、以及
+乘以 ``1 / sqrt(n_layers)`` 的 skip-sum 聚合。
 """
 
 from __future__ import annotations
@@ -40,7 +39,7 @@ N_SLOTS: int = 3
 
 @dataclass(frozen=True)
 class BackboneConfig:
-    """Plain config holder so the backbone can be instantiated without Hydra."""
+    """纯 dataclass 配置，方便在不依赖 Hydra 的场景下实例化 backbone。"""
 
     slot_length: int = 500
     channels: int = 288
@@ -53,7 +52,7 @@ class BackboneConfig:
 
     @classmethod
     def from_mapping(cls, cfg: Mapping[str, Any]) -> "BackboneConfig":
-        """Build from a plain dict (or OmegaConf DictConfig)."""
+        """从普通 dict（或 OmegaConf DictConfig）构造配置。"""
         return cls(
             slot_length=int(cfg["slot_length"]),
             channels=int(cfg["channels"]),
@@ -69,7 +68,7 @@ class BackboneConfig:
 
 
 class _OutputHead(nn.Module):
-    """Per-slot 2-stage output head (``C -> C -> 1``) with ReLU between."""
+    """每个 slot 独立的 2 级输出头（``C -> C -> 1``，中间接 ReLU）。"""
 
     def __init__(self, channels: int) -> None:
         super().__init__()
@@ -81,14 +80,14 @@ class _OutputHead(nn.Module):
 
 
 class UniCardioBackbone(nn.Module):
-    """Transformer backbone with per-slot encoders and a single task head.
+    """按 slot 独立编码、并通过任务头输出的 Transformer 主干。
 
-    Forward signature: ``forward(x, t, mask, target_slot)`` where
+    Forward 签名：``forward(x, t, mask, target_slot)``，其中
 
-    * ``x``: ``(B, 1, 3 * L_slot)`` — concatenated slot tensor.
-    * ``t``: ``(B,)`` — continuous time in ``[0, 1]``.
-    * ``mask``: ``(3 * L_slot, 3 * L_slot)`` — additive attention mask.
-    * ``target_slot``: ``int`` — which slot's output head to use.
+    * ``x``: ``(B, 1, 3 * L_slot)`` —— 拼接后的 slot 张量。
+    * ``t``: ``(B,)`` —— 取值于 ``[0, 1]`` 的连续时间。
+    * ``mask``: ``(3 * L_slot, 3 * L_slot)`` —— 加性注意力 mask。
+    * ``target_slot``: ``int`` —— 选择使用的输出头。
     """
 
     def __init__(self, config: Mapping[str, Any] | BackboneConfig) -> None:
@@ -103,7 +102,7 @@ class UniCardioBackbone(nn.Module):
         self.channels = cfg.channels
         self.n_layers = cfg.n_layers
 
-        # Expected feature dim from the encoder bank (must match self.channels).
+        # 编码器 bank 的特征维必须与 self.channels 一致。
         encoded_channels = cfg.per_kernel_channels * len(cfg.kernel_sizes)
         if encoded_channels != cfg.channels:
             raise ValueError(
@@ -160,9 +159,9 @@ class UniCardioBackbone(nn.Module):
         mask: Tensor,
         target_slot: int,
     ) -> Tensor:
-        """Predict the velocity for the target slot only.
+        """只对 target slot 预测速度。
 
-        Returns a tensor of shape ``(B, 1, L_slot)``.
+        返回形状为 ``(B, 1, L_slot)`` 的张量。
         """
         B, input_dim, L_total = x.shape
         if L_total != self.total_length:
@@ -176,7 +175,7 @@ class UniCardioBackbone(nn.Module):
                 f"target_slot must be in [0, {N_SLOTS}), got {target_slot}"
             )
 
-        # Per-slot encoding -> per-slot LayerNorm.
+        # 对每个 slot 分别编码 -> 每个 slot 独立的 LayerNorm。
         slot_feats: list[Tensor] = []
         for i in range(N_SLOTS):
             start, end = i * self.L, (i + 1) * self.L
@@ -196,7 +195,7 @@ class UniCardioBackbone(nn.Module):
             skip_list.append(skip)
 
         h = torch.stack(skip_list, dim=0).sum(dim=0) / math.sqrt(self.n_layers)
-        # Extract target-slot activations and decode with the matching head.
+        # 取出 target slot 的激活并用对应的输出头解码。
         start = target_slot * self.L
         end = start + self.L
         target_feat = h[:, :, start:end]

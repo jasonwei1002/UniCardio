@@ -1,24 +1,24 @@
-# Training loop configuration.
+# 训练循环配置
 
 epochs: 800
 lr: 1.0e-3
 weight_decay: 1.0e-6
 
-# MultiStepLR milestones as fractions of total epochs; matches the original
-# schedule (0.18 * epochs, 0.75 * epochs, gamma=0.1).
+# MultiStepLR 的里程碑按总 epoch 数的比例给出；与原始 schedule 对齐
+# （0.18 * epochs、0.75 * epochs，gamma=0.1）。
 lr_scheduler:
   name: multistep
   milestones_pct: [0.18, 0.75]
   gamma: 0.1
 
-# Logit-normal time sampling (Esser et al., 2024 "SD3").
+# Logit-normal 时间采样（Esser 等人 2024 "SD3"）。
 t_sampler:
   name: logit_normal
   mean: 0.0
   std: 1.0
 
-# Task sampling: uniform over the 5 task types. Weighted sampling is exposed
-# for future tuning but default to balanced.
+# 任务采样：5 个任务均匀采样。为未来调参保留按任务加权采样接口，
+# 默认全部权重为 1。
 task_weights:
   ecg2ppg: 1.0
   ppg2ecg: 1.0
@@ -26,11 +26,11 @@ task_weights:
   ppg2abp: 1.0
   ecgppg2abp: 1.0
 
-# Bookkeeping.
+# 记账项。
 val_every: 10
 ckpt_every: 1
-itr_per_epoch: null        # null -> iterate the full DataLoader
+itr_per_epoch: null        # null 表示遍历整个 DataLoader
 log_filename: loss.csv
 
-# Optional: resume from a checkpoint path (relative or absolute).
+# 可选：从 checkpoint 路径断点续训（相对/绝对路径均可）。
 resume_from: null

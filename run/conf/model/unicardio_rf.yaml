@@ -1,11 +1,11 @@
-# Model architecture configuration for UniCardioRF.
+# UniCardioRF 模型结构配置
 #
-# channels MUST equal len(kernel_sizes) * per_kernel_channels; the constructor
-# enforces this to catch typos early.
+# channels 必须等于 len(kernel_sizes) * per_kernel_channels；构造函数中
+# 会检查这一点，以便尽早发现配置笔误。
 
 slot_length: 500
 n_slots: 3
-channels: 288          # 6 kernels * 48 channels
+channels: 288          # 6 个卷积核 * 每个核 48 通道
 nheads: 8
 n_layers: 5
 time_embedding_dim: 256

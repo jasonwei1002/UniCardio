@@ -1,10 +1,9 @@
-"""In-memory dataset wrapping the model-space signal tensor.
+"""完全加载到内存的模型空间信号数据集。
 
-Channel ordering contract (critical): everything downstream (model, masks,
-sampler, metrics) operates in *model* slot order ``ECG=0, PPG=1, ABP=2``.
-The on-disk array in ``Final_sig_combined.npy`` uses file order
-``PPG=0, BP=1, ECG=2``; the :data:`FILE_TO_MODEL_PERMUTATION` tuple documents
-the single place where that re-ordering happens.
+通道顺序约定（非常重要）：下游所有代码（模型、mask、采样器、指标）
+都按**模型** slot 顺序 ``ECG=0, PPG=1, ABP=2`` 工作。
+``Final_sig_combined.npy`` 在磁盘上的顺序为 ``PPG=0, BP=1, ECG=2``；
+:data:`FILE_TO_MODEL_PERMUTATION` 元组是这次重排唯一发生的位置。
 """
 
 from __future__ import annotations
@@ -15,16 +14,15 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 FILE_TO_MODEL_PERMUTATION: tuple[int, int, int] = (2, 0, 1)
-"""Indexes to permute file order (PPG, BP, ECG) into model order (ECG, PPG, ABP)."""
+"""将文件顺序（PPG, BP, ECG）重排为模型顺序（ECG, PPG, ABP）的索引元组。"""
 
 
 class CardiacDataset(Dataset):
-    """Dataset of shape ``(N, 3, slot_length)`` in model slot order.
+    """形状为 ``(N, 3, slot_length)`` 的模型 slot 顺序数据集。
 
-    The tensor is held entirely in RAM (the full ``Final_sig_combined.npy``
-    is ~3.4 GB as float32 and fits comfortably on a training node). For
-    on-disk streaming, swap this class for a memory-mapped variant; the
-    interface contract is identical.
+    张量完全驻留在内存中（``Final_sig_combined.npy`` 以 float32 加载约 3.4 GB，
+    在训练节点上可从容装载）。如果需要 on-disk 流式读取，可替换为 mmap 版本，
+    接口契约保持不变。
     """
 
     def __init__(self, signals: np.ndarray | Tensor) -> None:

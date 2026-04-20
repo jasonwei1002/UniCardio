@@ -1,11 +1,11 @@
-"""Unit tests for :func:`build_task_mask`.
+""":func:`build_task_mask` 的单元测试。
 
-Each of the 5 tasks has a hand-computed expected set of allowed ``(query_slot,
-key_slot)`` blocks. The tests verify that:
+5 个任务中每个任务都有一组手算得到的允许 ``(query_slot, key_slot)`` 块。
+测试验证：
 
-1. Allowed blocks are exactly zero (additive mask semantics).
-2. Non-allowed blocks are entirely ``-inf``.
-3. The zero-cell count matches ``(# allowed blocks) * L * L``.
+1. 允许位置的值恰好为 0（加性 mask 语义）。
+2. 非允许位置全部为 ``-inf``。
+3. 取值为 0 的 cell 数量等于 ``(允许块数) * L * L``。
 """
 
 from __future__ import annotations
@@ -18,20 +18,20 @@ import torch
 from src.model_module.attention_masks import build_task_mask, clear_mask_cache
 from src.model_module.tasks import TASK_LIST
 
-L_SLOT = 16  # small, fast to check cell-by-cell
+L_SLOT = 16  # 取小一点，可以逐 cell 检查且速度快
 
-# Hand-derived allowed (query, key) slot pairs per task.
-# Rule recap: target↔target, cond→cond (self), cond↔cond (pairs), target←cond.
+# 每个任务手工推导出的允许 (query, key) 块集合。
+# 规则回顾：target↔target、cond→cond 自注意力、cond↔cond 成对、target←cond。
 EXPECTED_ALLOWED: dict[str, set[tuple[int, int]]] = {
-    # ecg2ppg  — cond={0}, target=1
+    # ecg2ppg  —— cond={0}, target=1
     "ecg2ppg": {(0, 0), (1, 1), (1, 0)},
-    # ppg2ecg  — cond={1}, target=0
+    # ppg2ecg  —— cond={1}, target=0
     "ppg2ecg": {(0, 0), (1, 1), (0, 1)},
-    # ecg2abp  — cond={0}, target=2
+    # ecg2abp  —— cond={0}, target=2
     "ecg2abp": {(0, 0), (2, 2), (2, 0)},
-    # ppg2abp  — cond={1}, target=2
+    # ppg2abp  —— cond={1}, target=2
     "ppg2abp": {(1, 1), (2, 2), (2, 1)},
-    # ecgppg2abp — cond={0,1}, target=2 → cond↔cond + target←both + self
+    # ecgppg2abp —— cond={0,1}, target=2 → cond↔cond + target←两个 cond + 自注意力
     "ecgppg2abp": {
         (0, 0), (1, 1), (2, 2),
         (0, 1), (1, 0),
@@ -86,5 +86,5 @@ def test_mask_cache_hits():
     clear_mask_cache()
     m1 = build_task_mask("ppg2abp", L_SLOT)
     m2 = build_task_mask("ppg2abp", L_SLOT)
-    # lru_cache returns same object on repeat hit.
+    # lru_cache 命中时会返回同一个对象。
     assert m1 is m2

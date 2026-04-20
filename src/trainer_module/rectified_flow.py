@@ -1,18 +1,17 @@
-"""Rectified-Flow training step: time sampling, x_t construction, loss.
+"""Rectified Flow 训练步：时间采样、x_t 构造、损失计算。
 
-Training objective (from Liu et al., 2022 / SD3):
+训练目标（Liu 等, 2022 / SD3）：
 
     x_t     = (1 - t) * x_0 + t * eps,   eps ~ N(0, I),   t ∈ (0, 1)
     v_true  = eps - x_0
     loss    = E_{x_0, eps, t} [ || v_theta(x_t, t) - v_true ||^2 ]
 
-The network only predicts velocity for the *target* slot; non-target slots
-hold the clean conditioning signals and never contribute to the loss.
+网络只对 target slot 预测速度；非 target slot 保存干净的条件信号，不参与
+损失计算。
 
-Time sampling follows SD3's logit-normal: ``u ~ N(0, 1); t = sigmoid(u)``.
-Compared with uniform ``t``, this concentrates training signal around
-``t ≈ 0.5`` where the trajectory is most ambiguous, which empirically speeds
-convergence.
+时间采样采用 SD3 的 logit-normal：``u ~ N(0, 1); t = sigmoid(u)``。
+相比均匀采样，这样能把训练信号更多地集中在轨迹最模糊的 ``t ≈ 0.5`` 附近，
+经验上能加速收敛。
 """
 
 from __future__ import annotations
@@ -32,9 +31,9 @@ def sample_t_logit_normal(
     mean: float = 0.0,
     std: float = 1.0,
 ) -> Tensor:
-    """SD3-style logit-normal time sampling.
+    """SD3 风格的 logit-normal 时间采样。
 
-    Returns ``(batch_size,)`` float tensor with values in ``(0, 1)``.
+    返回形状为 ``(batch_size,)`` 的 float 张量，取值于 ``(0, 1)``。
     """
     u = torch.randn(batch_size, device=device) * std + mean
     return torch.sigmoid(u)
@@ -46,16 +45,16 @@ def assemble_x_full(
     target_slot: int,
     L: int,
 ) -> Tensor:
-    """Flatten per-slot signals to ``(B, 1, 3 * L)`` with target slot replaced.
+    """把按 slot 组织的信号展平为 ``(B, 1, 3 * L)``，同时替换 target slot。
 
     Args:
-        signal_3slot: ``(B, 3, L)`` — clean slot-ordered signals in model space.
-        x_t_target: ``(B, 1, L)`` — the noised target ``x_t`` tensor.
-        target_slot: Which slot is being reconstructed.
-        L: ``slot_length``.
+        signal_3slot: ``(B, 3, L)`` —— 模型空间下、按 slot 顺序的干净信号。
+        x_t_target: ``(B, 1, L)`` —— 经加噪后的 target ``x_t`` 张量。
+        target_slot: 当前正在重建的 slot 编号。
+        L: ``slot_length``。
 
     Returns:
-        ``(B, 1, 3 * L)`` tensor suitable for :meth:`UniCardioRF.forward`.
+        形状为 ``(B, 1, 3 * L)`` 的张量，可直接传入 :meth:`UniCardioRF.forward`。
     """
     if signal_3slot.size(1) != 3:
         raise ValueError(
@@ -82,10 +81,10 @@ def build_rf_inputs(
     t_mean: float = 0.0,
     t_std: float = 1.0,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Return ``(x_full, t, x0_target, v_target)`` tensors for one step.
+    """返回单步训练所需的 ``(x_full, t, x0_target, v_target)`` 张量。
 
-    Factored out of :func:`rf_train_step` so tests can inspect the tensors
-    without having to run a backward pass.
+    从 :func:`rf_train_step` 中拆出来，方便测试在不触发反向传播的情况下
+    直接检查各个张量。
     """
     if batch_signal.dim() != 3 or batch_signal.size(1) != 3:
         raise ValueError(
@@ -117,10 +116,9 @@ def rf_train_step(
     t_mean: float = 0.0,
     t_std: float = 1.0,
 ) -> Tensor:
-    """Compute the scalar Rectified-Flow loss for one batch.
+    """计算单个 batch 的 Rectified Flow 标量损失。
 
-    The model is expected to accept ``(x_full, t, task)`` and return a
-    velocity prediction of shape ``(B, 1, L)``.
+    模型需接受 ``(x_full, t, task)``，返回形状为 ``(B, 1, L)`` 的速度预测。
     """
     x_full, t, _, v_target = build_rf_inputs(
         batch_signal, task, t_mean=t_mean, t_std=t_std

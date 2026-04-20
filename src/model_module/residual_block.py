@@ -1,18 +1,17 @@
-"""Residual transformer block used by :class:`UniCardioBackbone`.
+""":class:`UniCardioBackbone` 使用的残差 Transformer block。
 
-Preserved structure from the original UniCardio code:
+结构保留自 UniCardio 原始代码：
 
-* 1-layer ``nn.TransformerEncoder`` (``d_model=channels``, GELU, ``dim_feedforward=64``).
-* Sinusoidal position embedding along the token dimension (registered as a
-  non-persistent buffer so it follows ``.to(device)``).
-* Gated activation ``sigmoid(gate) * tanh(filter)`` on the mid-projection.
-* Residual is scaled by ``1 / sqrt(2)``; skip is returned separately for
-  aggregation by the backbone.
+* 单层 ``nn.TransformerEncoder``（``d_model=channels``、GELU、
+  ``dim_feedforward=64``）。
+* 沿 token 维度的正弦位置编码（注册为 non-persistent buffer，
+  以便随 ``.to(device)`` 一起搬运）。
+* mid-projection 后使用门控激活 ``sigmoid(gate) * tanh(filter)``。
+* 残差乘以 ``1 / sqrt(2)``；skip 单独返回，由 backbone 做聚合。
 
-The only behavioural change vs. the diffusion version: the block no longer
-takes a ``device`` argument. Placement is controlled externally via
-``module.to(device)``, which matches idiomatic PyTorch and avoids duplicate
-tensor-movement logic.
+相比扩散版本唯一的行为差异：block 不再接收 ``device`` 参数。设备放置交由
+调用方通过 ``module.to(device)`` 统一处理，更符合 PyTorch 惯例，也避免
+重复的 tensor 搬运逻辑。
 """
 
 from __future__ import annotations
@@ -33,7 +32,7 @@ def _transformer_layer(
     ffn_dim: int = 64,
     dropout: float = 0.0,
 ) -> nn.TransformerEncoder:
-    """Mirror of ``get_torch_trans`` from the original code."""
+    """与原代码 ``get_torch_trans`` 对齐的 Transformer 层。"""
     encoder_layer = nn.TransformerEncoderLayer(
         d_model=channels,
         nhead=nheads,
@@ -45,7 +44,7 @@ def _transformer_layer(
 
 
 def _sinusoidal_position_embedding(length: int, d_model: int) -> Tensor:
-    """Standard sinusoidal positional encoding, shape ``(length, d_model)``."""
+    """标准正弦位置编码，形状为 ``(length, d_model)``。"""
     pe = torch.zeros(length, d_model)
     position = torch.arange(length).unsqueeze(1).float()
     div_term = 1.0 / torch.pow(
@@ -57,15 +56,15 @@ def _sinusoidal_position_embedding(length: int, d_model: int) -> Tensor:
 
 
 class ResidualBlock(nn.Module):
-    """One gated transformer block with flow-time conditioning.
+    """一个带 flow-time 条件的门控 Transformer block。
 
     Args:
-        channels: Feature dimension ``C`` of the token sequence.
-        time_embedding_dim: Dimension of the time embedding vector; a linear
-            projection maps it to ``channels`` before broadcast-adding.
-        nheads: Number of attention heads.
-        length: Total token sequence length (``3 * L_slot`` for this project).
-        ffn_dim: Transformer FFN dimension; matches the original code's 64.
+        channels: token 序列的特征维 ``C``。
+        time_embedding_dim: 时间 embedding 的维度；通过一个线性层映射到
+            ``channels`` 后再广播相加。
+        nheads: 注意力头数。
+        length: token 序列总长度（本项目为 ``3 * L_slot``）。
+        ffn_dim: Transformer FFN 维度；与原代码的 64 保持一致。
     """
 
     def __init__(
@@ -94,29 +93,29 @@ class ResidualBlock(nn.Module):
     def forward(
         self, x: Tensor, time_emb: Tensor, mask: Tensor
     ) -> tuple[Tensor, Tensor]:
-        """Forward pass.
+        """前向传播。
 
         Args:
-            x: ``(B, C, L)`` input sequence (C = ``channels``).
-            time_emb: ``(B, time_embedding_dim)`` flow-time embedding.
-            mask: ``(L, L)`` additive attention mask (0 / -inf).
+            x: ``(B, C, L)`` 输入序列（C = ``channels``）。
+            time_emb: ``(B, time_embedding_dim)`` 的 flow-time embedding。
+            mask: ``(L, L)`` 加性注意力 mask（0 / -inf）。
 
         Returns:
-            ``(x_out, skip)`` both of shape ``(B, C, L)``.
+            ``(x_out, skip)``，两者形状均为 ``(B, C, L)``。
         """
         B, C, L = x.shape
         base_shape = x.shape
 
-        # Broadcast-add the time embedding to every spatial position.
+        # 将时间 embedding 广播加到每个时空位置。
         t_emb = self.time_projection(time_emb).unsqueeze(-1)  # (B, C, 1)
         y = x + t_emb
 
-        # Transformer self-attention along the token axis with the task mask.
+        # 沿 token 轴的 Transformer self-attention，使用任务 mask。
         y_seq = y.permute(2, 0, 1)  # (L, B, C)
         y_seq = self.time_layer(y_seq, mask=mask)
         y = y_seq.permute(1, 2, 0).reshape(B, C, L)
 
-        # Gated mid-projection with positional bias.
+        # 带位置偏置的门控 mid-projection。
         y = self.mid_projection(y)  # (B, 2C, L)
         pos_bias = (
             self.pe.unsqueeze(0)

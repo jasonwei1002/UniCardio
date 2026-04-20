@@ -1,4 +1,4 @@
-"""Shared utilities: seeding, checkpointing, normalization, metrics."""
+"""通用工具：随机种子、checkpoint、归一化、评估指标。"""
 
 from .seed import set_seed
 from .normalization import BP_OFFSET, BP_SCALE, bp_denormalize, bp_normalize

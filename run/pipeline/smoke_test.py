@@ -1,15 +1,15 @@
-"""Smoke test: overfit a tiny synthetic batch with the full model stack.
+"""Smoke 测试：用极小的合成 batch 对整套模型做过拟合，端到端验证链路。
 
-Intentionally independent of the real dataset so the check runs in ~1 minute
-on a CPU laptop. Validates four things end-to-end:
+刻意不依赖真实数据集，使该检查在一台 CPU 笔记本上也能在约 1 分钟内完成。
+本测试端到端地验证四件事：
 
-1. Model + trainer wiring is correct (one forward+backward step succeeds).
-2. Loss decreases monotonically on an overfitting dataset (sanity that the
-   Rectified-Flow training step and attention masks actually learn).
-3. Non-target output heads receive no gradient (mask + head routing correct).
-4. Euler sampler reconstructs the overfit target within tolerance.
+1. 模型与训练器的接线正确（一次 forward + backward 成功）。
+2. 在过拟合数据集上 loss 单调下降（证明 Rectified Flow 训练步与
+   attention mask 确实在学习）。
+3. 非 target 的输出头不会收到梯度（说明 mask 与输出头路由正确）。
+4. Euler 采样器能把过拟合后的 target 在容忍范围内重建出来。
 
-Run:
+运行方式：
 
     python run/pipeline/smoke_test.py
     python run/pipeline/smoke_test.py --steps 150 --task ecgppg2abp
@@ -100,7 +100,7 @@ def _run_overfit(
         final / max(initial, 1e-12),
     )
 
-    # Euler reconstruction on the overfit weights.
+    # 在过拟合后的权重上用 Euler 采样器重建 target。
     model.eval()
     target = batch[:, int(task.target_slot):int(task.target_slot) + 1, :]
     sample = euler_sample(model, batch, task, n_steps=16, device=device)
@@ -111,14 +111,14 @@ def _run_overfit(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task", default=None, help="Single task name; default runs all 5.")
+    parser.add_argument("--task", default=None, help="单个任务名；缺省则跑全部 5 个任务。")
     parser.add_argument("--steps", type=int, default=700)
     parser.add_argument("--lr", type=float, default=3.0e-3)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--loss-drop-threshold", type=float, default=0.3,
-                        help="Final/initial loss ratio threshold for PASS.")
+                        help="final/initial loss 比例的 PASS 阈值。")
     parser.add_argument("--recon-mse-threshold", type=float, default=0.6,
-                        help="Euler reconstruction MSE threshold for PASS.")
+                        help="Euler 重建 MSE 的 PASS 阈值。")
     args = parser.parse_args()
 
     logging.basicConfig(

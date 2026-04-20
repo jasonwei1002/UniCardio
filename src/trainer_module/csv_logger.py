@@ -1,9 +1,8 @@
-"""Lightweight append-only CSV logger.
+"""轻量级 append-only CSV 日志。
 
-The original ``SimpleCSVLogger`` in ``base_model/utils_together_original.py``
-used a fixed 9-column schema tailored to diffusion staged training. We keep
-the class name for continuity but accept an arbitrary ordered field list so
-the RF trainer can log per-task losses without rewriting the schema.
+``base_model/utils_together_original.py`` 中的原 ``SimpleCSVLogger`` 使用
+针对扩散分阶段训练的 9 列固定 schema。这里保留类名以延续用法，但改成
+接受任意有序字段列表，使 RF 训练器无需改动 schema 即可按任务记录 loss。
 """
 
 from __future__ import annotations
@@ -15,11 +14,11 @@ from typing import Any, Mapping, Sequence
 
 
 class SimpleCSVLogger:
-    """Append-only CSV logger that writes a header on first open.
+    """append-only 的 CSV 日志，首次打开时会写入表头。
 
     Args:
-        filepath: Destination CSV (created if missing).
-        fieldnames: Ordered list of column names; becomes the CSV header.
+        filepath: 目标 CSV 路径（不存在则自动创建）。
+        fieldnames: 有序列名列表，同时作为 CSV 表头。
     """
 
     def __init__(
@@ -33,13 +32,13 @@ class SimpleCSVLogger:
                 csv.writer(f).writerow(self.fieldnames)
 
     def log(self, **row: Any) -> None:
-        """Append one row. Missing fields become empty strings."""
+        """追加一行记录，缺失字段会写成空字符串。"""
         values = [row.get(name, "") for name in self.fieldnames]
         with self.filepath.open("a", newline="") as f:
             csv.writer(f).writerow(values)
 
     def log_mapping(self, row: Mapping[str, Any]) -> None:
-        """Variant that takes a dict instead of keyword args."""
+        """接收 dict 的版本（功能同 :meth:`log`）。"""
         values = [row.get(name, "") for name in self.fieldnames]
         with self.filepath.open("a", newline="") as f:
             csv.writer(f).writerow(values)

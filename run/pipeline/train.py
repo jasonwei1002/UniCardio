@@ -1,6 +1,6 @@
-"""Training entrypoint: Hydra-driven configuration + UniCardioRF + RF trainer.
+"""训练入口：Hydra 配置 + UniCardioRF + Rectified Flow 训练器。
 
-Run from the repo root so Hydra resolves ``run/conf`` correctly:
+请在仓库根目录运行，这样 Hydra 才能正确定位 ``run/conf``：
 
     python run/pipeline/train.py
     python run/pipeline/train.py device=cpu trainer.epochs=2 data.num_workers=0
@@ -16,7 +16,7 @@ import hydra
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-# Make ``import src.*`` work whether invoked directly or via ``python -m``.
+# 不论是直接运行还是通过 ``python -m`` 调用，都让 ``import src.*`` 生效。
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 def _resolve_device(name: str) -> torch.device:
-    """Map config device string to a safe ``torch.device`` for the host."""
+    """将配置中的 device 字符串映射为本机可用的 ``torch.device``。"""
     if name == "cuda" and not torch.cuda.is_available():
         logger.warning("cuda requested but unavailable; falling back to cpu.")
         return torch.device("cpu")
