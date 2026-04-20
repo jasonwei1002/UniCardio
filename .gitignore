@@ -16,6 +16,7 @@ outputs/
 .pytest_cache/
 
 # Large data directories
+data/
 PulseDB/*
 down_stream_code/AF/*.mat
 down_stream_code/BP/*.mat
