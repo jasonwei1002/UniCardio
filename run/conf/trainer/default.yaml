@@ -11,6 +11,11 @@ lr_scheduler:
   milestones_pct: [0.18, 0.75]
   gamma: 0.1
 
+# 自动混合精度（AMP）。仅在 CUDA 上启用，固定使用 bfloat16：
+# Ada/Ampere+ 与 fp16 吞吐相同，动态范围=fp32，无需 GradScaler。
+amp:
+  enabled: true
+
 # Logit-normal 时间采样（Esser 等人 2024 "SD3"）。
 t_sampler:
   name: logit_normal

@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import hydra
+import swanlab
 import torch
 from omegaconf import DictConfig, OmegaConf
 
@@ -30,14 +31,28 @@ logger = logging.getLogger(__name__)
 
 
 def _resolve_device(name: str) -> torch.device:
-    """将配置中的 device 字符串映射为本机可用的 ``torch.device``。"""
+    """仅支持 ``cuda`` 和 ``cpu``；cuda 不可用时自动降级到 cpu。"""
     if name == "cuda" and not torch.cuda.is_available():
         logger.warning("cuda requested but unavailable; falling back to cpu.")
         return torch.device("cpu")
-    if name == "mps" and not torch.backends.mps.is_available():
-        logger.warning("mps requested but unavailable; falling back to cpu.")
-        return torch.device("cpu")
     return torch.device(name)
+
+
+def _init_swanlab(cfg: DictConfig) -> None:
+    """根据 cfg.swanlab 初始化 SwanLab；完整 cfg 作为实验配置写入。"""
+    sw_cfg = cfg.get("swanlab", {}) or {}
+    mode = "disabled" if not bool(sw_cfg.get("enabled", True)) else str(
+        sw_cfg.get("mode", "cloud")
+    )
+    swanlab.init(
+        project=str(sw_cfg.get("project", "UniCardio")),
+        experiment_name=sw_cfg.get("experiment_name"),
+        description=sw_cfg.get("description"),
+        tags=list(sw_cfg.get("tags", []) or []),
+        config=OmegaConf.to_container(cfg, resolve=True),
+        logdir=str(Path(cfg.output_dir) / "swanlog"),
+        mode=mode,
+    )
 
 
 @hydra.main(
@@ -64,14 +79,18 @@ def main(cfg: DictConfig) -> None:
         sum(p.numel() for p in model.parameters()) / 1e6,
     )
 
-    train(
-        model,
-        cfg.trainer,
-        train_loader,
-        val_loader,
-        device=device,
-        output_dir=cfg.output_dir,
-    )
+    _init_swanlab(cfg)
+    try:
+        train(
+            model,
+            cfg.trainer,
+            train_loader,
+            val_loader,
+            device=device,
+            output_dir=cfg.output_dir,
+        )
+    finally:
+        swanlab.finish()
 
 
 if __name__ == "__main__":

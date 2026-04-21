@@ -37,8 +37,6 @@ logger = logging.getLogger(__name__)
 def _resolve_device(name: str) -> torch.device:
     if name == "cuda" and not torch.cuda.is_available():
         return torch.device("cpu")
-    if name == "mps" and not torch.backends.mps.is_available():
-        return torch.device("cpu")
     return torch.device(name)
 
 

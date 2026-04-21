@@ -11,6 +11,7 @@ base_model/check/
 base_model/train*.log
 run/outputs/
 outputs/
+logs/
 
 # Pytest
 .pytest_cache/

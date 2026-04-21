@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+import swanlab
 import torch
 from omegaconf import DictConfig, OmegaConf
 from torch import Tensor, nn
@@ -28,6 +29,11 @@ from .csv_logger import SimpleCSVLogger
 from .rectified_flow import rf_train_step
 
 logger = logging.getLogger(__name__)
+
+def _amp_enabled(cfg: Mapping[str, Any], device: torch.device) -> bool:
+    """AMP 仅在 CUDA 上启用，始终使用 bfloat16（无需 GradScaler）。"""
+    amp_cfg = cfg.get("amp", {}) or {}
+    return bool(amp_cfg.get("enabled", True)) and device.type == "cuda"
 
 
 def _build_optimizer(model: nn.Module, cfg: Mapping[str, Any]) -> Optimizer:
@@ -94,6 +100,7 @@ def _evaluate(
     *,
     t_mean: float,
     t_std: float,
+    amp_enabled: bool = False,
     max_batches: int | None = None,
 ) -> dict[str, float]:
     """在验证集上按任务计算平均 RF loss。"""
@@ -103,9 +110,14 @@ def _evaluate(
     for batch_idx, batch in enumerate(val_loader):
         signal = batch[0].to(device)
         for task in TASK_LIST:
-            loss = rf_train_step(
-                model, signal, task, t_mean=t_mean, t_std=t_std
-            )
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+                enabled=amp_enabled,
+            ):
+                loss = rf_train_step(
+                    model, signal, task, t_mean=t_mean, t_std=t_std
+                )
             sums[task.name] += float(loss.item())
             counts[task.name] += 1
         if max_batches is not None and (batch_idx + 1) >= max_batches:
@@ -158,6 +170,9 @@ def train(
     t_mean = float(t_sampler_cfg.get("mean", 0.0))
     t_std = float(t_sampler_cfg.get("std", 1.0))
 
+    amp_enabled = _amp_enabled(cfg_dict, device)
+    logger.info("AMP: enabled=%s dtype=bfloat16", amp_enabled)
+
     task_pairs = _weighted_task_sampler(cfg_dict.get("task_weights"))
 
     csv_logger = SimpleCSVLogger(
@@ -182,6 +197,7 @@ def train(
     model.train()
     model.to(device)
 
+    global_step = 0
     for epoch in range(start_epoch, epochs):
         epoch_start = time.time()
         task_loss_sum = {t.name: 0.0 for t in TASK_LIST}
@@ -201,9 +217,14 @@ def train(
             task = _sample_task(task_pairs)
 
             optimizer.zero_grad(set_to_none=True)
-            loss = rf_train_step(
-                model, signal, task, t_mean=t_mean, t_std=t_std
-            )
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+                enabled=amp_enabled,
+            ):
+                loss = rf_train_step(
+                    model, signal, task, t_mean=t_mean, t_std=t_std
+                )
             loss.backward()
             optimizer.step()
 
@@ -212,6 +233,16 @@ def train(
             task_loss_count[task.name] += 1
             total_loss += val
             total_batches += 1
+
+            swanlab.log(
+                {
+                    "train/loss": val,
+                    f"train/loss_{task.name}": val,
+                    "train/lr": float(optimizer.param_groups[0]["lr"]),
+                },
+                step=global_step,
+            )
+            global_step += 1
 
             if itr_per_epoch is not None and batch_idx >= int(itr_per_epoch):
                 break
@@ -243,10 +274,11 @@ def train(
             **per_task,
         }
 
-        # 验证阶段。
         if val_loader is not None and (epoch + 1) % val_every == 0:
             val_losses = _evaluate(
-                model, val_loader, device, t_mean=t_mean, t_std=t_std
+                model, val_loader, device,
+                t_mean=t_mean, t_std=t_std,
+                amp_enabled=amp_enabled,
             )
             for name, v in val_losses.items():
                 row[f"val_loss_{name}"] = v
@@ -267,6 +299,18 @@ def train(
                 )
 
         csv_logger.log_mapping(row)
+        # 用 epoch/、val/ 前缀，避免与 batch 级 train/loss 共享 step 轴时相互覆盖。
+        epoch_metrics: dict[str, float] = {
+            "epoch/avg_loss": avg,
+            "epoch/lr": lr_val,
+            "epoch/time_s": epoch_time,
+            **{f"epoch/loss_{name}": per_task[f"loss_{name}"] for name in task_loss_sum},
+        }
+        if "val_loss_mean" in row:
+            epoch_metrics["val/loss_mean"] = row["val_loss_mean"]
+            for t in TASK_LIST:
+                epoch_metrics[f"val/loss_{t.name}"] = row[f"val_loss_{t.name}"]
+        swanlab.log(epoch_metrics, step=global_step)
 
         if (epoch + 1) % ckpt_every == 0:
             save_checkpoint(

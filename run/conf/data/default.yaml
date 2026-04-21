@@ -3,7 +3,7 @@
 # 数据加载器会执行一次 [2, 0, 1] 的通道置换（PPG/BP/ECG -> ECG/PPG/ABP），
 # 并对模型 slot 2 做 BP 归一化 (x - 100) / 50。
 
-data_path: ${oc.env:UNICARDIO_DATA,/Volumes/Disk/projects/UniCardio/data/Final_sig_combined.npy}
+data_path: ${oc.env:UNICARDIO_DATA,data/Final_sig_combined.npy}
 slot_length: 500
 
 # 与原始随机划分一致 (random_state=42)：20k 验证 + 20k 测试，其余为训练。

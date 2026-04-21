@@ -20,10 +20,14 @@ See `reports/diffusion-rectified-flow-expressive-cascade.md` for the refactor pl
 
 ## Development Environment
 
-- **Local (macOS Apple Silicon, arm64)** — code edits, unit tests, CPU smoke tests.
-- **Linux training server** — full training runs with CUDA.
+Hard rules — do not deviate without asking:
 
-The training server is `hdu-baiyang`; code is rsync'd there via `script/sync.sh`. No script hardcodes `CUDA` any more — the device is read from the Hydra config (`device: cuda | mps | cpu`).
+- **Local = macOS Apple Silicon, CPU only.** For error debugging and smoke tests. Never launch real training here; the dataset is 3.4 GB and epochs would take hours. No MPS — some ops are unimplemented and it's not worth maintaining.
+- **Remote = Linux GPU server, CUDA only.** Only place full training runs. Access is **one-way via GitHub** — the laptop cannot SSH into the server. Push code from laptop → `git pull` on server → `bash train.sh`. Do not try to rsync / ssh the server.
+- **AMP is bf16-only on CUDA**, fp16 path removed entirely (no GradScaler). `run/conf/trainer/default.yaml::amp.enabled` gates it; CPU falls back to fp32 automatically.
+- **Data / checkpoints / logs are never in git** — `.gitignore` excludes `data/`, `run/outputs/`, `logs/`. First setup on a new server: scp `data/Final_sig_combined.npy` once.
+
+Device is read from the Hydra config (`device: cuda | cpu`); on macOS `cuda` auto-falls back to `cpu` so local debug just works with the default config.
 
 ## Environment Setup
 
@@ -97,7 +101,7 @@ run/
 
 tests/                    # pytest unit tests (masks, rf_step, sampler)
 data/Final_sig_combined.npy   # Training data (gitignored)
-script/sync.sh            # rsync helper for macOS → Linux server
+train.sh                  # 一键启动训练（需按服务器改 PROJECT_ROOT / PYTHON）
 ```
 
 ### Slot Layout & Attention Masks
@@ -159,5 +163,5 @@ The sampler integrates `v_θ` from `t = 1` → `t = 0` with Euler steps. `n_step
 
 - **Adding a new task**: extend `TASK_SPECS` in `src/model_module/tasks.py`. The mask builder handles any slot subset; no model surgery needed.
 - **Single-GPU → multi-GPU**: the checkpoint save/load path already unwraps `nn.DataParallel`. For DDP, wrap before calling `train()`; the logger and ckpt code are DDP-safe per process.
-- **macOS**: `device: mps` works for most ops; fall back to `device: cpu` for anything `MPS` doesn't implement.
+- **macOS**: 本地只用 CPU 做错误调试与 smoke test；不走 MPS（部分算子未实现，不值得维护）。
 - **Reproducibility**: `set_seed(cfg.seed)` is called at both entrypoints. Set `deterministic: true` to force cuDNN determinism (slower).

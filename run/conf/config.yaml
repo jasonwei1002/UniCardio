@@ -16,6 +16,19 @@ device: cuda
 deterministic: false
 output_dir: ${hydra:runtime.output_dir}
 
+# SwanLab 实验追踪。日志文件默认落到 ${output_dir}/swanlog。
+# mode: cloud  上传到 swanlab 云端（需提前 `swanlab login`）
+#       local  仅写本地日志，可用 `swanlab watch` 离线查看
+#       offline 记录到本地但以 offline 模式（便于之后 sync）
+#       disabled 完全关闭（API 变为 no-op）
+swanlab:
+  enabled: true
+  project: UniCardio
+  experiment_name: null     # null 时由 swanlab 自动命名
+  description: null
+  tags: []
+  mode: cloud
+
 hydra:
   run:
     dir: run/outputs/${now:%Y-%m-%d_%H-%M-%S}
