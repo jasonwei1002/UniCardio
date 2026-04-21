@@ -1,13 +1,16 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python3 base_model/train_original.py*)",
-      "Bash(python3 base_model/test_final.py*)",
-      "Bash(python3 base_model/self_process.py*)"
+      "Bash(python run/pipeline/train.py:*)",
+      "Bash(python run/pipeline/evaluate.py:*)",
+      "Bash(python run/pipeline/smoke_test.py:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(bash train.sh:*)"
     ],
     "deny": [
       "Bash(rm -rf *)",
-      "Bash(rm base_model/check/*)"
+      "Bash(rm data/*)",
+      "Bash(rm run/outputs/*)"
     ]
   },
   "hooks": {
@@ -27,13 +30,14 @@
     ],
     "PostToolUse": [
       {
+        "matcher": "Edit|Write|MultiEdit",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PROJECT_DIR}/.claude/hooks/scripts/hooks.py",
-            "timeout": 3000,
+            "command": "python3 ${CLAUDE_PROJECT_DIR}/.claude/hooks/scripts/pytest_on_src_edit.py",
+            "timeout": 15000,
             "async": true,
-            "statusMessage": "Checking model integrity..."
+            "statusMessage": "Running unit tests..."
           }
         ]
       }
@@ -42,6 +46,6 @@
   "plansDirectory": "./reports",
   "statusLine": {
     "type": "command",
-    "command": "bash /data2/wcn/UniCardio/glm-usage.sh"
+    "command": "sh -c 'f=\"${CLAUDE_PROJECT_DIR}/script/glm-usage.sh\"; [ -r \"$f\" ] && bash \"$f\" || true'"
   }
 }

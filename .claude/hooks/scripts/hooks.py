@@ -1,121 +1,117 @@
 #!/usr/bin/env python3
+"""SessionStart hook: 打印最近一次训练的尾部进度。
+
+支持两种 CSV 来源：
+
+* **Hydra 训练 run**（服务器上直接训练产物）::
+
+      run/outputs/<YYYY-MM-DD>/<HH-MM-SS>/logs/loss.csv
+
+  schema 由 ``src/trainer_module/trainer.py::_csv_fields`` 决定，核心列：
+  ``epoch``, ``lr``, ``avg_loss``, ``val_loss_mean``。
+
+* **SwanLab 拉取**（本机用 ``/swanlog`` 从云端下载）::
+
+      run/outputs/swanlog_<exp_id>/metrics.csv
+
+  列来自 SwanLab key 命名：``step`` (index), ``epoch/avg_loss``,
+  ``epoch/lr``, ``val/loss_mean`` 等；非 epoch 边界的行这些列会是空串。
 """
-UniCardio Claude Code Hook Handler
 
-SessionStart: prints the last few training epochs from check/loss.csv
-              so every conversation starts with awareness of training state.
+from __future__ import annotations
 
-PostToolUse (Edit on model files): warns if attention mask buffers may be affected.
-"""
-
+import csv
 import sys
-import json
-import os
+from collections import deque
 from pathlib import Path
+from typing import NamedTuple
+
+PROJECT_DIR = Path(__file__).resolve().parent.parent.parent.parent
+OUTPUTS_DIR = PROJECT_DIR / "run" / "outputs"
+
+STALL_WINDOW = 10
+STALL_TOL = 1e-5
 
 
-PROJECT_DIR = Path(__file__).parent.parent.parent  # .claude/hooks/scripts/ -> project root
-
-MASK_KEYWORDS = ["mask1", "mask2", "mask3", "mask12", "mask13", "mask23", "mask123", "borrow_mode"]
-CORE_MODEL_FILES = {
-    "diffusion_model_no_compress_final.py",
-    "train_original.py",
-    "utils_together_original.py",
-}
+class Schema(NamedTuple):
+    source: str
+    progress: str
+    avg_loss: str
+    val_loss: str
+    lr: str
 
 
-def handle_session_start():
-    """Print last training epochs on session start."""
-    loss_csv = PROJECT_DIR / "base_model" / "check" / "loss.csv"
-    if not loss_csv.exists():
-        print("[UniCardio] No training log found at base_model/check/loss.csv", flush=True)
+HYDRA = Schema("hydra", "epoch", "avg_loss", "val_loss_mean", "lr")
+SWANLOG = Schema("swanlog", "step", "epoch/avg_loss", "val/loss_mean", "epoch/lr")
+
+
+def _find_csv() -> tuple[Path, Schema] | None:
+    # Hydra run dirs are YYYY-MM-DD/HH-MM-SS — lexicographic == chronological.
+    for path in sorted(OUTPUTS_DIR.glob("*/*/logs/loss.csv"), reverse=True):
+        return path, HYDRA
+    swan = list(OUTPUTS_DIR.glob("swanlog_*/metrics.csv"))
+    if swan:
+        return max(swan, key=lambda p: p.stat().st_mtime), SWANLOG
+    return None
+
+
+def _run_dir(csv_path: Path, schema: Schema) -> Path:
+    # Hydra: .../TIME/logs/loss.csv → .../TIME ; SwanLog: .../swanlog_id/metrics.csv → .../swanlog_id
+    return csv_path.parent.parent if schema is HYDRA else csv_path.parent
+
+
+def handle_session_start() -> None:
+    found = _find_csv()
+    if found is None:
+        print("[UniCardio] No hydra runs or swanlog pulls under run/outputs/.", flush=True)
         return
+    csv_path, schema = found
 
+    epoch_rows: deque[dict[str, str]] = deque(maxlen=STALL_WINDOW)
     try:
-        import csv
-        with open(loss_csv, newline="", encoding="utf-8") as f:
-            rows = list(csv.DictReader(f))
-
-        if not rows:
-            print("[UniCardio] Training log is empty.", flush=True)
-            return
-
-        last = rows[-1]
-        epoch = last.get("epoch", "?")
-        loss = last.get("train_loss", "?")
-        stage = last.get("stage", "?")
-        lr = last.get("lr", "?")
-
-        # Count checkpoints
-        check_dir = PROJECT_DIR / "base_model" / "check"
-        ckpts = list(check_dir.glob("model*.pth")) if check_dir.exists() else []
-
-        print(f"[UniCardio] Training status — epoch {epoch}/800 | stage {stage} | loss {loss} | lr {lr} | {len(ckpts)} checkpoints saved", flush=True)
-
-        # Warn if loss has been stagnant (last 10 epochs)
-        if len(rows) >= 10:
-            recent_losses = []
-            for r in rows[-10:]:
-                try:
-                    recent_losses.append(float(r.get("train_loss", "")))
-                except (ValueError, TypeError):
-                    pass
-            if recent_losses and len(recent_losses) >= 5:
-                delta = abs(recent_losses[-1] - recent_losses[0])
-                if delta < 1e-5:
-                    print("[UniCardio] WARNING: Loss has not changed in the last 10 epochs — possible training stall.", flush=True)
-
-    except Exception as e:
-        print(f"[UniCardio] Could not read loss.csv: {e}", flush=True)
-
-
-def handle_post_tool_use(data):
-    """Warn if edits to core model files may affect attention masks."""
-    tool_name = data.get("tool_name", "")
-    if tool_name not in ("Edit", "Write"):
+        with csv_path.open(newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if row.get(schema.avg_loss):
+                    epoch_rows.append(row)
+    except OSError as exc:
+        print(f"[UniCardio] Could not read {csv_path}: {exc}", flush=True)
         return
 
-    tool_input = data.get("tool_input", {})
-    file_path = tool_input.get("file_path", "")
-
-    filename = Path(file_path).name
-    if filename not in CORE_MODEL_FILES:
+    rel = _run_dir(csv_path, schema).relative_to(PROJECT_DIR)
+    if not epoch_rows:
+        print(f"[UniCardio] {rel} has no epoch-summary rows yet.", flush=True)
         return
 
-    # Check if the edit touches mask-related code
-    new_string = tool_input.get("new_string", "") or tool_input.get("content", "")
-    old_string = tool_input.get("old_string", "")
-    changed_text = (old_string + " " + new_string).lower()
+    last = epoch_rows[-1]
+    print(
+        f"[UniCardio] Latest {schema.source} {rel} — "
+        f"{schema.progress} {last.get(schema.progress, '?')} | "
+        f"avg_loss {last[schema.avg_loss]} | "
+        f"val_loss {last.get(schema.val_loss) or 'n/a'} | "
+        f"lr {last.get(schema.lr, '?')}",
+        flush=True,
+    )
 
-    hit_keywords = [kw for kw in MASK_KEYWORDS if kw in changed_text]
-    if hit_keywords:
+    if len(epoch_rows) < STALL_WINDOW:
+        return
+    try:
+        losses = [float(r[schema.avg_loss]) for r in epoch_rows]
+    except ValueError:
+        return
+    if abs(losses[-1] - losses[0]) < STALL_TOL:
         print(
-            f"[UniCardio] ATTENTION: Edit to {filename} touches mask/borrow logic: {hit_keywords}. "
-            f"Run /verify-training to confirm forward pass is still correct.",
-            flush=True
+            f"[UniCardio] WARNING: avg_loss flat across last {STALL_WINDOW} epoch rows — possible stall.",
+            flush=True,
         )
 
 
-def main():
+def main() -> None:
     try:
-        stdin_content = sys.stdin.read().strip()
-        if not stdin_content:
-            sys.exit(0)
-
-        data = json.loads(stdin_content)
-        event = data.get("hook_event_name", "")
-
-        if event == "SessionStart":
-            handle_session_start()
-        elif event == "PostToolUse":
-            handle_post_tool_use(data)
-
-        sys.exit(0)
-
-    except json.JSONDecodeError:
-        sys.exit(0)
-    except Exception:
-        sys.exit(0)
+        sys.stdin.read()
+    except OSError:
+        pass
+    handle_session_start()
+    sys.exit(0)
 
 
 if __name__ == "__main__":
