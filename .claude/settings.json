@@ -1,0 +1,51 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python run/pipeline/train.py:*)",
+      "Bash(python run/pipeline/evaluate.py:*)",
+      "Bash(python run/pipeline/smoke_test.py:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(bash train.sh:*)"
+    ],
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(rm data/*)",
+      "Bash(rm run/outputs/*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PROJECT_DIR}/.claude/hooks/scripts/hooks.py",
+            "timeout": 5000,
+            "async": true,
+            "once": true,
+            "statusMessage": "Loading training status..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PROJECT_DIR}/.claude/hooks/scripts/pytest_on_src_edit.py",
+            "timeout": 15000,
+            "async": true,
+            "statusMessage": "Running unit tests..."
+          }
+        ]
+      }
+    ]
+  },
+  "plansDirectory": "./reports",
+  "statusLine": {
+    "type": "command",
+    "command": "sh -c 'f=\"${CLAUDE_PROJECT_DIR}/script/glm-usage.sh\"; [ -r \"$f\" ] && bash \"$f\" || true'"
+  }
+}

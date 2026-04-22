@@ -38,6 +38,4 @@ venv/
 # IDE
 .vscode/
 .idea/
-.claude/
-CLAUDE.md
 reports/
