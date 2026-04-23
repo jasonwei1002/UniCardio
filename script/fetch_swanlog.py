@@ -74,20 +74,31 @@ def _resolve_run(
     raise ValueError("Must pass --exp-id or --latest.")
 
 
-def _dump_profile(profile: dict[str, Any], out_dir: Path) -> list[str]:
-    """把 profile 里的各块分别落到 out_dir；返回已写文件名列表。"""
+def _dump_profile(profile: Any, out_dir: Path) -> list[str]:
+    """把 profile 里的各块分别落到 out_dir；返回已写文件名列表。
+
+    SwanLab 0.7.x 的 ``run.profile`` 是 ``Profile`` 对象而不是 dict，
+    暴露 ``config`` / ``metadata`` / ``requirements`` / ``conda`` 属性。
+    """
+    def _get(key: str) -> Any:
+        if profile is None:
+            return None
+        if isinstance(profile, dict):
+            return profile.get(key)
+        return getattr(profile, key, None)
+
     written: list[str] = []
-    if config := profile.get("config"):
+    if config := _get("config"):
         cfg_path = out_dir / "config.yaml"
         cfg_path.write_text(OmegaConf.to_yaml(OmegaConf.create(config)))
         written.append(cfg_path.name)
-    if metadata := profile.get("metadata"):
+    if metadata := _get("metadata"):
         meta_path = out_dir / "metadata.json"
         meta_path.write_text(
             json.dumps(metadata, indent=2, ensure_ascii=False, default=str)
         )
         written.append(meta_path.name)
-    if requirements := profile.get("requirements"):
+    if requirements := _get("requirements"):
         req_text = (
             "\n".join(requirements)
             if isinstance(requirements, list)
@@ -152,9 +163,9 @@ def main() -> None:
                 "created_at": run.created_at,
                 "finished_at": run.finished_at,
                 "url": run.url,
-                "user": run.user,
+                "user": getattr(run.user, "username", str(run.user)),
             },
-            indent=2, ensure_ascii=False,
+            indent=2, ensure_ascii=False, default=str,
         )
     )
 
