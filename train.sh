@@ -11,13 +11,13 @@ LOG_FILE="logs/train_$(date +%Y%m%d_%H%M%S).log"
 
 python run/pipeline/train.py \
     device=cuda \
-    data.batch_size=256 \
+    data.batch_size=512 \
     data.num_workers=8 \
-    trainer.lr=1.0e-3 \
+    trainer.lr=2.0e-3 \
     trainer.weight_decay=1.0e-6 \
     trainer.amp.enabled=true \
     trainer.compile.enabled=true \
     trainer.compile.mode=default \
-    trainer.warmup_steps=1040 \
+    trainer.warmup_steps=519 \
     trainer.val_every=1 \
     2>&1 | tee "$LOG_FILE"
