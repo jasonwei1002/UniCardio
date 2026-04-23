@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import random
 import time
 from pathlib import Path
@@ -99,15 +100,21 @@ def _build_scheduler(
 def _weighted_task_sampler(
     weights_cfg: Mapping[str, float] | None,
 ) -> list[tuple[TaskSpec, float]]:
+    """返回训练里实际参与采样的 ``(task, weight)`` 对。
+
+    权重为 0 的任务被从返回列表中剔除（"显式禁用该任务"语义）；权重为
+    NaN / Inf / 负数 直接 raise。由此所有下游消费者（训练采样、val、
+    CSV、checkpoint）都可以把返回值视作"active tasks"，不用再各自过滤。
+    """
     weights_cfg = weights_cfg or {}
     pairs: list[tuple[TaskSpec, float]] = []
     for spec in TASK_LIST:
         w = float(weights_cfg.get(spec.name, 1.0))
-        if w < 0:
-            raise ValueError(f"Negative task weight for {spec.name}: {w}")
-        pairs.append((spec, w))
-    total = sum(w for _, w in pairs)
-    if total <= 0:
+        if math.isnan(w) or math.isinf(w) or w < 0:
+            raise ValueError(f"Invalid task weight for {spec.name}: {w}")
+        if w > 0:
+            pairs.append((spec, w))
+    if not pairs:
         raise ValueError("All task weights are zero.")
     return pairs
 
@@ -136,14 +143,15 @@ def _evaluate(
     t_std: float,
     amp_enabled: bool = False,
     max_batches: int | None = None,
+    tasks: Sequence[TaskSpec] = TASK_LIST,
 ) -> dict[str, float]:
-    """在验证集上按任务计算平均 RF loss。"""
+    """在验证集上按任务计算平均 RF loss；``tasks`` 指定评估集合。"""
     model.eval()
-    sums = {t.name: 0.0 for t in TASK_LIST}
-    counts = {t.name: 0 for t in TASK_LIST}
+    sums = {t.name: 0.0 for t in tasks}
+    counts = {t.name: 0 for t in tasks}
     for batch_idx, batch in enumerate(val_loader):
         signal = batch[0].to(device)
-        for task in TASK_LIST:
+        for task in tasks:
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.bfloat16,
@@ -211,6 +219,8 @@ def train(
     logger.info("AMP: enabled=%s dtype=bfloat16", amp_enabled)
 
     task_pairs = _weighted_task_sampler(cfg_dict.get("task_weights"))
+    active_tasks: list[TaskSpec] = [spec for spec, _ in task_pairs]
+    logger.info("Training tasks: %s", [t.name for t in active_tasks])
 
     csv_logger = SimpleCSVLogger(
         log_dir / cfg_dict.get("log_filename", "loss.csv"),
@@ -237,8 +247,8 @@ def train(
     global_step = 0
     for epoch in range(start_epoch, epochs):
         epoch_start = time.time()
-        task_loss_sum = {t.name: 0.0 for t in TASK_LIST}
-        task_loss_count = {t.name: 0 for t in TASK_LIST}
+        task_loss_sum = {t.name: 0.0 for t in active_tasks}
+        task_loss_count = {t.name: 0 for t in active_tasks}
         total_loss = 0.0
         total_batches = 0
 
@@ -316,6 +326,7 @@ def train(
                 model, val_loader, device,
                 t_mean=t_mean, t_std=t_std,
                 amp_enabled=amp_enabled,
+                tasks=active_tasks,
             )
             for name, v in val_losses.items():
                 row[f"val_loss_{name}"] = v
@@ -331,7 +342,7 @@ def train(
                     optimizer=optimizer,
                     lr_scheduler=scheduler,
                     config=cfg_dict,
-                    task_list=[t.name for t in TASK_LIST],
+                    task_list=[t.name for t in active_tasks],
                     extra={"val_loss_mean": mean_val},
                 )
 
@@ -345,7 +356,7 @@ def train(
         }
         if "val_loss_mean" in row:
             epoch_metrics["val/loss_mean"] = row["val_loss_mean"]
-            for t in TASK_LIST:
+            for t in active_tasks:
                 epoch_metrics[f"val/loss_{t.name}"] = row[f"val_loss_{t.name}"]
         swanlab.log(epoch_metrics, step=global_step)
 
@@ -357,5 +368,5 @@ def train(
                 optimizer=optimizer,
                 lr_scheduler=scheduler,
                 config=cfg_dict,
-                task_list=[t.name for t in TASK_LIST],
+                task_list=[t.name for t in active_tasks],
             )
