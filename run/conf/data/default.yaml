@@ -11,7 +11,7 @@ val_size: 20000
 test_size: 20000
 split_seed: 42
 
-batch_size: 128
+batch_size: 512             # Tier 1：H20 96GB + SDPA/Flash Attention 下显存充足
 num_workers: 8
 pin_memory: true
 

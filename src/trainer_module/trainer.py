@@ -19,7 +19,12 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from torch import Tensor, nn
 from torch.optim import Adam, Optimizer
-from torch.optim.lr_scheduler import MultiStepLR, _LRScheduler
+from torch.optim.lr_scheduler import (
+    LinearLR,
+    MultiStepLR,
+    SequentialLR,
+    _LRScheduler,
+)
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -45,20 +50,49 @@ def _build_optimizer(model: nn.Module, cfg: Mapping[str, Any]) -> Optimizer:
 
 
 def _build_scheduler(
-    optimizer: Optimizer, cfg: Mapping[str, Any], total_epochs: int
+    optimizer: Optimizer,
+    cfg: Mapping[str, Any],
+    total_epochs: int,
+    steps_per_epoch: int,
 ) -> _LRScheduler:
+    """构造 step 级调度器：可选线性 warmup + MultiStepLR。
+
+    与旧实现的差异：整个调度器按 **step** 计数（而非 epoch），trainer 每个
+    training step 后调一次 ``scheduler.step()``。这让我们可以用 PyTorch 官方
+    的 ``SequentialLR`` 把 ``LinearLR`` warmup 和 ``MultiStepLR`` 主干衔接起来，
+    不需要在 trainer 里按阶段切换调度粒度。
+
+    ``milestones_pct`` 的语义保持"占总训练进度的比例"（因为
+    ``total_steps = epochs * steps_per_epoch``，占比解释不变），只是换算时
+    用的是总 step 数。
+    """
     sched_cfg = cfg["lr_scheduler"]
     name = str(sched_cfg["name"]).lower()
     if name != "multistep":
         raise ValueError(f"Unsupported lr_scheduler '{name}'.")
-    milestones = [
-        max(1, int(round(total_epochs * float(p))))
+
+    total_steps = max(1, int(total_epochs) * int(steps_per_epoch))
+    milestones_steps = [
+        max(1, int(round(total_steps * float(p))))
         for p in sched_cfg["milestones_pct"]
     ]
-    return MultiStepLR(
+    gamma = float(sched_cfg["gamma"])
+
+    warmup_steps = int(cfg.get("warmup_steps", 0))
+    main = MultiStepLR(optimizer, milestones=milestones_steps, gamma=gamma)
+    if warmup_steps <= 0:
+        return main
+
+    # LinearLR 从 start_factor 线性升到 1.0，持续 total_iters 步。
+    # start_factor 取 1/warmup_steps 以避免 LR=0 的第一步（Adam 的数值稳定性）。
+    warmup = LinearLR(
         optimizer,
-        milestones=milestones,
-        gamma=float(sched_cfg["gamma"]),
+        start_factor=1.0 / float(warmup_steps),
+        end_factor=1.0,
+        total_iters=warmup_steps,
+    )
+    return SequentialLR(
+        optimizer, schedulers=[warmup, main], milestones=[warmup_steps]
     )
 
 
@@ -165,7 +199,10 @@ def train(
     itr_per_epoch = cfg_dict.get("itr_per_epoch")
 
     optimizer = _build_optimizer(model, cfg_dict)
-    scheduler = _build_scheduler(optimizer, cfg_dict, epochs)
+    steps_per_epoch = len(train_loader) if itr_per_epoch is None else int(itr_per_epoch)
+    scheduler = _build_scheduler(
+        optimizer, cfg_dict, epochs, steps_per_epoch=steps_per_epoch
+    )
     t_sampler_cfg = cfg_dict.get("t_sampler", {})
     t_mean = float(t_sampler_cfg.get("mean", 0.0))
     t_std = float(t_sampler_cfg.get("std", 1.0))
@@ -227,6 +264,7 @@ def train(
                 )
             loss.backward()
             optimizer.step()
+            scheduler.step()
 
             val = float(loss.item())
             task_loss_sum[task.name] += val
@@ -247,7 +285,6 @@ def train(
             if itr_per_epoch is not None and batch_idx >= int(itr_per_epoch):
                 break
 
-        scheduler.step()
         epoch_time = time.time() - epoch_start
         avg = total_loss / max(total_batches, 1)
         per_task = {

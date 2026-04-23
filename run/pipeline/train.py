@@ -79,6 +79,14 @@ def main(cfg: DictConfig) -> None:
         sum(p.numel() for p in model.parameters()) / 1e6,
     )
 
+    compile_cfg = (cfg.trainer.get("compile") or {}) if "compile" in cfg.trainer else {}
+    if bool(compile_cfg.get("enabled", False)) and device.type == "cuda":
+        compile_mode = str(compile_cfg.get("mode", "reduce-overhead"))
+        logger.info("torch.compile enabled (mode=%s, fullgraph=False)", compile_mode)
+        model = torch.compile(model, mode=compile_mode, fullgraph=False)
+    elif bool(compile_cfg.get("enabled", False)):
+        logger.info("torch.compile requested but device=%s; skipping.", device.type)
+
     _init_swanlab(cfg)
     try:
         train(

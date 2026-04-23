@@ -4,12 +4,18 @@
 只返回 target slot 的原始速度预测 ``(B, 1, L)``；loss、x_t 的构造、采样
 都放在 ``src.trainer_module`` 中，使本模块更易测试、checkpoint 以及在
 将来替换不同 backbone。
+
+注意：``torch.compile`` 不在本模块内部包装，而是由训练入口
+(``run/pipeline/train.py``) 在构造完成后按 ``cfg.trainer.compile`` 包一层。
+这样 ``UniCardioRF.state_dict()`` 的 key 前缀不会被 ``OptimizedModule``
+污染成 ``backbone._orig_mod.*``。
 """
 
 from __future__ import annotations
 
 from typing import Any, Mapping
 
+import torch
 import torch.nn as nn
 from torch import Tensor
 
@@ -53,6 +59,7 @@ class UniCardioRF(nn.Module):
             task.name,
             self.L,
             device=str(x_full.device),
+            dtype=torch.bool,
         )
         return self.backbone(
             x_full, t, mask, target_slot=int(task.target_slot)
