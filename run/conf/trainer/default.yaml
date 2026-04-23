@@ -33,11 +33,14 @@ t_sampler:
   mean: 0.0
   std: 1.0
 
-# 任务采样：5 个任务均匀采样。为未来调参保留按任务加权采样接口，
-# 默认全部权重为 1。
+# 任务采样权重。当前聚焦 cuffless BP 估计，只训练 3 个 ABP-target 任务；
+# ECG↔PPG 两个方向都属于 "易得 → 易得"，不构成独立的临床产品功能，设 0
+# 从训练采样里剔除（`_weighted_task_sampler` 接受 0 权重，只要总和 > 0）。
+# 三个 ABP 任务共享 target_slot=2，对 torch.compile 更友好（Dynamo 只需
+# 特化一种 target_slot 变体）。
 task_weights:
-  ecg2ppg: 1.0
-  ppg2ecg: 1.0
+  ecg2ppg: 0.0
+  ppg2ecg: 0.0
   ecg2abp: 1.0
   ppg2abp: 1.0
   ecgppg2abp: 1.0
