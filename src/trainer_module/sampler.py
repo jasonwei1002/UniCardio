@@ -13,6 +13,7 @@ from typing import Tuple
 import torch
 from torch import Tensor, nn
 
+from ..model_module.attention_masks import build_task_mask
 from ..model_module.tasks import TaskSpec
 from .rectified_flow import assemble_x_full
 
@@ -56,6 +57,10 @@ def euler_sample(
     B, _, L = conditions.shape
     target = int(task.target_slot)
     conditions = conditions.to(device)
+    # mask 只与 (task.name, L, device, dtype) 有关，n_steps 个步骤可共用一份。
+    mask = build_task_mask(
+        task.name, L, device=str(device), dtype=torch.bool
+    )
 
     x = torch.randn(B, 1, L, device=device)  # x_1 ~ N(0, I)
     ts = torch.linspace(1.0, 0.0, n_steps + 1, device=device)
@@ -66,7 +71,7 @@ def euler_sample(
         dt = t_next - t_cur  # 为负值
         t_b = torch.full((B,), float(t_cur), device=device)
         x_full = assemble_x_full(conditions, x, target_slot=target, L=L)
-        v = model(x_full, t_b, task)
+        v = model(x_full, t_b, mask, target)
         x = x + v * dt
         if return_trajectory:
             traj.append(x.clone())

@@ -21,6 +21,7 @@ from typing import Tuple
 import torch
 from torch import Tensor, nn
 
+from ..model_module.attention_masks import build_task_mask
 from ..model_module.tasks import TaskSpec
 
 
@@ -118,12 +119,20 @@ def rf_train_step(
 ) -> Tensor:
     """计算单个 batch 的 Rectified Flow 标量损失。
 
-    模型需接受 ``(x_full, t, task)``，返回形状为 ``(B, 1, L)`` 的速度预测。
+    模型接受 ``(x_full, t, mask, target_slot)``，返回 ``(B, 1, L)`` 的速度预测。
+    ``task`` 在这里（编译区之外）解包成 bool mask 和 int ``target_slot``，使
+    ``torch.compile`` 只对 3 种 ``target_slot`` 做 Dynamo 特化，不会因为
+    ``task.name`` 的 5 种字符串撞 recompile limit。
     """
     x_full, t, _, v_target = build_rf_inputs(
         batch_signal, task, t_mean=t_mean, t_std=t_std
     )
-    v_pred = model(x_full, t, task)
+    _, _, L_total = x_full.shape
+    L_slot = L_total // 3
+    mask = build_task_mask(
+        task.name, L_slot, device=str(x_full.device), dtype=torch.bool
+    )
+    v_pred = model(x_full, t, mask, int(task.target_slot))
     if v_pred.shape != v_target.shape:
         raise RuntimeError(
             f"Velocity prediction shape {tuple(v_pred.shape)} "
