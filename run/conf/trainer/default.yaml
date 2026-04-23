@@ -21,9 +21,11 @@ amp:
   enabled: true
 
 # Tier 1：torch.compile 包装顶层 UniCardioRF。仅 CUDA 生效，CPU 自动跳过。
+# mode 选 "default"：reduce-overhead 会通过 CUDA Graphs 常驻一份输入/输出
+# buffer（trace 上显示 ~14 GB 的 private pool），在大 batch 下得不偿失。
 compile:
   enabled: true
-  mode: reduce-overhead
+  mode: default
 
 # Logit-normal 时间采样（Esser 等人 2024 "SD3"）。
 t_sampler:
