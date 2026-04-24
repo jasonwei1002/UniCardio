@@ -23,7 +23,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from src.data_module.datamodule import build_loaders
-from src.model_module.tasks import TASK_LIST, Slot
+from src.model_module.tasks import Slot, active_task_pairs
 from src.model_module.unicardio_rf import UniCardioRF
 from src.trainer_module.sampler import euler_sample
 from src.utils.checkpoint import load_checkpoint
@@ -113,13 +113,19 @@ def main(cfg: DictConfig) -> None:
     if limit_batches is not None:
         limit_batches = int(limit_batches)
 
+    # 与训练保持一致：权重为 0 的任务不参与评估。
+    active_tasks = [spec for spec, _ in active_task_pairs(
+        cfg.trainer.task_weights
+    )]
+    logger.info("Active tasks: %s", [t.name for t in active_tasks])
+
     out_dir = Path(cfg.output_dir) / "eval"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_csv = out_dir / "per_task_metrics.csv"
     with out_csv.open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["task", "rmse", "mae", "ks", "n"])
-        for task in TASK_LIST:
+        for task in active_tasks:
             logger.info("Evaluating task %s", task.name)
             metrics = _eval_task(
                 model,
