@@ -1,14 +1,21 @@
 # 训练循环配置
 
 epochs: 300
-lr: 2.0e-3                # Tier 1：batch 128→512 对应 sqrt scaling (1e-3 * 2)
+lr: 1.0e-3                # SD3/RF 速度回归的惯常值；2e-3 在 bf16 + Adam 下已实测
+                          # 在 epoch ~10 warmup 爬升期发散（ox-3 run，无 grad clip）
 weight_decay: 1.0e-6
 
-# Linear warmup 的长度，填占总训练的比例（0~1 之间）。比如 0.05 表示 5%
+# 梯度范数裁剪（L2）。RF 速度 MSE 偶尔会因某个 outlier batch 产生爆炸 step，
+# Adam 第二动量累积后尤其明显。≤0 / null 关闭。1.0 是 SD3 / Flow Matching
+# 的通用默认值。
+grad_clip_norm: 1.0
+
+# Linear warmup 的长度，填占总训练的比例（0~1 之间）。比如 0.1 表示 10%
 # 的 total_steps 用来 warmup；换 epochs / batch / 数据量时这个比例保持不变。
 # 实际 step 数 = round(warmup_pct * total_steps)，在 _build_scheduler 里运行
 # 时换算。设 0 可关闭 warmup。
-warmup_pct: 0.05
+# 0.1 给 Adam 第二动量更多时间 settle，降低 warmup 后半段发散风险。
+warmup_pct: 0.1
 
 # Cosine annealing（不做 warm restart）。使用 katsura-jp/cosine_annealing_warmup
 # 的 CosineAnnealingWarmupRestarts，把 first_cycle_steps 固定成整段训练的

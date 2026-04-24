@@ -183,6 +183,13 @@ def train(
     amp_enabled = _amp_enabled(cfg_dict, device)
     logger.info("AMP: enabled=%s dtype=bfloat16", amp_enabled)
 
+    # 梯度范数裁剪：防 Adam 第二动量累积后被单个 outlier batch 爆出 1e3 级 step。
+    # ≤0 或 None 都关闭裁剪，交给调用方兜底。
+    grad_clip_norm = cfg_dict.get("grad_clip_norm")
+    grad_clip_norm = float(grad_clip_norm) if grad_clip_norm else 0.0
+    if grad_clip_norm > 0:
+        logger.info("Grad clip: max_norm=%.2f", grad_clip_norm)
+
     task_pairs = active_task_pairs(cfg_dict.get("task_weights"))
     active_tasks: list[TaskSpec] = [spec for spec, _ in task_pairs]
     logger.info("Training tasks: %s", [t.name for t in active_tasks])
@@ -238,6 +245,10 @@ def train(
                     model, signal, task, t_mean=t_mean, t_std=t_std
                 )
             loss.backward()
+            if grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=grad_clip_norm
+                )
             optimizer.step()
             scheduler.step()
 

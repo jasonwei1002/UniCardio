@@ -13,8 +13,6 @@ python run/pipeline/train.py \
     device=cuda \
     data.batch_size=512 \
     data.num_workers=8 \
-    trainer.lr=2.0e-3 \
-    trainer.weight_decay=1.0e-6 \
     trainer.amp.enabled=true \
     trainer.compile.enabled=true \
     trainer.compile.mode=default \
