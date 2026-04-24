@@ -18,6 +18,5 @@ python run/pipeline/train.py \
     trainer.amp.enabled=true \
     trainer.compile.enabled=true \
     trainer.compile.mode=default \
-    trainer.warmup_steps=519 \
     trainer.val_every=1 \
     2>&1 | tee "$LOG_FILE"

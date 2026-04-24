@@ -21,6 +21,9 @@ scikit-learn>=1.2,<2.0
 tqdm>=4.65
 swanlab>=0.7,<1.0
 
+# 自带 warmup 的 cosine 调度器：trainer.py::_build_scheduler
+cosine_annealing_warmup>=2.0,<3
+
 # script/convert_h5_to_npy_csv.py 用到；不跑那个脚本可以不装
 h5py>=3.8
 

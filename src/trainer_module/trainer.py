@@ -1,4 +1,4 @@
-"""训练循环：按权重采样任务、Adam + MultiStepLR、按 epoch 保存 checkpoint。
+"""训练循环：按权重采样任务、Adam + cosine annealing (含 warmup)、按 epoch 保存 checkpoint。
 
 每个 batch 进行一次优化器更新：先从 ``TASK_LIST`` 中按权重随机采样一个任务，
 再对该任务调用 :func:`rf_train_step`。每个 epoch 结束时把按任务的滑动均值、
@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import random
 import time
 from pathlib import Path
@@ -20,16 +19,13 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from torch import Tensor, nn
 from torch.optim import Adam, Optimizer
-from torch.optim.lr_scheduler import (
-    LinearLR,
-    MultiStepLR,
-    SequentialLR,
-    _LRScheduler,
-)
+from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from ..model_module.tasks import TASK_LIST, TaskSpec
+from cosine_annealing_warmup import CosineAnnealingWarmupRestarts
+
+from ..model_module.tasks import TASK_LIST, TaskSpec, active_task_pairs
 from ..utils.checkpoint import load_checkpoint, save_checkpoint
 from .csv_logger import SimpleCSVLogger
 from .rectified_flow import rf_train_step
@@ -53,70 +49,41 @@ def _build_optimizer(model: nn.Module, cfg: Mapping[str, Any]) -> Optimizer:
 def _build_scheduler(
     optimizer: Optimizer,
     cfg: Mapping[str, Any],
-    total_epochs: int,
-    steps_per_epoch: int,
+    total_steps: int,
 ) -> _LRScheduler:
-    """构造 step 级调度器：可选线性 warmup + MultiStepLR。
+    """构造 step 级调度器：线性 warmup + cosine 退火（无 restart）。
 
-    与旧实现的差异：整个调度器按 **step** 计数（而非 epoch），trainer 每个
-    training step 后调一次 ``scheduler.step()``。这让我们可以用 PyTorch 官方
-    的 ``SequentialLR`` 把 ``LinearLR`` warmup 和 ``MultiStepLR`` 主干衔接起来，
-    不需要在 trainer 里按阶段切换调度粒度。
+    使用 ``cosine_annealing_warmup.CosineAnnealingWarmupRestarts``（自带
+    warmup）。把 ``first_cycle_steps = total_steps`` 让整个训练留在第一个
+    cycle 内，就实现了"no restart"：warmup 阶段 lr 从 ``min_lr`` 线性升到
+    ``max_lr = cfg.lr``，之后剩余步数从 ``max_lr`` cosine 退火到 ``min_lr``。
+    整套调度按 step 推进，trainer 每个 step 后 ``scheduler.step()`` 一次。
 
-    ``milestones_pct`` 的语义保持"占总训练进度的比例"（因为
-    ``total_steps = epochs * steps_per_epoch``，占比解释不变），只是换算时
-    用的是总 step 数。
+    Warmup 长度用 ``cfg.warmup_pct`` 配置，填 [0, 1) 的小数表示占总训练的
+    比例（例如 ``0.05`` 即 5%）。真正的 step 数在这里实时换算：
+    ``warmup_steps = round(warmup_pct * total_steps)``，这样 epochs / batch /
+    数据量变了，warmup 占比仍然保持不变。
     """
     sched_cfg = cfg["lr_scheduler"]
     name = str(sched_cfg["name"]).lower()
-    if name != "multistep":
+    if name != "cosine":
         raise ValueError(f"Unsupported lr_scheduler '{name}'.")
 
-    total_steps = max(1, int(total_epochs) * int(steps_per_epoch))
-    milestones_steps = [
-        max(1, int(round(total_steps * float(p))))
-        for p in sched_cfg["milestones_pct"]
-    ]
-    gamma = float(sched_cfg["gamma"])
-
-    warmup_steps = int(cfg.get("warmup_steps", 0))
-    main = MultiStepLR(optimizer, milestones=milestones_steps, gamma=gamma)
-    if warmup_steps <= 0:
-        return main
-
-    # LinearLR 从 start_factor 线性升到 1.0，持续 total_iters 步。
-    # start_factor 取 1/warmup_steps 以避免 LR=0 的第一步（Adam 的数值稳定性）。
-    warmup = LinearLR(
+    warmup_pct = float(cfg.get("warmup_pct", 0.0))
+    if not 0.0 <= warmup_pct < 1.0:
+        raise ValueError(
+            f"warmup_pct must be in [0, 1); got {warmup_pct}"
+        )
+    # CosineAnnealingWarmupRestarts 内部 assert warmup_steps < first_cycle_steps；
+    # round 在 warmup_pct → 1.0 时会把结果推到 total_steps 触发断言，在这里截断。
+    warmup_steps = min(int(round(warmup_pct * total_steps)), total_steps - 1)
+    return CosineAnnealingWarmupRestarts(
         optimizer,
-        start_factor=1.0 / float(warmup_steps),
-        end_factor=1.0,
-        total_iters=warmup_steps,
+        first_cycle_steps=total_steps,
+        max_lr=float(cfg["lr"]),
+        min_lr=float(sched_cfg.get("min_lr", 0.0)),
+        warmup_steps=warmup_steps,
     )
-    return SequentialLR(
-        optimizer, schedulers=[warmup, main], milestones=[warmup_steps]
-    )
-
-
-def _weighted_task_sampler(
-    weights_cfg: Mapping[str, float] | None,
-) -> list[tuple[TaskSpec, float]]:
-    """返回训练里实际参与采样的 ``(task, weight)`` 对。
-
-    权重为 0 的任务被从返回列表中剔除（"显式禁用该任务"语义）；权重为
-    NaN / Inf / 负数 直接 raise。由此所有下游消费者（训练采样、val、
-    CSV、checkpoint）都可以把返回值视作"active tasks"，不用再各自过滤。
-    """
-    weights_cfg = weights_cfg or {}
-    pairs: list[tuple[TaskSpec, float]] = []
-    for spec in TASK_LIST:
-        w = float(weights_cfg.get(spec.name, 1.0))
-        if math.isnan(w) or math.isinf(w) or w < 0:
-            raise ValueError(f"Invalid task weight for {spec.name}: {w}")
-        if w > 0:
-            pairs.append((spec, w))
-    if not pairs:
-        raise ValueError("All task weights are zero.")
-    return pairs
 
 
 def _sample_task(pairs: Sequence[tuple[TaskSpec, float]]) -> TaskSpec:
@@ -208,9 +175,7 @@ def train(
 
     optimizer = _build_optimizer(model, cfg_dict)
     steps_per_epoch = len(train_loader) if itr_per_epoch is None else int(itr_per_epoch)
-    scheduler = _build_scheduler(
-        optimizer, cfg_dict, epochs, steps_per_epoch=steps_per_epoch
-    )
+    scheduler = _build_scheduler(optimizer, cfg_dict, epochs * steps_per_epoch)
     t_sampler_cfg = cfg_dict.get("t_sampler", {})
     t_mean = float(t_sampler_cfg.get("mean", 0.0))
     t_std = float(t_sampler_cfg.get("std", 1.0))
@@ -218,7 +183,7 @@ def train(
     amp_enabled = _amp_enabled(cfg_dict, device)
     logger.info("AMP: enabled=%s dtype=bfloat16", amp_enabled)
 
-    task_pairs = _weighted_task_sampler(cfg_dict.get("task_weights"))
+    task_pairs = active_task_pairs(cfg_dict.get("task_weights"))
     active_tasks: list[TaskSpec] = [spec for spec, _ in task_pairs]
     logger.info("Training tasks: %s", [t.name for t in active_tasks])
 

@@ -1,19 +1,23 @@
 # 训练循环配置
 
-epochs: 800
+epochs: 300
 lr: 2.0e-3                # Tier 1：batch 128→512 对应 sqrt scaling (1e-3 * 2)
 weight_decay: 1.0e-6
 
-# Linear warmup 的步数。默认 520 ≈ 1 epoch @ B=512 (train_N≈265k)。
-# 设 0 可关闭 warmup。
-warmup_steps: 520
+# Linear warmup 的长度，填占总训练的比例（0~1 之间）。比如 0.05 表示 5%
+# 的 total_steps 用来 warmup；换 epochs / batch / 数据量时这个比例保持不变。
+# 实际 step 数 = round(warmup_pct * total_steps)，在 _build_scheduler 里运行
+# 时换算。设 0 可关闭 warmup。
+warmup_pct: 0.05
 
-# lr_scheduler.milestones_pct 的语义是"占总训练进度的比例"；换算到 step 粒度
-# （total_steps = epochs * steps_per_epoch），整套调度（含 warmup）都按 step 推进。
+# Cosine annealing（不做 warm restart）。使用 katsura-jp/cosine_annealing_warmup
+# 的 CosineAnnealingWarmupRestarts，把 first_cycle_steps 固定成整段训练的
+# total_steps，所以训练在首个 cycle 内完成、不触发 restart。
+# warmup_steps 阶段 lr 从 min_lr 线性升到 cfg.lr（作为 max_lr），之后 cosine
+# 退火到 min_lr。整套调度按 step 推进。
 lr_scheduler:
-  name: multistep
-  milestones_pct: [0.18, 0.75]
-  gamma: 0.1
+  name: cosine
+  min_lr: 1.0e-6
 
 # 自动混合精度（AMP）。仅在 CUDA 上启用，固定使用 bfloat16：
 # Ada/Ampere+ 与 fp16 吞吐相同，动态范围=fp32，无需 GradScaler。
@@ -46,7 +50,7 @@ task_weights:
   ecgppg2abp: 1.0
 
 # 记账项。
-val_every: 10
+val_every: 1
 ckpt_every: 1
 itr_per_epoch: null        # null 表示遍历整个 DataLoader
 log_filename: loss.csv
