@@ -10,12 +10,13 @@ weight_decay: 1.0e-6
 # 的通用默认值。
 grad_clip_norm: 1.0
 
-# Linear warmup 的长度，填占总训练的比例（0~1 之间）。比如 0.1 表示 10%
+# Linear warmup 的长度，填占总训练的比例（0~1 之间）。比如 0.005 表示 0.5%
 # 的 total_steps 用来 warmup；换 epochs / batch / 数据量时这个比例保持不变。
 # 实际 step 数 = round(warmup_pct * total_steps)，在 _build_scheduler 里运行
 # 时换算。设 0 可关闭 warmup。
-# 0.1 给 Adam 第二动量更多时间 settle，降低 warmup 后半段发散风险。
-warmup_pct: 0.1
+# 0.005 ≈ 1–2 epoch（对齐 rooster-11 / SD3 的短 warmup 实践）：Adam 第二动量
+# 时间常数约 1000 step，短 warmup 够 settle；grad_clip_norm 承担爆炸兜底。
+warmup_pct: 0.005
 
 # Cosine annealing（不做 warm restart）。使用 katsura-jp/cosine_annealing_warmup
 # 的 CosineAnnealingWarmupRestarts，把 first_cycle_steps 固定成整段训练的
