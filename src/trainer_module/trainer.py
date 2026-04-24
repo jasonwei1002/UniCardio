@@ -268,7 +268,9 @@ def train(
             else float("nan")
             for name in task_loss_sum
         }
-        lr_val = float(scheduler.get_last_lr()[0])
+        # 直接读 optimizer 而不是 scheduler.get_last_lr()：CosineAnnealingWarmupRestarts
+        # 在 torch 2.7+ 下 __init__ 不一定给 _last_lr 赋值，访问会 AttributeError。
+        lr_val = float(optimizer.param_groups[0]["lr"])
         logger.info(
             "epoch %d/%d | avg_loss %.6f | lr %.2e | %.1fs",
             epoch,
