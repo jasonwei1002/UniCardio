@@ -60,13 +60,13 @@ def test_assemble_x_full_replaces_target_slot():
 def test_build_rf_inputs_shapes_and_values():
     signal = _random_batch()
     task = TASK_LIST[0]
-    x_full, t, x0, v = build_rf_inputs(signal, task)
+    x_full, t, x1, v = build_rf_inputs(signal, task)
     assert x_full.shape == (B, 1, 3 * SLOT_LEN)
     assert t.shape == (B,)
-    assert x0.shape == (B, 1, SLOT_LEN)
+    assert x1.shape == (B, 1, SLOT_LEN)
     assert v.shape == (B, 1, SLOT_LEN)
-    # x0 必须正好等于原信号中 target slot 那一列。
-    assert torch.equal(x0[:, 0, :], signal[:, task.target_slot, :])
+    # x1 是数据端点，必须正好等于原信号中 target slot 那一列。
+    assert torch.equal(x1[:, 0, :], signal[:, task.target_slot, :])
 
 
 @pytest.mark.parametrize("task", TASK_LIST, ids=lambda t: t.name)

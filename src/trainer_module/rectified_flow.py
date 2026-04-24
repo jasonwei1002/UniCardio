@@ -1,17 +1,17 @@
 """Rectified Flow 训练步：时间采样、x_t 构造、损失计算。
 
-训练目标（Liu 等, 2022 / SD3）：
+约定 Lipman Flow Matching 方向：``t = 0`` 是噪声端，``t = 1`` 是数据端。
 
-    x_t     = (1 - t) * x_0 + t * eps,   eps ~ N(0, I),   t ∈ (0, 1)
-    v_true  = eps - x_0
-    loss    = E_{x_0, eps, t} [ || v_theta(x_t, t) - v_true ||^2 ]
+    x_t     = (1 - t) * eps + t * x_1,   eps ~ N(0, I),   t ∈ (0, 1)
+    v_true  = x_1 - eps                   # dx_t / dt
+    loss    = E_{x_1, eps, t} [ || v_theta(x_t, t) - v_true ||^2 ]
 
-网络只对 target slot 预测速度；非 target slot 保存干净的条件信号，不参与
-损失计算。
+``x_1`` 指代 target slot 的干净数据端点（Lipman 记号里数据在 t=1）；与
+diffusion 文献里 ``x_0`` 同义，只是换了时间坐标。网络只对 target slot 预测
+速度；非 target slot 保存干净的条件信号，不参与损失计算。
 
 时间采样采用 SD3 的 logit-normal：``u ~ N(0, 1); t = sigmoid(u)``。
-相比均匀采样，这样能把训练信号更多地集中在轨迹最模糊的 ``t ≈ 0.5`` 附近，
-经验上能加速收敛。
+分布关于 ``t = 0.5`` 对称，方向翻转后密度不变。
 """
 
 from __future__ import annotations
@@ -82,8 +82,9 @@ def build_rf_inputs(
     t_mean: float = 0.0,
     t_std: float = 1.0,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    """返回单步训练所需的 ``(x_full, t, x0_target, v_target)`` 张量。
+    """返回单步训练所需的 ``(x_full, t, x1_target, v_target)`` 张量。
 
+    ``x1_target`` 是 target slot 的干净数据（Lipman 记号下 ``t = 1`` 端点）。
     从 :func:`rf_train_step` 中拆出来，方便测试在不触发反向传播的情况下
     直接检查各个张量。
     """
@@ -95,18 +96,18 @@ def build_rf_inputs(
     device = batch_signal.device
     target = int(task.target_slot)
 
-    x0 = batch_signal[:, target : target + 1, :]  # (B, 1, L)
+    x1 = batch_signal[:, target : target + 1, :]  # (B, 1, L)，数据端点
 
     if eps is None:
-        eps = torch.randn_like(x0)
+        eps = torch.randn_like(x1)
     if t is None:
         t = sample_t_logit_normal(B, device=device, mean=t_mean, std=t_std)
     t_b = t.view(B, 1, 1)
 
-    x_t = (1.0 - t_b) * x0 + t_b * eps
-    v_target = eps - x0
+    x_t = (1.0 - t_b) * eps + t_b * x1
+    v_target = x1 - eps
     x_full = assemble_x_full(batch_signal, x_t, target_slot=target, L=L)
-    return x_full, t, x0, v_target
+    return x_full, t, x1, v_target
 
 
 def rf_train_step(
