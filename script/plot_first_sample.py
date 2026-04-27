@@ -1,10 +1,13 @@
-"""加载 checkpoint，对 test 集第 0 条样本绘制各 active task 的预测 vs 真值波形。
+"""加载 checkpoint，对 test 集第 0 条样本绘制各 active task 的预测 vs 真值波形，
+并额外画出 Euler 采样过程从 t=0 (噪声) 到 t=1 (数据) 的逐步演化。
 
 运行：
     python script/plot_first_sample.py \
         +checkpoint=run/outputs/<run>/checkpoints/best.pt
 
-输出 PNG 落到 ``${output_dir}/plots/first_test_sample.png``。
+输出 PNG 落到 ``${output_dir}/``：
+    - first_test_sample.png                —— 终态预测 vs 真值（所有 task 叠一张）
+    - sampling_trajectory_<task>.png       —— 每个 task 独立的 Euler 轨迹图
 """
 
 from __future__ import annotations
@@ -53,6 +56,52 @@ def _to_physical(tensor: torch.Tensor, target_slot: int) -> np.ndarray:
     return tensor.detach().cpu().numpy().squeeze()
 
 
+def _plot_one_trajectory(
+    out_path: Path,
+    traj_phys: np.ndarray,
+    target_np: np.ndarray,
+    task,
+    *,
+    n_steps: int,
+    ckpt_name: str,
+) -> None:
+    """单个 task 的 Euler 轨迹图：所有中间帧按 t 渐变着色叠在一张图里。"""
+    target_slot = int(task.target_slot)
+    target_name = _SLOT_NAMES[task.target_slot]
+    cond_names = "+".join(_SLOT_NAMES[s] for s in task.cond_slots)
+    unit = "mmHg" if target_slot == int(Slot.ABP) else "normalized"
+    L = target_np.shape[-1]
+    x_axis = np.arange(L)
+    cmap = plt.get_cmap("viridis")
+    n_frames = n_steps + 1
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    for i, frame in enumerate(traj_phys):
+        t = i / (n_frames - 1)
+        label = "x_t=0 (noise)" if i == 0 else (
+            "x_t=1 (pred)" if i == n_frames - 1 else None
+        )
+        ax.plot(x_axis, frame, color=cmap(t), linewidth=0.9, alpha=0.75, label=label)
+    ax.plot(x_axis, target_np, color="black", linewidth=1.5, label="target")
+
+    ax.set_title(
+        f"{task.name}: {cond_names} → {target_name}    Euler {n_steps}-step\n"
+        f"checkpoint: {ckpt_name}"
+    )
+    ax.set_xlabel("sample index (slot)")
+    ax.set_ylabel(f"{target_name} ({unit})")
+    ax.grid(alpha=0.3)
+    ax.legend(loc="upper right")
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0.0, 1.0))
+    sm.set_array([])
+    fig.colorbar(sm, ax=ax, label="t  (Lipman: 0 = noise → 1 = data)", pad=0.02)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Wrote %s", out_path)
+
+
 @hydra.main(
     config_path="../run/conf",
     config_name="config",
@@ -93,13 +142,22 @@ def main(cfg: DictConfig) -> None:
     )
     x_axis = np.arange(L)
 
+    # 缓存每个 task 的 trajectory 用于第二张图，避免再跑一遍 n_steps 次前向。
+    trajectories: list[np.ndarray] = []
+    targets_np: list[np.ndarray] = []
+
     for ax, task in zip(axes[:, 0], active_tasks):
         target_slot = int(task.target_slot)
         target = signal[:, target_slot:target_slot + 1, :]
-        pred = euler_sample(model, signal, task, n_steps=n_steps, device=device)
+        pred, traj = euler_sample(
+            model, signal, task,
+            n_steps=n_steps, device=device, return_trajectory=True,
+        )   # pred: (1,1,L); traj: (n_steps+1, 1, 1, L)
 
         target_np = _to_physical(target, target_slot)
         pred_np = _to_physical(pred, target_slot)
+        # traj 也走 ABP 反归一化，保证与 target 同单位
+        traj_phys = _to_physical(traj.view(-1, 1, L), target_slot).reshape(traj.size(0), -1)
 
         rmse = float(np.sqrt(np.mean((pred_np - target_np) ** 2)))
         mae = float(np.mean(np.abs(pred_np - target_np)))
@@ -118,6 +176,9 @@ def main(cfg: DictConfig) -> None:
         ax.grid(alpha=0.3)
         ax.legend(loc="upper right")
 
+        trajectories.append(traj_phys)
+        targets_np.append(target_np)
+
     axes[-1, 0].set_xlabel("sample index (slot)")
     fig.suptitle(
         f"First test sample — checkpoint: {Path(cfg.checkpoint).name}",
@@ -131,6 +192,16 @@ def main(cfg: DictConfig) -> None:
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     logger.info("Wrote %s", out_path)
     plt.close(fig)
+
+    for task, traj_phys, target_np in zip(active_tasks, trajectories, targets_np):
+        _plot_one_trajectory(
+            out_dir / f"sampling_trajectory_{task.name}.png",
+            traj_phys,
+            target_np,
+            task,
+            n_steps=n_steps,
+            ckpt_name=Path(cfg.checkpoint).name,
+        )
 
 
 if __name__ == "__main__":
