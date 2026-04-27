@@ -65,7 +65,12 @@ def _plot_one_trajectory(
     n_steps: int,
     ckpt_name: str,
 ) -> None:
-    """单个 task 的 Euler 轨迹图：所有中间帧按 t 渐变着色叠在一张图里。"""
+    """单个 task 的 Euler 轨迹图：3×3 网格，每格画一帧 + target 黑线参考。
+
+    默认 ``n_steps=8`` → 9 帧（含 ``t=0`` 噪声），刚好填满 3×3。其它步数下
+    用 ``np.linspace`` 在轨迹里挑 9 个最接近均匀的索引，可视化保持一致。
+    所有子图共享 X/Y 轴，方便横向对比每一步与真值的距离。
+    """
     target_slot = int(task.target_slot)
     target_name = _SLOT_NAMES[task.target_slot]
     cond_names = "+".join(_SLOT_NAMES[s] for s in task.cond_slots)
@@ -73,29 +78,42 @@ def _plot_one_trajectory(
     L = target_np.shape[-1]
     x_axis = np.arange(L)
     cmap = plt.get_cmap("viridis")
-    n_frames = n_steps + 1
 
-    fig, ax = plt.subplots(figsize=(12, 4))
-    for i, frame in enumerate(traj_phys):
-        t = i / (n_frames - 1)
-        label = "x_t=0 (noise)" if i == 0 else (
-            "x_t=1 (pred)" if i == n_frames - 1 else None
-        )
-        ax.plot(x_axis, frame, color=cmap(t), linewidth=0.9, alpha=0.75, label=label)
-    ax.plot(x_axis, target_np, color="black", linewidth=1.5, label="target")
+    n_frames = traj_phys.shape[0]
+    grid_n = 9
+    if n_frames == grid_n:
+        idxs = np.arange(grid_n)
+    else:
+        idxs = np.linspace(0, n_frames - 1, grid_n).round().astype(int)
 
-    ax.set_title(
-        f"{task.name}: {cond_names} → {target_name}    Euler {n_steps}-step\n"
-        f"checkpoint: {ckpt_name}"
+    fig, axes = plt.subplots(
+        3, 3, figsize=(15, 9), sharex=True, sharey=True, squeeze=False,
     )
-    ax.set_xlabel("sample index (slot)")
-    ax.set_ylabel(f"{target_name} ({unit})")
-    ax.grid(alpha=0.3)
-    ax.legend(loc="upper right")
+    for ax_pos, idx in enumerate(idxs):
+        r, c = divmod(ax_pos, 3)
+        ax = axes[r, c]
+        t = idx / (n_frames - 1)
+        ax.plot(x_axis, target_np, color="black", linewidth=1.2, alpha=0.6, label="target")
+        ax.plot(x_axis, traj_phys[idx], color=cmap(t), linewidth=1.1, label=f"x_t")
+        if idx == 0:
+            tag = "  (noise)"
+        elif idx == n_frames - 1:
+            tag = "  (pred)"
+        else:
+            tag = ""
+        ax.set_title(f"t = {t:.3f}{tag}", fontsize=10)
+        ax.grid(alpha=0.3)
+        if c == 0:
+            ax.set_ylabel(f"{target_name} ({unit})")
+        if r == 2:
+            ax.set_xlabel("sample index (slot)")
 
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0.0, 1.0))
-    sm.set_array([])
-    fig.colorbar(sm, ax=ax, label="t  (Lipman: 0 = noise → 1 = data)", pad=0.02)
+    axes[0, 0].legend(loc="upper right", fontsize=8)
+    fig.suptitle(
+        f"{task.name}: {cond_names} → {target_name}    Euler {n_steps}-step    "
+        f"checkpoint: {ckpt_name}",
+        y=1.0,
+    )
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
