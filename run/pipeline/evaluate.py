@@ -27,7 +27,7 @@ from src.model_module.tasks import Slot, active_task_pairs
 from src.model_module.unicardio_rf import UniCardioRF
 from src.trainer_module.sampler import euler_sample
 from src.utils.checkpoint import load_checkpoint
-from src.utils.metrics import ks_statistic, mae, rmse
+from src.utils.metrics import ks_statistic, mae, pearson_corr, rmse
 from src.utils.normalization import bp_denormalize
 from src.utils.seed import set_seed
 
@@ -76,6 +76,7 @@ def _eval_task(
     return {
         "rmse": rmse(preds_np, targets_np),
         "mae": mae(preds_np, targets_np),
+        "pearson": pearson_corr(preds_np, targets_np),
         "ks": ks_statistic(preds_np, targets_np),
         "n": int(preds_np.shape[0]),
     }
@@ -124,7 +125,7 @@ def main(cfg: DictConfig) -> None:
     out_csv = out_dir / "per_task_metrics.csv"
     with out_csv.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["task", "rmse", "mae", "ks", "n"])
+        writer.writerow(["task", "rmse", "mae", "pearson", "ks", "n"])
         for task in active_tasks:
             logger.info("Evaluating task %s", task.name)
             metrics = _eval_task(
@@ -135,14 +136,20 @@ def main(cfg: DictConfig) -> None:
                 n_steps=n_steps,
                 limit_batches=limit_batches,
             )
-            writer.writerow(
-                [task.name, metrics["rmse"], metrics["mae"], metrics["ks"], metrics["n"]]
-            )
-            logger.info(
-                "%s | rmse=%.4f | mae=%.4f | ks=%.4f | n=%d",
+            writer.writerow([
                 task.name,
                 metrics["rmse"],
                 metrics["mae"],
+                metrics["pearson"],
+                metrics["ks"],
+                metrics["n"],
+            ])
+            logger.info(
+                "%s | rmse=%.4f | mae=%.4f | pearson=%.4f | ks=%.4f | n=%d",
+                task.name,
+                metrics["rmse"],
+                metrics["mae"],
+                metrics["pearson"],
                 metrics["ks"],
                 metrics["n"],
             )

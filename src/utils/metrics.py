@@ -38,3 +38,27 @@ def ks_statistic(
     p = _to_numpy(pred).ravel()
     t = _to_numpy(target).ravel()
     return float(ks_2samp(p, t).statistic)
+
+
+def pearson_corr(
+    pred: Tensor | np.ndarray, target: Tensor | np.ndarray
+) -> float:
+    """逐样本 Pearson 相关系数，再对所有样本取均值。
+
+    形状假设 ``(N, ..., L)``——首维是样本，其余被展平为时间维。波形重建里
+    全局展平后求 r 会被各样本的 DC 偏移偏倚，逐样本中心化再平均更贴合
+    "波形相似度" 这一直觉。常数样本（方差为 0）会从分母上跳过；若整批
+    都常数，返回 ``nan``。
+    """
+    p = _to_numpy(pred)
+    t = _to_numpy(target)
+    p = p.reshape(p.shape[0], -1).astype(np.float64)
+    t = t.reshape(t.shape[0], -1).astype(np.float64)
+    pm = p - p.mean(axis=1, keepdims=True)
+    tm = t - t.mean(axis=1, keepdims=True)
+    num = (pm * tm).sum(axis=1)
+    den = np.sqrt((pm * pm).sum(axis=1) * (tm * tm).sum(axis=1))
+    valid = den > 0
+    if not valid.any():
+        return float("nan")
+    return float(np.mean(num[valid] / den[valid]))
