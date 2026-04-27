@@ -19,12 +19,17 @@ if [ -z "$CHECKPOINT" ] || [ ! -f "$CHECKPOINT" ]; then
     exit 1
 fi
 
-mkdir -p logs
-LOG_FILE="logs/eval_$(date +%Y%m%d_%H%M%S).log"
+# 把 eval 产物写入 checkpoint 所在 run 目录下的 eval/ 子目录，与训练同源。
+RUN_DIR="$(dirname "$(dirname "$CHECKPOINT")")"
+OUT_DIR="$RUN_DIR/eval"
+mkdir -p "$OUT_DIR"
+LOG_FILE="$OUT_DIR/eval_$(date +%Y%m%d_%H%M%S).log"
 echo "Evaluating checkpoint: $CHECKPOINT" | tee "$LOG_FILE"
+echo "Writing artifacts to: $OUT_DIR" | tee -a "$LOG_FILE"
 
 python run/pipeline/evaluate.py \
     +checkpoint="$CHECKPOINT" \
+    hydra.run.dir="$OUT_DIR" \
     device=cuda \
     data.batch_size=512 \
     data.num_workers=8 \

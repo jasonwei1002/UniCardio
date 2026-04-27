@@ -125,7 +125,7 @@ def main(cfg: DictConfig) -> None:
     )
     fig.tight_layout()
 
-    out_dir = Path(cfg.output_dir) / "plots"
+    out_dir = Path(cfg.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "first_test_sample.png"
     fig.savefig(out_path, dpi=150, bbox_inches="tight")

@@ -19,12 +19,17 @@ if [ -z "$CHECKPOINT" ] || [ ! -f "$CHECKPOINT" ]; then
     exit 1
 fi
 
-mkdir -p logs
-LOG_FILE="logs/plot_$(date +%Y%m%d_%H%M%S).log"
+# 把图写入 checkpoint 所在 run 目录下的 plots/ 子目录，与训练同源。
+RUN_DIR="$(dirname "$(dirname "$CHECKPOINT")")"
+OUT_DIR="$RUN_DIR/plots"
+mkdir -p "$OUT_DIR"
+LOG_FILE="$OUT_DIR/plot_$(date +%Y%m%d_%H%M%S).log"
 echo "Plotting checkpoint: $CHECKPOINT" | tee "$LOG_FILE"
+echo "Writing artifacts to: $OUT_DIR" | tee -a "$LOG_FILE"
 
 python script/plot_first_sample.py \
     +checkpoint="$CHECKPOINT" \
+    hydra.run.dir="$OUT_DIR" \
     device=cuda \
     data.batch_size=1 \
     data.num_workers=0 \

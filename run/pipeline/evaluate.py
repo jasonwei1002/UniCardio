@@ -119,7 +119,7 @@ def main(cfg: DictConfig) -> None:
     )]
     logger.info("Active tasks: %s", [t.name for t in active_tasks])
 
-    out_dir = Path(cfg.output_dir) / "eval"
+    out_dir = Path(cfg.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_csv = out_dir / "per_task_metrics.csv"
     with out_csv.open("w", newline="") as f:
