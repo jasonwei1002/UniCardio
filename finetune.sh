@@ -28,10 +28,18 @@ LOG_FILE="logs/finetune_$(date +%Y%m%d_%H%M%S).log"
 echo "Fine-tuning from: $CHECKPOINT" | tee "$LOG_FILE"
 echo "Extra overrides: $*" | tee -a "$LOG_FILE"
 
+# Fine-tune 时常见的需求是改任务采样权重——比如启用 ecg2ppg / ppg2ecg
+# 当辅助目标，或聚焦单条 ABP 任务。在这里直接改数值即可；命令行透传的
+# `"$@"` 会覆盖这些（Hydra 后到先得）。
 python run/pipeline/train.py \
     trainer.init_from="$CHECKPOINT" \
     device=cuda \
     data.batch_size=512 \
     data.num_workers=8 \
+    trainer.task_weights.ecg2ppg=0.0 \
+    trainer.task_weights.ppg2ecg=0.0 \
+    trainer.task_weights.ecg2abp=1.0 \
+    trainer.task_weights.ppg2abp=1.0 \
+    trainer.task_weights.ecgppg2abp=1.0 \
     "$@" \
     2>&1 | tee -a "$LOG_FILE"
