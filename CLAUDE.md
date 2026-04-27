@@ -58,7 +58,8 @@ python run/pipeline/train.py
 python run/pipeline/train.py device=cpu trainer.epochs=2 data.num_workers=0
 python run/pipeline/train.py trainer.compile.enabled=false   # skip Dynamo when iterating
 
-# Evaluation with a checkpoint.
+# Evaluation with a checkpoint. On the GPU server prefer `bash test.sh [ckpt]`,
+# which auto-picks the latest `run/outputs/*/checkpoints/best.pt` if no path is given.
 python run/pipeline/evaluate.py +checkpoint=run/outputs/<run>/checkpoints/best.pt
 ```
 
@@ -115,6 +116,7 @@ tests/                    # pytest unit tests (masks, rf_step, sampler)
 script/                   # Reusable utility scripts (data conversion, swanlog pull)
 data/Final_sig_combined.npy   # Training data (gitignored)
 train.sh                  # 一键启动训练（GPU 服务器使用，固定 Tier-1 overrides）
+test.sh                   # 一键启动评估（默认挑最新 best.pt，可传入 ckpt 路径）
 ```
 
 Convention: any reusable helper script lives in `script/` at the repo root — do not scatter them under `data/` or feature subdirs (see `convert_h5_to_npy_csv.py`, `convert_mimicbp_to_npy_csv.py`, `fetch_swanlog.py`).
@@ -129,7 +131,7 @@ Total token sequence length = `3 * slot_length = 1500`. Slot token ranges in the
 | 1    | PPG      | `[500, 1000)`|
 | 2    | ABP      | `[1000, 1500)`|
 
-`build_task_mask(task_name, L_slot)` returns an additive `(L_total, L_total)` mask with `0` on allowed cells and `-inf` elsewhere. Rule: every participating slot attends to itself; the target slot additionally attends to all condition slots; condition slots cross-attend to each other (only matters for `ecgppg2abp`); non-participating slot rows are fully blocked.
+`build_task_mask(task_name, L_slot, *, dtype=...)` returns a `(L_total, L_total)` mask. Both training (`rf_train_step`) and the Euler sampler call it with `dtype=torch.bool` (`True`=allowed) — that's what `ResidualBlock` feeds into `F.scaled_dot_product_attention`, which routes to Flash Attention on Hopper bf16. The legacy `dtype=torch.float32` path returns the additive `0`/`-inf` form for compatibility with `nn.MultiheadAttention` but isn't used in the runtime hot path. Rule: every participating slot attends to itself; the target slot additionally attends to all condition slots; condition slots cross-attend to each other (only matters for `ecgppg2abp`); non-participating slot rows are fully blocked.
 
 ### Model (`UniCardioRF` / `UniCardioBackbone`)
 
@@ -157,7 +159,7 @@ Per batch: sample one task from the active set (zero-weight tasks are pre-filter
 4. Assembles `(B, 1, 3*L)` input with clean conditions + `x_t` in the target slot.
 5. Calls the model and returns MSE between predicted and target velocity.
 
-Optimizer: Adam (default lr 1e-3, wd 1e-6). Gradient clipping: L2 norm capped at `trainer.grad_clip_norm` (default `1.0`; set to 0/null to disable) between `backward()` and `optimizer.step()` — non-optional under bf16 + Adam on RF velocity MSE, an earlier 2e-3 run diverged mid-warmup around epoch 10 without clipping. Schedule: **`cosine_annealing_warmup.CosineAnnealingWarmupRestarts`** (no warm restart — `first_cycle_steps = total_steps` so training ends before the cycle wraps). Linear warmup for `trainer.warmup_pct` (fraction of total steps in `[0, 1)`, default `0.1`; step count derived at runtime via `round(warmup_pct * total_steps)`) from `min_lr` up to `lr` (= the library's `max_lr`), then cosine anneal from `lr` down to `lr_scheduler.min_lr` (default `1e-6`) across the remaining steps; all step-granularity internally. AMP: bf16-only on CUDA, no GradScaler; CPU silently falls back to fp32. `torch.compile(mode="default")` wraps the top-level `UniCardioRF` on CUDA — `mode="reduce-overhead"` was tried and rejected because the CUDA-Graphs private pool burns ~14 GB at this batch size. Checkpoints every epoch (`latest.pt`); best tracked by mean validation RF loss (`best.pt`); `trainer.resume_from` resumes from any saved checkpoint.
+Optimizer: Adam (default lr 1e-3, wd 1e-6). Gradient clipping: L2 norm capped at `trainer.grad_clip_norm` (default `1.0`; set to 0/null to disable) between `backward()` and `optimizer.step()` — non-optional under bf16 + Adam on RF velocity MSE, an earlier 2e-3 run diverged mid-warmup around epoch 10 without clipping. Schedule: **`cosine_annealing_warmup.CosineAnnealingWarmupRestarts`** (no warm restart — `first_cycle_steps = total_steps` so training ends before the cycle wraps). Linear warmup for `trainer.warmup_pct` (fraction of total steps in `[0, 1)`, default `0.005` ≈ 1–2 epochs at current schedule; step count derived at runtime via `round(warmup_pct * total_steps)`) from `min_lr` up to `lr` (= the library's `max_lr`), then cosine anneal from `lr` down to `lr_scheduler.min_lr` (default `1e-6`) across the remaining steps; all step-granularity internally. AMP: bf16-only on CUDA, no GradScaler; CPU silently falls back to fp32. `torch.compile(mode="default")` wraps the top-level `UniCardioRF` on CUDA — `mode="reduce-overhead"` was tried and rejected because the CUDA-Graphs private pool burns ~14 GB at this batch size. Checkpoints every epoch (`latest.pt`); best tracked by mean validation RF loss (`best.pt`); `trainer.resume_from` resumes from any saved checkpoint.
 
 ### Inference API
 
@@ -165,18 +167,18 @@ Optimizer: Adam (default lr 1e-3, wd 1e-6). Gradient clipping: L2 norm capped at
 from src.trainer_module.sampler import euler_sample
 from src.model_module.tasks import TASK_SPECS
 
-task = TASK_SPECS['ecg2ppg']                    # 5 tasks total
+task = TASK_SPECS['ppg2abp']                    # any active task; 5 specs total
 out = euler_sample(
     model, conditions, task,                     # conditions: (B, 3, L)
     n_steps=8, device=device,
 )                                                # returns (B, 1, L) target-slot reconstruction
 ```
 
-The sampler integrates `v_θ` from `t = 1` → `t = 0` with Euler steps. `n_steps=8` is the default (trades speed for quality; 4-16 typical).
+The sampler integrates `v_θ` from `t = 0` (noise) → `t = 1` (data) with Euler steps, matching the Lipman convention. `n_steps=8` is the default (trades speed for quality; 4-16 typical).
 
 ## Development Notes
 
 - **Adding a new task**: extend `TASK_SPECS` in `src/model_module/tasks.py` *and* give it a non-zero entry in `trainer.task_weights` (the sampler drops zero-weight tasks). The mask builder handles any slot subset; no model surgery needed. Adding a task with a new `target_slot` will trigger a `torch.compile` re-specialization on the first batch hitting it.
-- **Single-GPU → multi-GPU**: the checkpoint save/load path already unwraps `nn.DataParallel`. For DDP, wrap before calling `train()`; the logger and ckpt code are DDP-safe per process.
+- **Single-GPU → multi-GPU**: the checkpoint save/load path unwraps `nn.DataParallel`, `DistributedDataParallel`, and `torch.compile`'s `OptimizedModule` (`_orig_mod`) — so saved `state_dict` keys stay aligned with the architecture regardless of wrapping order. For DDP, wrap before calling `train()`; the logger and ckpt code are DDP-safe per process.
 - **macOS**: 本地只用 CPU 做错误调试与 smoke test；不走 MPS（部分算子未实现，不值得维护）。
 - **Reproducibility**: `set_seed(cfg.seed)` is called at both entrypoints. Set `deterministic: true` to force cuDNN determinism (slower).
