@@ -3,7 +3,7 @@
 # channels 必须等于 len(kernel_sizes) * per_kernel_channels；构造函数中
 # 会检查这一点，以便尽早发现配置笔误。
 
-slot_length: 500
+slot_length: ${data.slot_length}
 n_slots: 3
 channels: 288          # 6 个卷积核 * 每个核 48 通道
 nheads: 9

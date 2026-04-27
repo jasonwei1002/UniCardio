@@ -1,14 +1,41 @@
 # 数据集配置
 #
-# 数据加载器会执行一次 [2, 0, 1] 的通道置换（PPG/BP/ECG -> ECG/PPG/ABP），
-# 并对模型 slot 2 做 BP 归一化 (x - 100) / 50。
+# 通过 `data.name` 在多个数据集之间切换；每个数据集的具体参数（路径、
+# 通道置换、划分逻辑）放在同名子节里。模型配置通过 `${data.slot_length}`
+# 单点引用本文件的 slot_length，避免数据/模型 slot 长度不一致。
+#
+# 数据加载器读取后会执行：
+#   1) `channel_permutation` 通道置换（让模型 slot 顺序统一为 ECG/PPG/ABP）
+#   2) ABP 通道归一化 (x - 100) / 50
 
-data_path: ${oc.env:UNICARDIO_DATA,data/Final_sig_combined.npy}
-slot_length: 500
+# 数据集选择：'combined' (Final_sig_combined.npy, slot 500) 或
+# 'pulsedb' (PulseDB Train/Test_Subset.npy, slot 1250)。切换它会自动
+# 联动 slot_length（嵌套插值从子节取），无需再单独改两处。
+name: pulsedb
 
-# 与原始随机划分一致 (random_state=42)：20k 验证 + 20k 测试，其余为训练。
-val_size: 20000
-test_size: 20000
+# 当前所选数据集的 slot 长度，从同名子节自动解析。模型配置通过
+# ${data.slot_length} 引用本字段，保证模型和数据 slot 长度恒一致。
+slot_length: ${.${.name}.slot_length}
+
+# Final_sig_combined.npy：单文件 train+val+test 三划分。
+# 文件通道顺序 (PPG, BP, ECG) -> 模型顺序 (ECG, PPG, ABP)
+combined:
+  data_path: ${oc.env:UNICARDIO_DATA,data/Final_sig_combined.npy}
+  channel_permutation: [2, 0, 1]
+  slot_length: 500
+  val_size: 20000
+  test_size: 20000
+
+# PulseDB：Train_Subset.npy 8:2 划分得 train/val，CalFree_Test_Subset.npy 作为 test。
+# 文件已按 (ECG, PPG, ABP) 顺序保存（见 script/convert_h5_to_npy_csv.py），
+# channel_permutation 走 identity。
+pulsedb:
+  train_path: data/pulsedb/Train_Subset.npy
+  test_path: data/pulsedb/CalFree_Test_Subset.npy
+  channel_permutation: [0, 1, 2]
+  slot_length: 1250
+  val_ratio: 0.2
+
 split_seed: 42
 
 batch_size: 512             # Tier 1：H20 96GB + SDPA/Flash Attention 下显存充足
