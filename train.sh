@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # UniCardio Rectified Flow 训练一键启动脚本
 # 用法：放在仓库根目录，`bash train.sh`
+# 续训用 resume.sh，不在这里混。
 set -euo pipefail
 
 cd "$(dirname "$0")"

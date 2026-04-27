@@ -173,6 +173,11 @@ def train(
     ckpt_every = int(cfg_dict.get("ckpt_every", 1))
     itr_per_epoch = cfg_dict.get("itr_per_epoch")
 
+    # Move model to device BEFORE building optimizer / loading state. Otherwise
+    # optimizer is built over CPU params, and load_checkpoint(..., map_location=device)
+    # would land Adam moments on CPU while later model.to(device) moves only params,
+    # crashing on the next optimizer.step().
+    model.to(device)
     optimizer = _build_optimizer(model, cfg_dict)
     steps_per_epoch = len(train_loader) if itr_per_epoch is None else int(itr_per_epoch)
     scheduler = _build_scheduler(optimizer, cfg_dict, epochs * steps_per_epoch)
@@ -202,6 +207,13 @@ def train(
     start_epoch = 0
     best_val = float("inf")
     resume_from = cfg_dict.get("resume_from")
+    init_from = cfg_dict.get("init_from")
+    if resume_from and init_from:
+        raise ValueError(
+            "trainer.resume_from and trainer.init_from are mutually exclusive. "
+            "Use resume_from to continue a run (restores optimizer/scheduler/epoch), "
+            "or init_from to start fresh from given model weights (fine-tune)."
+        )
     if resume_from:
         payload = load_checkpoint(
             resume_from,
@@ -212,9 +224,11 @@ def train(
         )
         start_epoch = int(payload.get("epoch", 0)) + 1
         logger.info("Resuming from epoch %d", start_epoch)
+    elif init_from:
+        load_checkpoint(init_from, model=model, map_location=device)
+        logger.info("Initialized model from %s (fine-tune mode, fresh optim/sched)", init_from)
 
     model.train()
-    model.to(device)
 
     global_step = 0
     for epoch in range(start_epoch, epochs):
