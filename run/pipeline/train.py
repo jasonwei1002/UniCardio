@@ -71,6 +71,13 @@ def main(cfg: DictConfig) -> None:
     device = _resolve_device(str(cfg.device))
     logger.info("Using device: %s", device)
 
+    # 非 deterministic 模式下显式打开 cudnn benchmark 让 Conv1d kernel auto-tune；
+    # TF32 matmul 精度调到 high 加速 norm/embedding 等仍走 fp32 的算子。bf16 AMP 已
+    # 覆盖大部分 matmul，但这两项无副作用且对长序列 pulsedb 有边际收益。
+    if device.type == "cuda" and not bool(cfg.deterministic):
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
+
     train_loader, val_loader, _ = build_loaders(cfg.data)
 
     model = UniCardioRF(cfg.model)

@@ -128,15 +128,21 @@ def build_loaders(
     )
     pin_memory = bool(cfg.get("pin_memory", True))
 
-    loader_kwargs = {
+    loader_kwargs: dict[str, Any] = {
         "batch_size": batch_size,
         "num_workers": num_workers,
         "pin_memory": pin_memory,
         "worker_init_fn": worker_init_fn if num_workers > 0 else None,
     }
+    # 长 epoch 下 worker 重启 + mmap 重开开销不可忽略；prefetch 提到 4 让 GPU 不饿。
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 4
 
+    # train loader 走 drop_last=True：保持 batch 形状常驻，避免 torch.compile 在
+    # 末尾短 batch 上 recompile。val/test 不能 drop——评估要看全样本。
     train_loader = DataLoader(
-        CardiacDataset(*train_spec), shuffle=True, **loader_kwargs
+        CardiacDataset(*train_spec), shuffle=True, drop_last=True, **loader_kwargs
     )
     val_loader = DataLoader(
         CardiacDataset(*val_spec), shuffle=False, **loader_kwargs

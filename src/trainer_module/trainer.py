@@ -39,10 +39,16 @@ def _amp_enabled(cfg: Mapping[str, Any], device: torch.device) -> bool:
 
 
 def _build_optimizer(model: nn.Module, cfg: Mapping[str, Any]) -> Optimizer:
+    # fused=True 走 CUDA 的多张量融合路径，单 step 比逐参数版本省可观的 launch 开销；
+    # CPU 上不支持，退回默认实现。
+    fused = torch.cuda.is_available() and any(
+        p.is_cuda for p in model.parameters()
+    )
     return Adam(
         model.parameters(),
         lr=float(cfg["lr"]),
         weight_decay=float(cfg.get("weight_decay", 1.0e-6)),
+        fused=fused,
     )
 
 

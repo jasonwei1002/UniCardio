@@ -12,10 +12,10 @@ LOG_FILE="logs/train_$(date +%Y%m%d_%H%M%S).log"
 
 python run/pipeline/train.py \
     device=cuda \
-    data.batch_size=512 \
+    data.batch_size=256 \
     data.num_workers=8 \
     trainer.amp.enabled=true \
     trainer.compile.enabled=true \
     trainer.compile.mode=default \
-    trainer.val_every=1 \
+    trainer.val_every=3 \
     2>&1 | tee "$LOG_FILE"
