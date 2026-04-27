@@ -41,6 +41,8 @@ class UniCardioRF(nn.Module):
         super().__init__()
         self.backbone = UniCardioBackbone(config)
         self.L = self.backbone.L
+        # trainer / sampler 据此构造 attention mask 的形状，下采样后必须用内部长度。
+        self.transformer_slot_length = self.backbone.transformer_slot_length
 
     def forward(
         self,

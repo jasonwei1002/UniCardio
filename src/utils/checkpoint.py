@@ -15,19 +15,21 @@ from torch.optim.lr_scheduler import _LRScheduler
 logger = logging.getLogger(__name__)
 
 
-def _unwrap_model(model: nn.Module) -> nn.Module:
+def unwrap_model(model: nn.Module) -> nn.Module:
     """剥掉 ``DataParallel`` / ``DDP`` / ``torch.compile`` 的包装。
 
-    ``torch.compile`` 返回的 ``OptimizedModule`` 把原始模块放在 ``_orig_mod``
-    属性下；直接对其调用 ``state_dict()`` 会出现 ``_orig_mod.`` 前缀，导致
-    checkpoint 与未编译版本不兼容。这里统一解包，让 state_dict 的 key 始终
-    与架构定义一致。
+    用 ``while`` 直到稳定，可以处理 ``DDP(compile(m))`` 与 ``compile(DDP(m))``
+    两种嵌套顺序。
     """
-    if isinstance(model, (nn.DataParallel, nn.parallel.DistributedDataParallel)):
-        model = model.module
-    if hasattr(model, "_orig_mod"):
-        model = model._orig_mod
-    return model
+    while True:
+        if isinstance(
+            model, (nn.DataParallel, nn.parallel.DistributedDataParallel)
+        ):
+            model = model.module
+        elif hasattr(model, "_orig_mod"):
+            model = model._orig_mod
+        else:
+            return model
 
 
 def save_checkpoint(
@@ -53,7 +55,7 @@ def save_checkpoint(
         task_list: 可选，参与训练的任务名列表。
         extra: 可选，会并入 checkpoint 的额外字段。
     """
-    target = _unwrap_model(model)
+    target = unwrap_model(model)
     model_state = target.state_dict()
 
     payload: dict[str, Any] = {
@@ -98,7 +100,7 @@ def load_checkpoint(
     返回完整的 payload，方便调用者读取 ``epoch`` 或 ``config`` 等字段。
     """
     payload = torch.load(Path(path), map_location=map_location, weights_only=False)
-    target = _unwrap_model(model)
+    target = unwrap_model(model)
     target.load_state_dict(payload["model_state"], strict=strict)
     if optimizer is not None and payload.get("optimizer_state") is not None:
         optimizer.load_state_dict(payload["optimizer_state"])

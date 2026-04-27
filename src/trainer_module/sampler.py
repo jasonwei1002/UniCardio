@@ -15,7 +15,7 @@ from torch import Tensor, nn
 
 from ..model_module.attention_masks import build_task_mask
 from ..model_module.tasks import TaskSpec
-from .rectified_flow import assemble_x_full
+from .rectified_flow import _model_transformer_slot_length, assemble_x_full
 
 
 @torch.no_grad()
@@ -57,9 +57,10 @@ def euler_sample(
     B, _, L = conditions.shape
     target = int(task.target_slot)
     conditions = conditions.to(device)
-    # mask 只与 (task.name, L, device, dtype) 有关，n_steps 个步骤可共用一份。
+    L_inner = _model_transformer_slot_length(model, L)
+    # mask 只与 (task.name, L_inner, device, dtype) 有关，n_steps 个步骤共用一份。
     mask = build_task_mask(
-        task.name, L, device=str(device), dtype=torch.bool
+        task.name, L_inner, device=str(device), dtype=torch.bool
     )
 
     x = torch.randn(B, 1, L, device=device)  # x_{t=0} ~ N(0, I)
