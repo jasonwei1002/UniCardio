@@ -61,6 +61,9 @@ class CardiacDataset(Dataset):
         # 一次 advanced indexing 即完成「行选取 + 通道置换」，并产出一份 owned、
         # writable、C-contiguous 的 ndarray（numpy 高级索引语义保证）；之后
         # `from_numpy` 可零拷贝接管，DataLoader 的 collate + pin_memory 也安全。
-        x = self._mm[self._indices[idx], self._perm]
+        # `astype(copy=False)` 在源已是 float32（如 PulseDB）时是 no-op；源是
+        # float64（如 Final_sig_combined.npy）时执行一次显式 cast，否则
+        # `torch.from_numpy` 会拿到 double tensor，conv1d 会报 dtype 不匹配。
+        x = self._mm[self._indices[idx], self._perm].astype(np.float32, copy=False)
         x[2] = bp_normalize(x[2])
         return (torch.from_numpy(x),)
