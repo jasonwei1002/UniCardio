@@ -97,7 +97,7 @@ def load_checkpoint(
 
     返回完整的 payload，方便调用者读取 ``epoch`` 或 ``config`` 等字段。
     """
-    payload = torch.load(Path(path), map_location=map_location)
+    payload = torch.load(Path(path), map_location=map_location, weights_only=False)
     target = _unwrap_model(model)
     target.load_state_dict(payload["model_state"], strict=strict)
     if optimizer is not None and payload.get("optimizer_state") is not None:
