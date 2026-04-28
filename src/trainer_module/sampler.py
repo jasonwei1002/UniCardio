@@ -15,7 +15,7 @@ from torch import Tensor, nn
 
 from ..model_module.attention_masks import build_task_mask
 from ..model_module.tasks import TaskSpec
-from .rectified_flow import _model_transformer_slot_length, assemble_x_full
+from .rectified_flow import assemble_x_full
 
 
 @torch.no_grad()
@@ -57,10 +57,9 @@ def euler_sample(
     B, _, L = conditions.shape
     target = int(task.target_slot)
     conditions = conditions.to(device)
-    L_inner = _model_transformer_slot_length(model, L)
-    # mask 只与 (task.name, L_inner, device, dtype) 有关，n_steps 个步骤共用一份。
+    # mask 只与 (task.name, L, device, dtype) 有关，n_steps 个步骤共用一份。
     mask = build_task_mask(
-        task.name, L_inner, device=str(device), dtype=torch.bool
+        task.name, L, device=str(device), dtype=torch.bool
     )
 
     x = torch.randn(B, 1, L, device=device)  # x_{t=0} ~ N(0, I)
@@ -68,9 +67,10 @@ def euler_sample(
     traj: list[Tensor] = [x.clone()] if return_trajectory else []
 
     for i in range(n_steps):
-        t_cur, t_next = ts[i], ts[i + 1]
-        dt = t_next - t_cur  # 正值
-        t_b = torch.full((B,), float(t_cur), device=device)
+        # ts[i] 是 0-d device 张量；用 expand 取代 torch.full(float(...))，避免每步
+        # host-sync，便于将来对 euler_sample 做 CUDA Graph 捕获。
+        t_b = ts[i].expand(B)
+        dt = ts[i + 1] - ts[i]  # 正值
         x_full = assemble_x_full(conditions, x, target_slot=target, L=L)
         v = model(x_full, t_b, mask, target)
         x = x + v * dt

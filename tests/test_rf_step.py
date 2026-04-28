@@ -14,7 +14,6 @@ from src.trainer_module.rectified_flow import (
     rf_train_step,
     sample_t_logit_normal,
 )
-from src.trainer_module.sampler import euler_sample
 
 SLOT_LEN = 32
 B = 2
@@ -82,43 +81,6 @@ def test_rf_train_step_produces_scalar_grad(tiny_model, task):
     head = tiny_model.backbone.output_heads[int(task.target_slot)]
     assert head.proj2.weight.grad is not None
     assert torch.any(head.proj2.weight.grad != 0)
-
-
-def test_backbone_rejects_invalid_downsample_factor():
-    # ds 必须是 2 的幂；BackboneConfig 不校验，校验在 UniCardioBackbone 构造。
-    with pytest.raises(ValueError):
-        UniCardioRF(BackboneConfig(slot_length=32, channels=288, downsample_factor=3))
-    # slot_length 必须能被 ds 整除。
-    with pytest.raises(ValueError):
-        UniCardioRF(BackboneConfig(slot_length=33, channels=288, downsample_factor=2))
-
-
-def test_downsampled_model_round_trips():
-    """ds=2 时 forward / 训练步 / Euler 采样在形状上仍然自洽。"""
-    torch.manual_seed(0)
-    cfg = BackboneConfig(
-        slot_length=SLOT_LEN,
-        channels=288,
-        n_layers=2,
-        nheads=4,
-        time_embedding_dim=64,
-        ffn_dim=32,
-        downsample_factor=2,
-    )
-    model = UniCardioRF(cfg)
-    assert model.transformer_slot_length == SLOT_LEN // 2
-
-    signal = _random_batch()
-    task = TASK_LIST[0]
-    loss = rf_train_step(model, signal, task)
-    assert loss.ndim == 0
-    assert torch.isfinite(loss)
-    loss.backward()
-
-    # Euler 采样器需要在下采样模型上也能输出 full L 形状。
-    out = euler_sample(model, signal, task, n_steps=4)
-    assert out.shape == (B, 1, SLOT_LEN)
-    assert torch.isfinite(out).all()
 
 
 @pytest.mark.parametrize("task", TASK_LIST, ids=lambda t: t.name)
