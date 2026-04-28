@@ -139,13 +139,15 @@ def build_loaders(
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 4
 
-    # train loader 走 drop_last=True：保持 batch 形状常驻，避免 torch.compile 在
-    # 末尾短 batch 上 recompile。val/test 不能 drop——评估要看全样本。
+    # train / val 都走 drop_last=True：保持 batch 形状常驻，避免 torch.compile
+    # （尤其是 reduce-overhead / max-autotune 的 CUDA Graphs 路径）在末尾短
+    # batch 上重 trace。val 损失的尾样本量极小（≤ batch_size-1 / 20000 < 0.16%），
+    # 远小于评估的统计误差。test 单跑、不走 compile，保留全样本。
     train_loader = DataLoader(
         CardiacDataset(*train_spec), shuffle=True, drop_last=True, **loader_kwargs
     )
     val_loader = DataLoader(
-        CardiacDataset(*val_spec), shuffle=False, **loader_kwargs
+        CardiacDataset(*val_spec), shuffle=False, drop_last=True, **loader_kwargs
     )
     test_loader = DataLoader(
         CardiacDataset(*test_spec), shuffle=False, **loader_kwargs

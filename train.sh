@@ -17,6 +17,6 @@ python run/pipeline/train.py \
     model.downsample_factor=1 \
     trainer.amp.enabled=true \
     trainer.compile.enabled=true \
-    trainer.compile.mode=default \
+    trainer.compile.mode=reduce-overhead \
     trainer.val_every=1 \
     2>&1 | tee "$LOG_FILE"
