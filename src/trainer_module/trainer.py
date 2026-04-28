@@ -345,7 +345,9 @@ def train(
                 )
 
         csv_logger.log_mapping(row)
-        # 用 epoch/、val/ 前缀，避免与 batch 级 train/loss 共享 step 轴时相互覆盖。
+        # epoch/ 与 val/ 前缀的 metric 用 epoch 作为 step，让 SwanLab chart 的
+        # 横轴显示 0, 1, 2, ...（epoch 数）。SwanLab 按 key 独立维护 step 计数，
+        # 不会与 batch 级 train/loss 的 global_step 冲突。
         epoch_metrics: dict[str, float] = {
             "epoch/avg_loss": avg,
             "epoch/lr": lr_val,
@@ -356,7 +358,7 @@ def train(
             epoch_metrics["val/loss_mean"] = row["val_loss_mean"]
             for t in active_tasks:
                 epoch_metrics[f"val/loss_{t.name}"] = row[f"val_loss_{t.name}"]
-        swanlab.log(epoch_metrics, step=global_step)
+        swanlab.log(epoch_metrics, step=epoch)
 
         if (epoch + 1) % ckpt_every == 0:
             save_checkpoint(
