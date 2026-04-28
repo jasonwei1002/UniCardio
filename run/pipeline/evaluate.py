@@ -17,6 +17,7 @@ import hydra
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
+from tqdm import tqdm
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -61,7 +62,16 @@ def _eval_task(
 ) -> dict[str, float]:
     preds: list[np.ndarray] = []
     targets: list[np.ndarray] = []
-    for batch_idx, batch in enumerate(loader):
+    total = limit_batches if limit_batches is not None else len(loader)
+    test_iter = tqdm(
+        loader,
+        desc=f"test {task.name}",
+        mininterval=5.0,
+        maxinterval=50.0,
+        total=total,
+        leave=False,
+    )
+    for batch_idx, batch in enumerate(test_iter):
         signal = batch[0].to(device)
         target = signal[:, int(task.target_slot):int(task.target_slot) + 1, :]
         pred = euler_sample(model, signal, task, n_steps=n_steps, device=device)

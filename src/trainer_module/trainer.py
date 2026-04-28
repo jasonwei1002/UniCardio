@@ -106,7 +106,7 @@ def _csv_fields() -> list[str]:
     return fields
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def _evaluate(
     model: nn.Module,
     val_loader: DataLoader,
@@ -120,10 +120,20 @@ def _evaluate(
 ) -> dict[str, float]:
     """在验证集上按任务计算平均 RF loss；``tasks`` 指定评估集合。"""
     model.eval()
-    sums = {t.name: 0.0 for t in tasks}
+    # GPU 上累加，循环结束再一次性 .item()：避免 1092 次 host sync 撕碎 stream。
+    sums = {t.name: torch.zeros((), device=device) for t in tasks}
     counts = {t.name: 0 for t in tasks}
-    for batch_idx, batch in enumerate(val_loader):
-        signal = batch[0].to(device)
+    total = max_batches if max_batches is not None else len(val_loader)
+    val_iter = tqdm(
+        val_loader,
+        desc="val",
+        mininterval=5.0,
+        maxinterval=50.0,
+        total=total,
+        leave=False,
+    )
+    for batch_idx, batch in enumerate(val_iter):
+        signal = batch[0].to(device, non_blocking=True)
         for task in tasks:
             with torch.autocast(
                 device_type=device.type,
@@ -133,13 +143,13 @@ def _evaluate(
                 loss = rf_train_step(
                     model, signal, task, t_mean=t_mean, t_std=t_std
                 )
-            sums[task.name] += float(loss.item())
+            sums[task.name] += loss
             counts[task.name] += 1
         if max_batches is not None and (batch_idx + 1) >= max_batches:
             break
     model.train()
     return {
-        name: (sums[name] / counts[name]) if counts[name] else float("nan")
+        name: (sums[name].item() / counts[name]) if counts[name] else float("nan")
         for name in sums
     }
 
@@ -248,7 +258,6 @@ def train(
             train_loader,
             mininterval=5.0,
             maxinterval=50.0,
-            disable=not (hasattr(tqdm, "_instances") and True),
             desc=f"epoch {epoch}/{epochs - 1}",
         )
         for batch_idx, batch in enumerate(it, start=1):
