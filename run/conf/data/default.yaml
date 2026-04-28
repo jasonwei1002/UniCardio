@@ -30,10 +30,10 @@ combined:
 # 文件已按 (ECG, PPG, ABP) 顺序保存（见 script/convert_h5_to_npy_csv.py），
 # channel_permutation 走 identity。
 pulsedb:
-  train_path: data/pulsedb/Train_Subset.npy
-  test_path: data/pulsedb/CalFree_Test_Subset.npy
+  train_path: data/pulsedb/Train_Subset_500.npy
+  test_path: data/pulsedb/CalFree_Test_Subset_500.npy
   channel_permutation: [0, 1, 2]
-  slot_length: 1250
+  slot_length: 500
   val_ratio: 0.2
 
 split_seed: 42
