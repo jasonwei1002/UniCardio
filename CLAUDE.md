@@ -44,26 +44,41 @@ Python 3.10+, PyTorch 2.x, Hydra 1.3.
 Run from the **repo root** — Hydra finds configs in `run/conf`:
 
 ```bash
-# Unit tests (mask semantics, RF step, sampler — 13 tests, ~1 s on CPU).
+# Unit tests (mask semantics, RF step, sampler — ~35 parametrized tests, < 5 s on CPU).
 python -m pytest tests/
-python -m pytest tests/test_masks.py::test_self_only_for_active_slots   # single test
+python -m pytest tests/test_masks.py -k mask_shape_and_dtype             # single test
 
 # CPU smoke test: overfits a tiny synthetic batch for each task,
 # verifies loss drop + Euler reconstruction. ~70 s total.
 python run/pipeline/smoke_test.py
 
 # Full training run (overrides via Hydra CLI). On the GPU server prefer `bash train.sh`,
-# which fixes the canonical Tier-1 overrides (batch 512, bf16 AMP, torch.compile, warmup).
+# which fixes the canonical Tier-1 overrides (batch 512, bf16 AMP, val_every=1).
+# Note: train.sh currently disables torch.compile (Dynamo recompiles cost more than
+# they save at this batch). Re-enable via `trainer.compile.enabled=true` if desired.
 python run/pipeline/train.py
 python run/pipeline/train.py device=cpu trainer.epochs=2 data.num_workers=0
 python run/pipeline/train.py trainer.compile.enabled=false   # skip Dynamo when iterating
 
+# Resume from a checkpoint (model + optimizer + scheduler + epoch; reuses the
+# original run dir so loss.csv / swanlog append cleanly).
+bash resume.sh                               # picks latest.pt automatically
+bash resume.sh path/to/latest.pt trainer.epochs=600
+
+# Fine-tune: load **only the model weights** as init, fresh optimizer / scheduler /
+# epoch, new Hydra run dir. Useful for swapping task_weights or lr.
+bash finetune.sh path/to/best.pt trainer.lr=1e-4
+
 # Evaluation with a checkpoint. On the GPU server prefer `bash test.sh [ckpt]`,
 # which auto-picks the latest `run/outputs/*/checkpoints/best.pt` if no path is given.
 python run/pipeline/evaluate.py +checkpoint=run/outputs/<run>/checkpoints/best.pt
+
+# Visualize first test sample, one figure per active task. Output goes to the
+# checkpoint's run dir under `plots/`.
+bash plot.sh                                 # picks latest best.pt automatically
 ```
 
-`data_path` resolves through `${oc.env:UNICARDIO_DATA, data/Final_sig_combined.npy}` — set `UNICARDIO_DATA=/abs/path/to.npy` to point at a different dataset without editing the config.
+For the legacy `combined` dataset, `data.combined.data_path` resolves through `${oc.env:UNICARDIO_DATA, data/Final_sig_combined.npy}` — set `UNICARDIO_DATA=/abs/path/to.npy` to point at a different file without editing the config. The PulseDB dataset uses fixed paths (`data/pulsedb/*.npy`) defined in `run/conf/data/default.yaml`.
 
 Hydra writes per-run artifacts under `run/outputs/<timestamp>/`:
 - `checkpoints/latest.pt`, `checkpoints/best.pt` — full state (model, optimizer, scheduler, config, RNG).
@@ -77,11 +92,16 @@ SwanLab is wired in `run/pipeline/train.py::_init_swanlab` and `src/trainer_modu
 
 ## Data Preparation
 
-Training data: `data/Final_sig_combined.npy`, shape `(N, 3, 500)`.
+Two datasets are wired in (switch via `data.name`); both feed into the model in slot order **ECG=0, PPG=1, ABP=2**, and both apply BP normalization `(x - 100) / 50` to slot 2 inside `CardiacDataset.__getitem__`. Slots are never indexed by raw channel order downstream.
 
-**Important**: the on-disk channel order is PPG=0, BP=1, ECG=2, but the model operates in slot order **ECG=0, PPG=1, ABP=2**. The data loader applies a single permutation `[2, 0, 1]` in `src/data_module/datamodule.py::load_and_preprocess` and also applies the BP normalization `(x - 100) / 50` on model slot 2. Everything downstream speaks exclusively in model slot indices.
+| `data.name`  | Files | Slot length | Channel permutation | Split |
+|--------------|-------|-------------|---------------------|-------|
+| `pulsedb` (default) | `data/pulsedb/Train_Subset_vitaldb_500.npy` + `data/pulsedb/CalFree_Test_Subset_vitaldb_500.npy` | 500 | `[0, 1, 2]` (already ECG/PPG/ABP) | Train file 80:20 → train/val; second file = test |
+| `combined` (legacy) | `data/Final_sig_combined.npy` | 500 | `[2, 0, 1]` (on-disk PPG/BP/ECG → ECG/PPG/ABP) | 20 000 val + 20 000 test + remainder train |
 
-Data split: 20 000 validation + 20 000 test + remainder train, `random_state=42` (matches the original codebase).
+Both datasets use `data.split_seed=42` for reproducibility. The PulseDB files are produced by `script/convert_h5_to_npy_csv.py` followed by `script/filter_and_split_pulsedb_to_500.py`, which keeps only VitalDB-source rows that have full demographics (height/weight/bmi) and slices each 1 250-sample window into two non-overlapping 500-sample halves.
+
+Datasets are read with `mmap_mode="r"`; only **indices** are split, so the 13 GB PulseDB file never lands in RAM. Permutation + BP normalization happen lazily per sample in `src/data_module/cardiac_dataset.py`.
 
 ## Architecture
 
@@ -113,10 +133,18 @@ run/
 └── outputs/              # Hydra run directories (gitignored)
 
 tests/                    # pytest unit tests (masks, rf_step, sampler)
-script/                   # Reusable utility scripts (data conversion, swanlog pull)
-data/Final_sig_combined.npy   # Training data (gitignored)
+script/                   # Reusable utility scripts:
+                          #   - convert_h5_to_npy_csv.py / convert_mimicbp_to_npy_csv.py (raw → .npy)
+                          #   - split_pulsedb_to_500.py / filter_and_split_pulsedb_to_500.py (1250→500 slicing + VitalDB filter)
+                          #   - plot_first_sample.py (Hydra entrypoint behind plot.sh)
+                          #   - fetch_swanlog.py (also exposed as /swanlog slash command)
+data/                     # Datasets (gitignored): Final_sig_combined.npy or pulsedb/*.npy
+reports/                  # Refactor / experiment design notes (RF cascade, Tier-1, DDP)
 train.sh                  # 一键启动训练（GPU 服务器使用，固定 Tier-1 overrides）
+resume.sh                 # 续训（沿用原 run 目录，恢复 model/opt/sched/epoch）
+finetune.sh               # 仅以 ckpt 权重做 init，新 run 目录、新 opt/sched
 test.sh                   # 一键启动评估（默认挑最新 best.pt，可传入 ckpt 路径）
+plot.sh                   # 一键可视化（test 第 0 条样本，每个 active task 一张图）
 ```
 
 Convention: any reusable helper script lives in `script/` at the repo root — do not scatter them under `data/` or feature subdirs (see `convert_h5_to_npy_csv.py`, `convert_mimicbp_to_npy_csv.py`, `fetch_swanlog.py`).
@@ -179,6 +207,7 @@ The sampler integrates `v_θ` from `t = 0` (noise) → `t = 1` (data) with Euler
 ## Development Notes
 
 - **Adding a new task**: extend `TASK_SPECS` in `src/model_module/tasks.py` *and* give it a non-zero entry in `trainer.task_weights` (the sampler drops zero-weight tasks). The mask builder handles any slot subset; no model surgery needed. Adding a task with a new `target_slot` will trigger a `torch.compile` re-specialization on the first batch hitting it.
+- **Switching dataset**: flip `data.name=pulsedb|combined` (or override on the CLI). `slot_length` resolves automatically from the matching subsection via Hydra interpolation, so the model config (which references `${data.slot_length}`) stays in sync — never edit `slot_length` in two places.
 - **Single-GPU → multi-GPU**: the checkpoint save/load path unwraps `nn.DataParallel`, `DistributedDataParallel`, and `torch.compile`'s `OptimizedModule` (`_orig_mod`) — so saved `state_dict` keys stay aligned with the architecture regardless of wrapping order. For DDP, wrap before calling `train()`; the logger and ckpt code are DDP-safe per process.
 - **macOS**: 本地只用 CPU 做错误调试与 smoke test；不走 MPS（部分算子未实现，不值得维护）。
 - **Reproducibility**: `set_seed(cfg.seed)` is called at both entrypoints. Set `deterministic: true` to force cuDNN determinism (slower).

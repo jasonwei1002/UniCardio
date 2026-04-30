@@ -134,15 +134,12 @@ def build_loaders(
         "pin_memory": pin_memory,
         "worker_init_fn": worker_init_fn if num_workers > 0 else None,
     }
-    # 长 epoch 下 worker 重启 + mmap 重开开销不可忽略；prefetch 提到 4 让 GPU 不饿。
+    
     if num_workers > 0:
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 4
 
-    # train / val 都走 drop_last=True：保持 batch 形状常驻，避免 torch.compile
-    # （尤其是 reduce-overhead / max-autotune 的 CUDA Graphs 路径）在末尾短
-    # batch 上重 trace。val 损失的尾样本量极小（≤ batch_size-1 / 20000 < 0.16%），
-    # 远小于评估的统计误差。test 单跑、不走 compile，保留全样本。
+
     train_loader = DataLoader(
         CardiacDataset(*train_spec), shuffle=True, drop_last=True, **loader_kwargs
     )

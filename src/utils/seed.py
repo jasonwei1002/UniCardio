@@ -1,4 +1,3 @@
-"""实验可复现性随机种子，遵循 ~/.claude/rules/experiment-reproducibility.md。"""
 
 from __future__ import annotations
 

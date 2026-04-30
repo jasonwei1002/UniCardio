@@ -17,5 +17,5 @@ python run/pipeline/train.py \
     trainer.amp.enabled=true \
     trainer.compile.enabled=false \
     trainer.compile.mode=reduce-overhead \
-    trainer.val_every=1 \
+    trainer.val_every=2 \
     2>&1 | tee "$LOG_FILE"

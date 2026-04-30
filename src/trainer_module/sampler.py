@@ -67,8 +67,6 @@ def euler_sample(
     traj: list[Tensor] = [x.clone()] if return_trajectory else []
 
     for i in range(n_steps):
-        # ts[i] 是 0-d device 张量；用 expand 取代 torch.full(float(...))，避免每步
-        # host-sync，便于将来对 euler_sample 做 CUDA Graph 捕获。
         t_b = ts[i].expand(B)
         dt = ts[i + 1] - ts[i]  # 正值
         x_full = assemble_x_full(conditions, x, target_slot=target, L=L)

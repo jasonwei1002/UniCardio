@@ -1,8 +1,5 @@
 """输入编码器与时间条件 embedding。
 
-``SignalEncoder`` 原样保留自 UniCardio 原始代码：6 条并行的 Conv1d 分支
-（卷积核 1/3/5/7/9/11，每条输出 48 通道），在通道维 concat 成 288 通道的
-特征图。权重使用 Kaiming-normal 初始化，与原实现一致。
 
 ``FlowTimeEmbedding`` 在 Rectified Flow 中替换了原来的 ``DiffusionEmbedding``。
 它将连续时间 ``t ∈ [0, 1]`` 映射到正弦特征向量，再经过两层 SiLU MLP。

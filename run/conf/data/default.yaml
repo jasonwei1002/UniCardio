@@ -26,12 +26,7 @@ combined:
   val_size: 20000
   test_size: 20000
 
-# PulseDB：Train_Subset.npy 8:2 划分得 train/val，CalFree_Test_Subset.npy 作为 test。
-# 文件已按 (ECG, PPG, ABP) 顺序保存（见 script/convert_h5_to_npy_csv.py），
-# channel_permutation 走 identity。
-# vitaldb_500 子集：在 _500 切片基础上，用 csv 元数据筛掉 height/weight/bmi
-# 缺失的样本（保留约 51.6% 的行，对应 VitalDB 来源），再按 0:500 / 500:1000
-# 切成 (3, 500)；详见 script/filter_and_split_pulsedb_to_500.py。
+
 pulsedb:
   train_path: data/pulsedb/Train_Subset_vitaldb_500.npy
   test_path: data/pulsedb/CalFree_Test_Subset_vitaldb_500.npy
@@ -41,7 +36,7 @@ pulsedb:
 
 split_seed: 42
 
-batch_size: 512             # Tier 1：H20 96GB + SDPA/Flash Attention 下显存充足
+batch_size: 512             
 num_workers: 8
 pin_memory: true
 

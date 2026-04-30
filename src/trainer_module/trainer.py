@@ -57,19 +57,7 @@ def _build_scheduler(
     cfg: Mapping[str, Any],
     total_steps: int,
 ) -> _LRScheduler:
-    """构造 step 级调度器：线性 warmup + cosine 退火（无 restart）。
 
-    使用 ``cosine_annealing_warmup.CosineAnnealingWarmupRestarts``（自带
-    warmup）。把 ``first_cycle_steps = total_steps`` 让整个训练留在第一个
-    cycle 内，就实现了"no restart"：warmup 阶段 lr 从 ``min_lr`` 线性升到
-    ``max_lr = cfg.lr``，之后剩余步数从 ``max_lr`` cosine 退火到 ``min_lr``。
-    整套调度按 step 推进，trainer 每个 step 后 ``scheduler.step()`` 一次。
-
-    Warmup 长度用 ``cfg.warmup_pct`` 配置，填 [0, 1) 的小数表示占总训练的
-    比例（例如 ``0.05`` 即 5%）。真正的 step 数在这里实时换算：
-    ``warmup_steps = round(warmup_pct * total_steps)``，这样 epochs / batch /
-    数据量变了，warmup 占比仍然保持不变。
-    """
     sched_cfg = cfg["lr_scheduler"]
     name = str(sched_cfg["name"]).lower()
     if name != "cosine":
@@ -120,7 +108,6 @@ def _evaluate(
 ) -> dict[str, float]:
     """在验证集上按任务计算平均 RF loss；``tasks`` 指定评估集合。"""
     model.eval()
-    # GPU 上累加，循环结束再一次性 .item()：避免 1092 次 host sync 撕碎 stream。
     sums = {t.name: torch.zeros((), device=device) for t in tasks}
     counts = {t.name: 0 for t in tasks}
     total = max_batches if max_batches is not None else len(val_loader)
@@ -308,8 +295,7 @@ def train(
             else float("nan")
             for name in task_loss_sum
         }
-        # 直接读 optimizer 而不是 scheduler.get_last_lr()：CosineAnnealingWarmupRestarts
-        # 在 torch 2.7+ 下 __init__ 不一定给 _last_lr 赋值，访问会 AttributeError。
+
         lr_val = float(optimizer.param_groups[0]["lr"])
         logger.info(
             "epoch %d/%d | avg_loss %.6f | lr %.2e | %.1fs",
@@ -354,9 +340,7 @@ def train(
                 )
 
         csv_logger.log_mapping(row)
-        # epoch/ 与 val/ 前缀的 metric 用 epoch 作为 step，让 SwanLab chart 的
-        # 横轴显示 0, 1, 2, ...（epoch 数）。SwanLab 按 key 独立维护 step 计数，
-        # 不会与 batch 级 train/loss 的 global_step 冲突。
+
         epoch_metrics: dict[str, float] = {
             "epoch/avg_loss": avg,
             "epoch/lr": lr_val,

@@ -6,8 +6,6 @@ Slot 约定（模型顺序，区别于磁盘文件中的 PPG/BP/ECG 顺序）：
     PPG = 1
     ABP = 2
 
-数据加载器会执行一次 ``[2, 0, 1]`` 的通道置换，因此下游所有代码（模型、
-mask、损失、采样器、指标）都只使用模型 slot 索引。
 """
 
 from __future__ import annotations

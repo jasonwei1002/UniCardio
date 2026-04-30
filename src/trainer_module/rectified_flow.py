@@ -6,9 +6,8 @@
     v_true  = x_1 - eps                   # dx_t / dt
     loss    = E_{x_1, eps, t} [ || v_theta(x_t, t) - v_true ||^2 ]
 
-``x_1`` 指代 target slot 的干净数据端点（Lipman 记号里数据在 t=1）；与
-diffusion 文献里 ``x_0`` 同义，只是换了时间坐标。网络只对 target slot 预测
-速度；非 target slot 保存干净的条件信号，不参与损失计算。
+``x_1`` 指代 target slot 的干净数据端点（Lipman 记号里数据在 t=1）。
+网络只对 target slot 预测速度；非 target slot 保存干净的条件信号，不参与损失计算。
 
 时间采样采用 SD3 的 logit-normal：``u ~ N(0, 1); t = sigmoid(u)``。
 分布关于 ``t = 0.5`` 对称，方向翻转后密度不变。
@@ -121,9 +120,6 @@ def rf_train_step(
     """计算单个 batch 的 Rectified Flow 标量损失。
 
     模型接受 ``(x_full, t, mask, target_slot)``，返回 ``(B, 1, L)`` 的速度预测。
-    ``task`` 在这里（编译区之外）解包成 bool mask 和 int ``target_slot``，使
-    ``torch.compile`` 只对 3 种 ``target_slot`` 做 Dynamo 特化，不会因为
-    ``task.name`` 的 5 种字符串撞 recompile limit。
     """
     x_full, t, _, v_target = build_rf_inputs(
         batch_signal, task, t_mean=t_mean, t_std=t_std

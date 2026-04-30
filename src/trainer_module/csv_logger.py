@@ -1,10 +1,3 @@
-"""轻量级 append-only CSV 日志。
-
-``base_model/utils_together_original.py`` 中的原 ``SimpleCSVLogger`` 使用
-针对扩散分阶段训练的 9 列固定 schema。这里保留类名以延续用法，但改成
-接受任意有序字段列表，使 RF 训练器无需改动 schema 即可按任务记录 loss。
-"""
-
 from __future__ import annotations
 
 import csv

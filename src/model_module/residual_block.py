@@ -1,23 +1,5 @@
 """:class:`UniCardioBackbone` 使用的残差 Transformer block。
 
-结构保留自 UniCardio 原始代码：
-
-* 单层 Transformer self-attn + FFN（``d_model=channels``、GELU、
-  ``dim_feedforward=ffn_dim=64``、post-norm、dropout=0）。
-* 沿 token 维度的正弦位置编码（注册为 non-persistent buffer，
-  以便随 ``.to(device)`` 一起搬运）。
-* mid-projection 后使用门控激活 ``sigmoid(gate) * tanh(filter)``。
-* 残差乘以 ``1 / sqrt(2)``；skip 单独返回，由 backbone 做聚合。
-
-Tier 1 改造：把原先的 ``nn.TransformerEncoderLayer`` 换成手写的
-``_SdpaAttentionFFN``。
-
-* 使用 ``F.scaled_dot_product_attention`` + **bool** 注意力 mask
-  （``True`` = allowed），在 Hopper BF16 上可自动路由到 Flash Attention。
-* 全程保持 ``batch_first=True`` 的 ``(B, L, C)`` 布局，消除两次 ``permute``。
-* 语义严格对齐 ``nn.TransformerEncoderLayer(norm_first=False,
-  activation="gelu", dim_feedforward=ffn_dim, dropout=0.0)``：post-norm、
-  GELU FFN、两次 LayerNorm。
 """
 
 from __future__ import annotations
@@ -33,13 +15,6 @@ from .embeddings import conv1d_kaiming
 
 
 class _SdpaAttentionFFN(nn.Module):
-    """Post-norm Transformer block，attention 走 SDPA + bool mask。
-
-    与 ``nn.TransformerEncoderLayer(d_model=channels, nhead=nheads,
-    dim_feedforward=ffn_dim, dropout=0.0, activation="gelu",
-    norm_first=False, batch_first=True)`` 结构等价（不保证 state_dict
-    兼容，本轮训练从零开始）。
-    """
 
     def __init__(
         self,
@@ -83,7 +58,6 @@ class _SdpaAttentionFFN(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, L, C)
         y = self.out_proj(y)
 
-        # post-norm，与 nn.TransformerEncoderLayer(norm_first=False) 对齐
         x = self.ln1(x + y)
         x = self.ln2(x + self.ffn(x))
         return x
@@ -110,7 +84,7 @@ class ResidualBlock(nn.Module):
             ``channels`` 后再广播相加。
         nheads: 注意力头数。
         length: token 序列总长度（本项目为 ``3 * L_slot``）。
-        ffn_dim: Transformer FFN 维度；与原代码的 64 保持一致。
+        ffn_dim: Transformer FFN 维度。
     """
 
     def __init__(
@@ -147,7 +121,6 @@ class ResidualBlock(nn.Module):
             x: ``(B, C, L)`` 输入序列（C = ``channels``）。
             time_emb: ``(B, time_embedding_dim)`` 的 flow-time embedding。
             mask: ``(L, L)`` 的 **bool** 注意力 mask，``True`` 为允许注意力。
-                由 :func:`build_task_mask` 以 ``dtype=torch.bool`` 生成。
 
         Returns:
             ``(x_out, skip)``，两者形状均为 ``(B, C, L)``。
