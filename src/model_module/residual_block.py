@@ -1,41 +1,49 @@
 """:class:`UniCardioBackbone` 使用的残差 Transformer block。
 
+方向 A 改造后版本：标准 pre-norm Transformer block（self-attn + GELU FFN），
+不再含 WaveNet 风格的 sigmoid×tanh 门控分支。位置编码由 backbone 在
+residual stack 之前一次性注入，本块不再持有 PE buffer。
+
+为保留 backbone 的 skip-sum 聚合（``UniCardioBackbone.forward`` 把每层
+``skip`` 求和后做 ``/ sqrt(n_layers)`` 归一化），每层在残差流上额外取一份
+``LN(h)`` 作为 skip 输出。
 """
 
 from __future__ import annotations
 
 import math
 
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from .embeddings import conv1d_kaiming
 
+class _PreNormBlock(nn.Module):
+    """``(B, L, C)`` 上的 pre-norm self-attn + GELU FFN block。
 
-class _SdpaAttentionFFN(nn.Module):
+    采用 LLaMA / GPT-NeoX 等现代 Transformer 的标准 pre-norm 结构：
+    ``x = x + sdpa(LN(x))``，``x = x + ffn(LN(x))``。
+    """
 
     def __init__(
         self,
         channels: int,
         nheads: int,
         *,
-        ffn_dim: int = 64,
+        ffn_dim: int,
     ) -> None:
         super().__init__()
         if channels % nheads != 0:
             raise ValueError(
                 f"channels ({channels}) must be divisible by nheads ({nheads})"
             )
-        self.channels = channels
         self.nheads = nheads
         self.head_dim = channels // nheads
 
+        self.ln_attn = nn.LayerNorm(channels)
+        self.ln_ffn = nn.LayerNorm(channels)
         self.qkv_proj = nn.Linear(channels, 3 * channels)
         self.out_proj = nn.Linear(channels, channels)
-        self.ln1 = nn.LayerNorm(channels)
-        self.ln2 = nn.LayerNorm(channels)
         self.ffn = nn.Sequential(
             nn.Linear(channels, ffn_dim),
             nn.GELU(),
@@ -45,46 +53,32 @@ class _SdpaAttentionFFN(nn.Module):
     def forward(self, x: Tensor, attn_mask: Tensor) -> Tensor:
         """``(B, L, C)`` 输入输出；``attn_mask`` 形状 ``(L, L)`` bool。"""
         B, L, C = x.shape
-        qkv = self.qkv_proj(x)  # (B, L, 3C)
+
+        qkv = self.qkv_proj(self.ln_attn(x))
         q, k, v = qkv.chunk(3, dim=-1)
         # (B, L, C) -> (B, H, L, D)
         q = q.view(B, L, self.nheads, self.head_dim).transpose(1, 2)
         k = k.view(B, L, self.nheads, self.head_dim).transpose(1, 2)
         v = v.view(B, L, self.nheads, self.head_dim).transpose(1, 2)
 
-        y = F.scaled_dot_product_attention(
+        attn = F.scaled_dot_product_attention(
             q, k, v, attn_mask=attn_mask, is_causal=False
-        )  # (B, H, L, D)
-        y = y.transpose(1, 2).contiguous().view(B, L, C)
-        y = self.out_proj(y)
-
-        x = self.ln1(x + y)
-        x = self.ln2(x + self.ffn(x))
+        )
+        attn = attn.transpose(1, 2).contiguous().view(B, L, C)
+        x = x + self.out_proj(attn)
+        x = x + self.ffn(self.ln_ffn(x))
         return x
 
 
-def _sinusoidal_position_embedding(length: int, d_model: int) -> Tensor:
-    """标准正弦位置编码，形状为 ``(length, d_model)``。"""
-    pe = torch.zeros(length, d_model)
-    position = torch.arange(length).unsqueeze(1).float()
-    div_term = 1.0 / torch.pow(
-        10000.0, torch.arange(0, d_model, 2).float() / d_model
-    )
-    pe[:, 0::2] = torch.sin(position * div_term)
-    pe[:, 1::2] = torch.cos(position * div_term)
-    return pe
-
-
 class ResidualBlock(nn.Module):
-    """一个带 flow-time 条件的门控 Transformer block。
+    """一个带 flow-time 条件的 pre-norm Transformer block。
 
     Args:
         channels: token 序列的特征维 ``C``。
         time_embedding_dim: 时间 embedding 的维度；通过一个线性层映射到
             ``channels`` 后再广播相加。
         nheads: 注意力头数。
-        length: token 序列总长度（本项目为 ``3 * L_slot``）。
-        ffn_dim: Transformer FFN 维度。
+        ffn_dim: Transformer FFN 中间维度（建议 4 × ``channels``）。
     """
 
     def __init__(
@@ -92,25 +86,15 @@ class ResidualBlock(nn.Module):
         channels: int,
         time_embedding_dim: int,
         nheads: int,
-        length: int,
         *,
-        ffn_dim: int = 64,
+        ffn_dim: int,
     ) -> None:
         super().__init__()
-        self.channels = channels
-        self.length = length
         self.time_projection = nn.Linear(time_embedding_dim, channels)
-        self.cond_projection = conv1d_kaiming(channels, 2 * channels, 1)
-        self.mid_projection = conv1d_kaiming(channels, 2 * channels, 1)
-        self.output_projection = conv1d_kaiming(channels, 2 * channels, 1)
-        self.time_layer = _SdpaAttentionFFN(
+        self.block = _PreNormBlock(
             channels=channels, nheads=nheads, ffn_dim=ffn_dim
         )
-        self.register_buffer(
-            "pe",
-            _sinusoidal_position_embedding(length, channels),
-            persistent=False,
-        )
+        self.ln_skip = nn.LayerNorm(channels)
 
     def forward(
         self, x: Tensor, time_emb: Tensor, mask: Tensor
@@ -125,35 +109,11 @@ class ResidualBlock(nn.Module):
         Returns:
             ``(x_out, skip)``，两者形状均为 ``(B, C, L)``。
         """
-        B, C, L = x.shape
-        base_shape = x.shape
-
-        # 将时间 embedding 广播加到每个时空位置。
         t_emb = self.time_projection(time_emb).unsqueeze(-1)  # (B, C, 1)
-        y = x + t_emb
+        y_seq = (x + t_emb).permute(0, 2, 1)                  # (B, L, C)
+        y_seq = self.block(y_seq, attn_mask=mask)
+        skip = self.ln_skip(y_seq).permute(0, 2, 1)           # (B, C, L)
+        y = y_seq.permute(0, 2, 1)                            # (B, C, L)
 
-        # Transformer self-attn + FFN，batch_first 布局、bool mask。
-        y_seq = y.permute(0, 2, 1)  # (B, L, C)
-        y_seq = self.time_layer(y_seq, attn_mask=mask)
-        y = y_seq.permute(0, 2, 1).reshape(B, C, L)
-
-        # 带位置偏置的门控 mid-projection。
-        y = self.mid_projection(y)  # (B, 2C, L)
-        pos_bias = (
-            self.pe.unsqueeze(0)
-            .expand(B, -1, -1)
-            .permute(0, 2, 1)
-            .contiguous()
-        )  # (B, C, L)
-        y = y + self.cond_projection(pos_bias)
-
-        gate, filt = torch.chunk(y, 2, dim=1)
-        y = torch.sigmoid(gate) * torch.tanh(filt)  # (B, C, L)
-
-        y = self.output_projection(y)  # (B, 2C, L)
-        residual, skip = torch.chunk(y, 2, dim=1)
-
-        x = x.reshape(base_shape)
-        residual = residual.reshape(base_shape)
-        skip = skip.reshape(base_shape)
-        return (x + residual) / math.sqrt(2.0), skip
+        # sqrt(2) 归一化补偿 residual sum 的方差膨胀（CSDI 主干的历史约定）。
+        return (x + y) / math.sqrt(2.0), skip

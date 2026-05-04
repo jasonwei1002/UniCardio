@@ -19,6 +19,15 @@ from torch import Tensor
 DEFAULT_KERNELS: tuple[int, ...] = (1, 3, 5, 7, 9, 11)
 DEFAULT_CHANNELS_PER_KERNEL: int = 48
 
+__all__ = [
+    "DEFAULT_CHANNELS_PER_KERNEL",
+    "DEFAULT_KERNELS",
+    "FlowTimeEmbedding",
+    "SignalEncoder",
+    "conv1d_kaiming",
+    "sinusoidal_position_embedding",
+]
+
 
 def conv1d_kaiming(
     in_channels: int, out_channels: int, kernel_size: int
@@ -27,6 +36,24 @@ def conv1d_kaiming(
     layer = nn.Conv1d(in_channels, out_channels, kernel_size)
     nn.init.kaiming_normal_(layer.weight)
     return layer
+
+
+def sinusoidal_position_embedding(length: int, d_model: int) -> Tensor:
+    """标准正弦位置编码，形状为 ``(length, d_model)``。
+
+    与 Vaswani et al. (2017) 一致：偶数维用 sin，奇数维用 cos，
+    频率沿维度指数衰减。
+    """
+    if d_model % 2 != 0:
+        raise ValueError(f"d_model must be even, got {d_model}")
+    pe = torch.zeros(length, d_model)
+    position = torch.arange(length).unsqueeze(1).float()
+    div_term = 1.0 / torch.pow(
+        10000.0, torch.arange(0, d_model, 2).float() / d_model
+    )
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
+    return pe
 
 
 class SignalEncoder(nn.Module):

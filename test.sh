@@ -31,6 +31,6 @@ python run/pipeline/evaluate.py \
     +checkpoint="$CHECKPOINT" \
     hydra.run.dir="$OUT_DIR" \
     device=cuda \
-    data.batch_size=2048 \
+    data.batch_size=1024 \
     data.num_workers=8 \
     2>&1 | tee -a "$LOG_FILE"

@@ -1,6 +1,6 @@
 # 训练循环配置
 
-epochs: 500
+epochs: 300
 lr: 1.0e-3                
 
 weight_decay: 1.0e-6

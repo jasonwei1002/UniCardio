@@ -31,6 +31,7 @@ from .embeddings import (
     FlowTimeEmbedding,
     SignalEncoder,
     conv1d_kaiming,
+    sinusoidal_position_embedding,
 )
 from .residual_block import ResidualBlock
 
@@ -137,12 +138,17 @@ class UniCardioBackbone(nn.Module):
                     channels=self.channels,
                     time_embedding_dim=cfg.time_embedding_dim,
                     nheads=cfg.nheads,
-                    length=transformer_total_length,
                     ffn_dim=cfg.ffn_dim,
                 )
                 for _ in range(self.n_layers)
             ]
         )
+
+        # Sinusoidal PE 一次性注入到 residual stack 输入端，让每层 self-attn
+        # 都能通过残差路径看到 token-level 位置信息。预转置到 (C, L_total)
+        # 与残差流 ``(B, C, L_total)`` 对齐，避免每次 forward 重复 transpose。
+        pe = sinusoidal_position_embedding(transformer_total_length, self.channels)
+        self.register_buffer("pe", pe.t().contiguous(), persistent=False)
 
         self.output_heads = nn.ModuleList(
             [_OutputHead(self.channels) for _ in range(N_SLOTS)]
@@ -184,6 +190,7 @@ class UniCardioBackbone(nn.Module):
             slot_feats.append(encoded)
 
         h = torch.cat(slot_feats, dim=-1)
+        h = h + self.pe.unsqueeze(0)        # (1, C, L_total) 广播
         time_emb = self.time_embedding(t)
 
         skip_list: list[Tensor] = []
