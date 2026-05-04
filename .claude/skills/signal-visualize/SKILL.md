@@ -14,7 +14,14 @@ Generate standardized plots for the three UniCardio modalities. **Always work in
 
 ## Model Slot Convention
 
-> Do not confuse with the on-disk layout. `data/Final_sig_combined.npy` stores `(N, 3, 500)` in PPG=0 / BP=1 / ECG=2 order; `src/data_module/datamodule.py::load_and_preprocess` permutes with `[2, 0, 1]` and applies `(x - 100) / 50` to BP. **All downstream arrays speak the model convention below.**
+> Do not confuse with the on-disk layout. The repo supports two datasets and the on-disk channel order differs:
+>
+> | `data.name` | Default? | File(s) | On-disk order | `channel_permutation` |
+> |-------------|----------|---------|---------------|------------------------|
+> | `pulsedb` | yes | `data/pulsedb/Train_Subset_vitaldb_500.npy` | ECG / PPG / ABP | `[0, 1, 2]` (no-op) |
+> | `combined` | legacy | `data/Final_sig_combined.npy` | PPG / BP / ECG | `[2, 0, 1]` |
+>
+> `CardiacDataset.__getitem__` applies the permutation and `bp_normalize(x) = (x - 100) / 50` on the ABP slot. **Plotting code MUST replicate the same permutation for whichever file it reads** — applying `[2, 0, 1]` to a PulseDB array silently mislabels every channel.
 
 | Slot | Modality | Color       | Hex       |
 |------|----------|-------------|-----------|
@@ -43,30 +50,50 @@ Style: white background, no grid, font size 12, figure size `(15, 4)` per signal
 
 ## Plot 1: Dataset Samples
 
-Read straight from the training npy **after** the loader normalization (re-apply `[2,0,1]` + BP scaling so visualization matches what the model sees).
+Read the dataset selected by Hydra (`run/conf/data/default.yaml::name`). The script auto-resolves which `.npy` to load and which `channel_permutation` to apply, so it stays correct for both `pulsedb` and `combined`. Use `mmap_mode='r'` — these files are 3–13 GB.
 
 ```bash
 cd "$CLAUDE_PROJECT_DIR" && python3 - <<'PY'
+import os
 import numpy as np
 import matplotlib.pyplot as plt
+from hydra import compose, initialize_config_dir
+from omegaconf import OmegaConf
 
-x = np.load("data/Final_sig_combined.npy")          # (N, 3, 500), disk order
-x = x[:, [2, 0, 1], :].astype(np.float32)           # model order: ECG, PPG, ABP
-x[:, 2, :] = (x[:, 2, :] - 100.0) / 50.0            # BP normalization
+# initialize_config_dir takes an absolute path; initialize() requires a real
+# __file__, which doesn't exist when invoked via `python3 -`.
+with initialize_config_dir(config_dir=os.path.abspath("run/conf"), version_base=None):
+    cfg = compose(config_name="config")
 
-idx = np.random.RandomState(0).choice(len(x), 3, replace=False)
+dname = cfg.data.name                                   # "pulsedb" or "combined"
+sub = cfg.data[dname]
+perm = list(sub.channel_permutation)                    # [0,1,2] for pulsedb, [2,0,1] for combined
+
+# pulsedb has train_path / test_path; combined has data_path. Pick whichever exists.
+path = sub.get("train_path") or sub.get("data_path")
+print(f"plotting from {dname}: {path}")
+
+x = np.load(path, mmap_mode="r")                        # (N, 3, L), disk order
+n = min(3, x.shape[0])
+idx = np.random.RandomState(0).choice(x.shape[0], n, replace=False)
+
+# Materialize only the picked rows, then permute to model order ECG/PPG/ABP and normalize ABP.
+sample = np.asarray(x[idx])[:, perm, :].astype(np.float32)
+sample[:, 2, :] = (sample[:, 2, :] - float(cfg.data.bp_offset)) / float(cfg.data.bp_scale)
+
 names = ["ECG", "PPG", "ABP"]
 colors = ["#4CAF50", "#2196F3", "#F44336"]
 
-fig, axes = plt.subplots(3, 3, figsize=(15, 9), sharex=True)
-for col, i in enumerate(idx):
+fig, axes = plt.subplots(3, n, figsize=(15, 9), sharex=True, squeeze=False)
+for col in range(n):
     for row in range(3):
-        axes[row, col].plot(x[i, row], color=colors[row], linewidth=1.2)
-        axes[row, col].set_ylabel(names[row]) if col == 0 else None
-        axes[row, col].set_title(f"sample {i}") if row == 0 else None
+        axes[row, col].plot(sample[col, row], color=colors[row], linewidth=1.2)
+        if col == 0: axes[row, col].set_ylabel(names[row])
+        if row == 0: axes[row, col].set_title(f"sample {idx[col]} ({dname})")
 plt.tight_layout()
-plt.savefig("run/outputs/signal_dataset_samples.png", dpi=150)
-print("wrote run/outputs/signal_dataset_samples.png")
+out = f"run/outputs/signal_dataset_samples_{dname}.png"
+plt.savefig(out, dpi=150)
+print(f"wrote {out}")
 PY
 ```
 
@@ -78,22 +105,44 @@ Overlay ground truth target slot against `euler_sample` output for one task.
 
 ```bash
 cd "$CLAUDE_PROJECT_DIR" && python3 - <<'PY'
+import os
 import torch, numpy as np, matplotlib.pyplot as plt
+from omegaconf import OmegaConf
+from hydra import compose, initialize_config_dir
+
 from src.model_module.unicardio_rf import UniCardioRF
 from src.model_module.tasks import TASK_SPECS, Slot
 from src.trainer_module.sampler import euler_sample
-from src.utils.checkpoint import load_checkpoint   # adapt to actual loader
+from src.utils.checkpoint import load_checkpoint
 
-TASK = "ecg2ppg"                                     # CHANGE ME
+TASK = "ppg2abp"                                     # CHANGE ME — must be an active task
 CKPT = "run/outputs/<run>/checkpoints/best.pt"       # CHANGE ME
+
+# Build cfg from saved checkpoint when possible (so plot uses the same dataset
+# / slot_length / model dims the run trained with). Fall back to current Hydra
+# default if the ckpt has no embedded config.
+ck = torch.load(CKPT, map_location="cpu", weights_only=False)
+cfg_dict = ck.get("config")
+if cfg_dict:
+    cfg = OmegaConf.create(cfg_dict)
+else:
+    with initialize_config_dir(config_dir=os.path.abspath("run/conf"), version_base=None):
+        cfg = compose(config_name="config")
 
 task = TASK_SPECS[TASK]
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model, _ = load_checkpoint(CKPT, map_location=device)
+model = UniCardioRF(OmegaConf.to_container(cfg.model, resolve=True)).to(device)
+load_checkpoint(CKPT, model=model, map_location=device)
 model.eval()
 
-x = np.load("data/Final_sig_combined.npy")[:4, [2, 0, 1], :].astype(np.float32)
-x[:, 2, :] = (x[:, 2, :] - 100.0) / 50.0
+# Pull conditions from whichever dataset matches the run.
+dname = cfg.data.name
+sub = cfg.data[dname]
+perm = list(sub.channel_permutation)
+src_path = sub.get("test_path") or sub.get("data_path") or sub.get("train_path")
+x = np.asarray(np.load(src_path, mmap_mode="r")[:4])[:, perm, :].astype(np.float32)
+x[:, 2, :] = (x[:, 2, :] - float(cfg.data.bp_offset)) / float(cfg.data.bp_scale)
+
 conditions = torch.from_numpy(x).to(device)
 pred = euler_sample(model, conditions, task, n_steps=8, device=device).cpu().numpy()
 gt = x[:, int(task.target_slot), :]
@@ -107,10 +156,10 @@ for i, ax in enumerate(axes):
     ax.plot(pred[i, 0],  color=color, linewidth=1.4, linestyle="--", label="reconstruction")
     ax.set_ylabel(f"sample {i}: {names[task.target_slot]}")
     ax.legend(loc="upper right")
-plt.suptitle(f"{TASK} reconstruction (Euler 8-step)")
+plt.suptitle(f"{TASK} reconstruction (Euler 8-step, {dname})")
 plt.tight_layout()
-plt.savefig(f"run/outputs/recon_{TASK}.png", dpi=150)
-print(f"wrote run/outputs/recon_{TASK}.png")
+plt.savefig(f"run/outputs/recon_{TASK}_{dname}.png", dpi=150)
+print(f"wrote run/outputs/recon_{TASK}_{dname}.png")
 PY
 ```
 

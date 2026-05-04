@@ -41,8 +41,9 @@ x_full (B, 1, 1500)
   → v̂ (B, 1, 500) for target slot only
 ```
 
-Objective: **Rectified Flow** — `x_t = (1-t) x_0 + t ε`, target velocity `v = ε - x_0`,
-logit-normal `t` sampling, 8-step Euler ODE sampler at inference.
+Objective: **Rectified Flow** with **Lipman Flow Matching convention** — `t = 0` is noise,
+`t = 1` is data. `x_t = (1-t) ε + t x_1`, target velocity `v = x_1 - ε`,
+logit-normal `t` sampling, 8-step Euler ODE sampler integrating from `t=0` to `t=1` at inference.
 
 Five registered tasks live in `src/model_module/tasks.py`:
 `ecg2ppg`, `ppg2ecg`, `ecg2abp`, `ppg2abp`, `ecgppg2abp`.
@@ -88,29 +89,32 @@ Unit tests for this live in `tests/test_masks.py`; run them before concluding an
 
 ### 4. Rectified Flow step
 
-`src/trainer_module/rectified_flow.py` must:
+`src/trainer_module/rectified_flow.py` must (Lipman convention, `t=0` noise → `t=1` data):
 
-1. Extract `x_0 = signal[:, target_slot, :]`.
+1. Extract `x_1 = signal[:, target_slot:target_slot+1, :]` (clean data, the `t=1` endpoint).
 2. Sample `t ~ sigmoid(Normal(mean, std))` (logit-normal).
-3. Compute `x_t = (1 - t) * x_0 + t * ε` and `v_target = ε - x_0`.
-4. Assemble `(B, 1, 3*L)` with clean conditions + `x_t` in `target_slot` + zeros elsewhere.
-5. Return MSE between model output and `v_target`.
+3. Compute `x_t = (1 - t) * ε + t * x_1` and `v_target = x_1 - ε`.
+4. Assemble `(B, 1, 3*L)` via `assemble_x_full` — clean conditions in their slots + `x_t` substituted into `target_slot`.
+5. Build a bool task mask via `build_task_mask(task.name, L, dtype=torch.bool)` and call `model(x_full, t, mask, int(task.target_slot))`.
+6. Return MSE between model output and `v_target`.
 
 Unit tests: `tests/test_rf_step.py`.
 
 ### 5. Sampler
 
-`src/trainer_module/sampler.py::euler_sample` integrates `v_θ` from `t = 1` → `t = 0` with N Euler steps. Verify:
+`src/trainer_module/sampler.py::euler_sample` integrates `v_θ` from `t = 0` (noise) → `t = 1` (data) with N Euler steps. Verify:
 
-- It does **not** mutate the condition slots.
+- Initial state is `x = randn(B, 1, L)` representing `x_{t=0}`.
+- It does **not** mutate the condition slots (calls `assemble_x_full` per step which `clone`s).
 - It returns `(B, 1, L)` for the target slot only — not the full 1500-token tensor.
-- Default `n_steps = 8`.
+- Default `n_steps = 8`; `dt = 1 / n_steps` (positive).
+- The mask is built once with `dtype=torch.bool` and reused across all steps.
 
 Unit tests: `tests/test_sampler.py`.
 
 ### 6. Pure-model contract
 
-`UniCardioRF.forward(x_full, t, task) -> Tensor` must **not** compute loss, sample noise, or construct `x_t`. Loss lives externally in `rf_train_step`. Violations make the model hard to test and checkpoint.
+`UniCardioRF.forward(x_full, t, mask, target_slot: int) -> Tensor` must **not** compute loss, sample noise, construct `x_t`, or accept a `TaskSpec`. The signature is intentionally pure tensors + a Python `int`: this keeps `torch.compile` from re-specializing per task name (Dynamo would otherwise hit the recompile limit at 5 tasks × 3 target slots). Loss / mask construction / x_t assembly all live in `rf_train_step`. Violations make the model hard to test, checkpoint, or compile.
 
 ### 7. AMP / device sanity
 

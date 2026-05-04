@@ -9,106 +9,134 @@ allowed-tools:
 
 # Verify Training Skill
 
-Run a forward pass sanity check using a small **synthetic batch** (2 samples, random noise) — no file I/O, runs in seconds.
+Quick architectural sanity checks for UniCardio Rectified Flow. Two layers, both run on CPU in seconds:
 
-Input shape: `(B=2, 1, 2000)` — four signal slots × L=500 concatenated, matching the real data layout.
+1. **Synthetic-batch forward** — exercises `UniCardioRF` + `rf_train_step` + `euler_sample` with random `(B=2, 3, L)` data, no file I/O.
+2. **Per-task overfit smoke test** — `python run/pipeline/smoke_test.py` overfits a tiny batch for each active task (~70 s on CPU). The richer of the two checks; use after non-trivial model edits.
 
-## What This Checks
+> **Layout reminder.** Total token sequence is `3 * slot_length = 1500` for the default
+> `slot_length=500`. Slot order is **ECG=0, PPG=1, ABP=2** (model space). The model
+> forward signature is `UniCardioRF.forward(x_full, t, mask, target_slot: int) -> (B, 1, L)` —
+> tensors + a Python `int`, **never** a `TaskSpec`. RF uses Lipman convention
+> (`t=0` noise → `t=1` data, `x_t = (1-t)ε + tx_1`, `v = x_1 - ε`).
 
-1. Model imports and initializes without error
-2. Forward pass completes for key `model_flag` combinations
-3. Output shapes are correct: `(B, n_samples, 1, 500)`
-4. Output values are finite (no NaN/Inf)
+## What this checks
 
-## Verification Script
+1. `UniCardioRF` builds from the resolved Hydra config without error.
+2. Forward pass returns the right shape `(B, 1, slot_length)` for each `target_slot` in use.
+3. Output is finite (no NaN / Inf at random init).
+4. `rf_train_step` produces a scalar loss whose `.backward()` populates parameter grads.
+5. (Optional) `euler_sample` runs with `n_steps=4` and returns finite `(B, 1, slot_length)`.
 
-Run this from `base_model/`:
+## Layer 1: Synthetic-batch forward
+
+Run from the **repo root** so the absolute config path resolves correctly:
 
 ```bash
-cd base_model && python3 -c "
-import torch
-import sys
+cd "$CLAUDE_PROJECT_DIR" && python3 - <<'PY'
 import os
+import torch
+from hydra import compose, initialize_config_dir
+from omegaconf import OmegaConf
 
-print('=== UniCardio Forward Pass Verification ===')
+from src.model_module.unicardio_rf import UniCardioRF
+from src.model_module.tasks import TASK_SPECS
+from src.trainer_module.rectified_flow import rf_train_step
+from src.trainer_module.sampler import euler_sample
 
-# Synthetic input: (B=2, 1, 2000), values in [-1, 1] like real normalized signals
-B, L = 2, 500
-observed_data = torch.randn(B, 1, 4 * L).clamp(-1, 1)
-print(f'[OK] synthetic input shape: {observed_data.shape}')
+print("=== UniCardio RF Sanity Check (synthetic) ===")
 
-# Import model
-try:
-    from diffusion_model_no_compress_final import CSDI_base
-    import yaml
-    with open('base_no_compress_original.yaml', 'r') as f:
-        config = yaml.safe_load(f)
-    print(f'[OK] Config loaded: {config.get(\"diffusion\", {}).get(\"layers\", \"?\")} layers')
-except Exception as e:
-    print(f'[FAIL] Cannot import model: {e}')
-    sys.exit(1)
+# initialize_config_dir takes an absolute path (initialize() is relative to
+# the caller's __file__, which doesn't exist when invoked via `python3 -`).
+with initialize_config_dir(config_dir=os.path.abspath("run/conf"), version_base=None):
+    cfg = compose(config_name="config")
 
-# Initialize model
-try:
-    device = torch.device('cpu')
-    model = CSDI_base(config, device, L=4*L)
-    model.eval()
-    print(f'[OK] Model initialized')
-except Exception as e:
-    print(f'[FAIL] Model init failed: {e}')
-    sys.exit(1)
+L = int(cfg.data.slot_length)
+device = torch.device("cpu")  # always CPU for sanity check
+torch.manual_seed(0)
 
-# Try loading checkpoint if available
-ckpt_files = sorted([f for f in os.listdir('check') if f.startswith('model') and f.endswith('.pth')]) if os.path.exists('check') else []
-if ckpt_files:
-    try:
-        state = torch.load(f'check/{ckpt_files[-1]}', map_location='cpu')
-        if isinstance(state, dict) and 'model_state_dict' in state:
-            model.load_state_dict(state['model_state_dict'], strict=False)
-        else:
-            model.load_state_dict(state, strict=False)
-        print(f'[OK] Loaded checkpoint: {ckpt_files[-1]}')
-    except Exception as e:
-        print(f'[WARN] Could not load checkpoint ({e}), using random weights')
-else:
-    print('[WARN] No checkpoints found, using random weights')
+# Build model from cfg.model (UniCardioRF accepts a Mapping or BackboneConfig).
+model = UniCardioRF(OmegaConf.to_container(cfg.model, resolve=True)).to(device)
+model.eval()
+n_params = sum(p.numel() for p in model.parameters())
+print(f"[OK] UniCardioRF built: {n_params:,} params, slot_length={L}")
 
-# Run forward pass tests
-test_cases = [
-    ('02', 2, 'PPG -> ECG cross-modal'),
-    ('03', 2, 'PPG -> slot3 self-conditioning'),
-]
+# Active tasks (zero weights are filtered out — same logic as the trainer).
+active = [name for name, w in cfg.trainer.task_weights.items() if float(w) > 0]
+print(f"[OK] Active tasks ({len(active)}): {', '.join(active)}")
 
-B = min(2, observed_data.shape[0])
-test_input = observed_data[:B]
+# Synthetic (B=2, 3, L) batch — model-space slot order ECG/PPG/ABP, ~unit variance.
+B = 2
+batch = torch.randn(B, 3, L)
 
-with torch.no_grad():
-    for model_flag, borrow_mode, description in test_cases:
-        try:
-            out = model(test_input, n_samples=2, model_flag=model_flag,
-                       borrow_mode=borrow_mode, DDIM_flag=1, sample_steps=3, train_gen_flag=1)
-            assert out.shape == (B, 2, 1, 500), f'Expected ({B}, 2, 1, 500), got {out.shape}'
-            assert torch.isfinite(out).all(), 'Output contains NaN or Inf'
-            print(f'[OK] {description}: output shape {out.shape}, range [{out.min():.3f}, {out.max():.3f}]')
-        except Exception as e:
-            print(f'[FAIL] {description}: {e}')
+failures = 0
+for task_name in active:
+    task = TASK_SPECS[task_name]
+
+    # Training step path: rf_train_step builds x_t / mask / target internally.
+    loss = rf_train_step(model, batch, task)
+    if not torch.isfinite(loss):
+        print(f"[FAIL] {task_name}: rf_train_step loss is {loss.item()}")
+        failures += 1
+        continue
+
+    # Backward populates grads for at least the output head + first conv.
+    model.zero_grad(set_to_none=True)
+    loss.backward()
+    grad_norm = sum(p.grad.norm().item() for p in model.parameters() if p.grad is not None)
+    if grad_norm == 0.0:
+        print(f"[FAIL] {task_name}: zero gradient norm — disconnected graph?")
+        failures += 1
+        continue
+
+    # Inference path: euler_sample with a tiny step count (CPU-friendly).
+    out = euler_sample(model, batch, task, n_steps=4, device=device)
+    if out.shape != (B, 1, L):
+        print(f"[FAIL] {task_name}: euler_sample shape {tuple(out.shape)} != ({B}, 1, {L})")
+        failures += 1
+        continue
+    if not torch.isfinite(out).all():
+        print(f"[FAIL] {task_name}: euler_sample produced non-finite values")
+        failures += 1
+        continue
+
+    print(f"[OK] {task_name}: loss={loss.item():.4f}, grad_norm={grad_norm:.2e}, "
+          f"euler out range=[{out.min().item():.3f}, {out.max().item():.3f}]")
 
 print()
-print('=== Verification Complete ===')
-"
+print("=== Sanity Check Complete ===" if failures == 0 else f"=== {failures} failures ===")
+PY
 ```
 
-## Expected Output
+Expected output:
 
 ```
-=== UniCardio Forward Pass Verification ===
-[OK] synthetic input shape: torch.Size([2, 1, 2000])
-[OK] Config loaded: 5 layers
-[OK] Model initialized
-[OK] Loaded checkpoint: modelXXX.pth
-[OK] PPG -> ECG cross-modal: output shape torch.Size([2, 2, 1, 500]), range [-1.234, 1.456]
-[OK] PPG -> slot3 self-conditioning: output shape torch.Size([2, 2, 1, 500]), range [-0.987, 1.123]
-=== Verification Complete ===
+=== UniCardio RF Sanity Check (synthetic) ===
+[OK] UniCardioRF built: 4,XXX,XXX params, slot_length=500
+[OK] Active tasks (3): ecg2abp, ppg2abp, ecgppg2abp
+[OK] ecg2abp: loss=…, grad_norm=…, euler out range=[…, …]
+[OK] ppg2abp: …
+[OK] ecgppg2abp: …
+=== Sanity Check Complete ===
 ```
 
-Any `[FAIL]` line indicates a problem that must be fixed before training.
+Any `[FAIL]` line means the architecture is broken — fix before running real training. The most common causes:
+- shape mismatch in `assemble_x_full` (wrong `target_slot` → wrong substitution),
+- mask dtype drift (training uses `dtype=torch.bool` for SDPA),
+- `task_weights` typo so no tasks are active.
+
+## Layer 2: Per-task overfit smoke test
+
+The repo ships with a richer test that overfits a tiny synthetic batch for each active task and verifies the loss actually drops + Euler reconstruction matches at the end. Slower (~70 s on CPU) but catches optimization-side bugs the synthetic forward misses:
+
+```bash
+python run/pipeline/smoke_test.py
+```
+
+Use Layer 1 first (fast); fall back to Layer 2 only when Layer 1 passes but training still misbehaves.
+
+## Guardrails
+
+- **Always run from repo root** — Hydra `initialize(config_path="../run/conf")` is relative to the script's location, but the inline heredoc uses `__file__` of `<stdin>`, so anchoring at the repo root is the only way the relative path resolves.
+- **CPU only on the laptop** — never start `python run/pipeline/train.py` from this skill. Real training is GPU-server only.
+- **No `torch.cuda.amp.GradScaler`** — project is bf16-only on CUDA. If you see a GradScaler reference anywhere, that's a regression.

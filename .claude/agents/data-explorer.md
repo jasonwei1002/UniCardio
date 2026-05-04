@@ -20,33 +20,65 @@ You are a read-only data analyst for UniCardio. **Everything lives on the laptop
 
 | Path | What's there | When populated |
 |------|--------------|----------------|
-| `data/Final_sig_combined.npy` | `(N, 3, 500)` raw dataset in **disk order** PPG=0 / BP=1 / ECG=2 | one-time scp |
+| `data/pulsedb/Train_Subset_vitaldb_500.npy` | `(N, 3, 500)` PulseDB train (default dataset) — disk order **already** ECG=0 / PPG=1 / ABP=2, perm `[0,1,2]` | one-time scp |
+| `data/pulsedb/CalFree_Test_Subset_vitaldb_500.npy` | matching held-out test split | same |
+| `data/Final_sig_combined.npy` | legacy `(N, 3, 500)` combined dataset — disk order PPG=0 / BP=1 / ECG=2, perm `[2,0,1]` | one-time scp |
 | `run/outputs/swanlog_<exp_id>/metrics.csv` | SwanLab pull of training metrics | after `/swanlog` |
 | `run/outputs/swanlog_<exp_id>/config.yaml` | resolved Hydra config of that run | same |
 | `run/outputs/swanlog_<exp_id>/run_info.json` | `{id, name, state, url, created_at, finished_at}` | same |
 | `run/outputs/swanlog_<exp_id>/metadata.json` | system/git/hardware snapshot | same |
 | checkpoints | usually **absent** on laptop — only present if manually scp'd | rare |
 
+Default dataset is `pulsedb` (`run/conf/data/default.yaml::name`). When asked about "the dataset" without qualification, assume PulseDB. When inspecting a SwanLab pull, read `config.yaml::data.name` first to know which permutation applied.
+
 ### Disk order vs. model order
 
-`data/Final_sig_combined.npy` is stored on disk as PPG=0 / BP=1 / ECG=2. The data loader (`src/data_module/datamodule.py::load_and_preprocess`) permutes with `[2, 0, 1]` and normalizes BP via `(x - 100) / 50`, so downstream **model-space** slots are ECG=0 / PPG=1 / ABP=2. When inspecting raw arrays, report in disk order; when discussing anything the model sees, use model order and say so.
+Both datasets resolve to the same **model-space** slot layout `ECG=0 / PPG=1 / ABP=2` after `CardiacDataset.__getitem__` runs the `channel_permutation` and applies BP normalization `(x - 100) / 50`. The on-disk channel order differs:
+
+| Dataset | On-disk channel order | `channel_permutation` |
+|---------|-----------------------|------------------------|
+| `pulsedb` (default) | ECG / PPG / ABP | `[0, 1, 2]` (no-op) |
+| `combined` (legacy) | PPG / BP / ECG | `[2, 0, 1]` |
+
+When dumping raw arrays, report values in **disk order** and name it; when discussing anything the model sees, use model order and say so.
 
 ## Capabilities
 
 ### 1. Dataset stats
 
+Pick the file based on what was asked. For **PulseDB** (default — disk channels are already in model order ECG/PPG/ABP):
+
 ```bash
 python3 -c "
 import numpy as np
-x = np.load('data/Final_sig_combined.npy')
+x = np.load('data/pulsedb/Train_Subset_vitaldb_500.npy', mmap_mode='r')
 print(f'shape={x.shape} dtype={x.dtype}')
-print(f'NaN count: {int(np.isnan(x).sum())}')
-print('Disk-order channel stats (PPG / BP / ECG):')
-for i, name in enumerate(['PPG','BP','ECG']):
-    ch = x[:, i, :]
+sample = np.asarray(x[:50000])     # mmap slice — keeps memory bounded
+print(f'NaN count (first 50k): {int(np.isnan(sample).sum())}')
+print('Disk-order channel stats (ECG / PPG / ABP) — already model order:')
+for i, name in enumerate(['ECG','PPG','ABP']):
+    ch = sample[:, i, :]
     print(f'  {name}: min={ch.min():.3f} max={ch.max():.3f} mean={ch.mean():.3f} std={ch.std():.3f}')
 "
 ```
+
+For the **combined** legacy file (disk order PPG/BP/ECG, gets permuted at load time):
+
+```bash
+python3 -c "
+import numpy as np
+x = np.load('data/Final_sig_combined.npy', mmap_mode='r')
+print(f'shape={x.shape} dtype={x.dtype}')
+sample = np.asarray(x[:50000])
+print(f'NaN count (first 50k): {int(np.isnan(sample).sum())}')
+print('Disk-order channel stats (PPG / BP / ECG):')
+for i, name in enumerate(['PPG','BP','ECG']):
+    ch = sample[:, i, :]
+    print(f'  {name}: min={ch.min():.3f} max={ch.max():.3f} mean={ch.mean():.3f} std={ch.std():.3f}')
+"
+```
+
+> Always use `mmap_mode='r'` and slice before stats — these files are 3-13 GB. Loading the whole array will OOM the laptop.
 
 ### 2. SwanLab pull health
 
@@ -90,14 +122,18 @@ python3 -c "
 import torch
 ck = torch.load('$ckpt', map_location='cpu', weights_only=False)
 print(f'top-level keys: {list(ck.keys()) if isinstance(ck, dict) else type(ck).__name__}')
-if isinstance(ck, dict) and 'model_state_dict' in ck:
-    sd = ck['model_state_dict']
+# UniCardio save_checkpoint() uses key 'model_state' (NOT 'model_state_dict').
+if isinstance(ck, dict) and 'model_state' in ck:
+    sd = ck['model_state']
     print(f'param tensors: {len(sd)}')
     print(f'total params : {sum(p.numel() for p in sd.values()):,}')
     for k in list(sd.keys())[:5]:
         print(f'  {k}: {tuple(sd[k].shape)}')
-    if 'epoch' in ck:   print(f'epoch: {ck[\"epoch\"]}')
-    if 'best_metric' in ck: print(f'best_metric: {ck[\"best_metric\"]}')
+    if 'epoch' in ck:    print(f'epoch: {ck[\"epoch\"]}')
+    if 'task_list' in ck: print(f'task_list: {ck[\"task_list\"]}')
+    if isinstance(ck.get('config'), dict):
+        d = ck['config'].get('data', {})
+        print(f'data.name: {d.get(\"name\", \"?\")}, slot_length: {d.get(\"slot_length\", \"?\")}')
 "
 ```
 

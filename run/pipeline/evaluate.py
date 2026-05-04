@@ -63,13 +63,16 @@ def _eval_task(
     preds: list[np.ndarray] = []
     targets: list[np.ndarray] = []
     total = limit_batches if limit_batches is not None else len(loader)
+    # mininterval=5s 避免刷屏；leave=True 让最后一行进度条留在日志里；
+    # 同时每 ~10% 主动 logger.info 一行，便于 `tee` 到文件后仍能看到推进。
+    log_every = max(1, total // 10)
     test_iter = tqdm(
         loader,
         desc=f"test {task.name}",
         mininterval=5.0,
         maxinterval=50.0,
         total=total,
-        leave=False,
+        leave=True,
     )
     for batch_idx, batch in enumerate(test_iter):
         signal = batch[0].to(device)
@@ -79,7 +82,13 @@ def _eval_task(
         target = _maybe_denormalize(target, int(task.target_slot))
         preds.append(pred.cpu().numpy())
         targets.append(target.cpu().numpy())
-        if limit_batches is not None and (batch_idx + 1) >= limit_batches:
+        done = batch_idx + 1
+        if done % log_every == 0 or done == total:
+            logger.info(
+                "task=%s batch=%d/%d (%.1f%%)",
+                task.name, done, total, 100.0 * done / total,
+            )
+        if limit_batches is not None and done >= limit_batches:
             break
     preds_np = np.concatenate(preds, axis=0)
     targets_np = np.concatenate(targets, axis=0)
@@ -136,8 +145,9 @@ def main(cfg: DictConfig) -> None:
     with out_csv.open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["task", "rmse", "mae", "pearson", "ks", "n"])
-        for task in active_tasks:
-            logger.info("Evaluating task %s", task.name)
+        task_iter = tqdm(active_tasks, desc="tasks", total=len(active_tasks), leave=True)
+        for ti, task in enumerate(task_iter, 1):
+            logger.info("[%d/%d] Evaluating task %s", ti, len(active_tasks), task.name)
             metrics = _eval_task(
                 model,
                 test_loader,
