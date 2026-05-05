@@ -15,7 +15,7 @@ python run/pipeline/train.py \
     data.batch_size=512 \
     data.num_workers=12 \
     trainer.amp.enabled=true \
-    trainer.compile.enabled=false \
-    trainer.compile.mode=reduce-overhead \
+    trainer.compile.enabled=true \
+    trainer.compile.mode=max-autotune \
     trainer.val_every=1 \
     2>&1 | tee "$LOG_FILE"
