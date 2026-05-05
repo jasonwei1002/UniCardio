@@ -1,14 +1,13 @@
 # UniCardio runtime dependencies.
 #
-# 注意 torch / torchvision / torchaudio 不在本文件里：CUDA 版本和平台强相关，
-# 请先按下面的命令安装，再装本文件。
+# 注意 torch 不在本文件里：CUDA 版本和平台强相关，请先按下面的命令安装，再装本文件。
+# 项目源码不用 torchvision / torchaudio，省略。
 #
-#   # 服务器 (CUDA 11.8)
-#   pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 \
-#       --index-url https://download.pytorch.org/whl/cu118
+#   # 服务器 (CUDA 12.8, H800) —— 当前生产环境
+#   pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
 #
 #   # macOS CPU 调试（同版本，走默认 PyPI）
-#   pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1
+#   pip install torch==2.11.0
 #
 # 然后：
 #   pip install -r requirements.txt
@@ -26,6 +25,9 @@ cosine_annealing_warmup>=2.0,<3
 
 # script/plot_first_sample.py 用到；不画图可不装
 matplotlib>=3.7
+
+# evaluate.py / trainer.py 的 SBP/DBP 提取（src/utils/bp_metrics.py）
+pyvital>=0.5
 
 # script/convert_h5_to_npy_csv.py 用到；不跑那个脚本可以不装
 h5py>=3.8

@@ -27,7 +27,7 @@ Hard rules — do not deviate without asking:
 - **Local = macOS Apple Silicon, CPU only.** For error debugging and smoke tests. Never launch real training here; the dataset is 3.4 GB and epochs would take hours. No MPS — some ops are unimplemented and it's not worth maintaining.
 - **Remote = Linux GPU server, CUDA only.** Only place full training runs. Access is **one-way via GitHub** — the laptop cannot SSH into the server. Push code from laptop → `git pull` on server → `bash train.sh`. Do not try to rsync / ssh the server.
 - **AMP is bf16-only on CUDA**, fp16 path removed entirely (no GradScaler). `run/conf/trainer/default.yaml::amp.enabled` gates it; CPU falls back to fp32 automatically.
-- **Data / checkpoints / logs are never in git** — `.gitignore` excludes `data/`, `run/outputs/`, `logs/`. First setup on a new server: scp `data/Final_sig_combined.npy` once.
+- **Data / checkpoints / logs are never in git** — `.gitignore` excludes `data/`, `run/outputs/`, `logs/`. First setup on a new server: scp the entire `data/mimicbp/` tree (subject-level `.npy` files plus the three `*_subjects.txt` lists), then run `python script/convert_mimicbp_to_500.py` to generate the three `*_mimicbp_500.npy` slice files.
 
 Device is read from the Hydra config (`device: cuda | cpu`); on macOS `cuda` auto-falls back to `cpu` so local debug just works with the default config.
 
@@ -37,7 +37,7 @@ Device is read from the Hydra config (`device: cuda | cpu`); on macOS `cuda` aut
 pip install -r requirements.txt
 ```
 
-Python 3.10+, PyTorch 2.x, Hydra 1.3.
+Python 3.10+, PyTorch 2.11 (CUDA 12.8 on the GPU server, CPU on macOS), Hydra 1.3.
 
 ## Key Commands
 
@@ -78,7 +78,7 @@ python run/pipeline/evaluate.py +checkpoint=run/outputs/<run>/checkpoints/best.p
 bash plot.sh                                 # picks latest best.pt automatically
 ```
 
-For the legacy `combined` dataset, `data.combined.data_path` resolves through `${oc.env:UNICARDIO_DATA, data/Final_sig_combined.npy}` — set `UNICARDIO_DATA=/abs/path/to.npy` to point at a different file without editing the config. The PulseDB dataset uses fixed paths (`data/pulsedb/*.npy`) defined in `run/conf/data/default.yaml`.
+Dataset paths are fixed in `run/conf/data/default.yaml` (`train_path / val_path / test_path`); override on the CLI like `python run/pipeline/train.py data.train_path=/abs/path/to.npy` if needed.
 
 Hydra writes per-run artifacts under `run/outputs/<timestamp>/`:
 - `checkpoints/latest.pt`, `checkpoints/best.pt` — full state (model, optimizer, scheduler, config, RNG).
@@ -92,16 +92,11 @@ SwanLab is wired in `run/pipeline/train.py::_init_swanlab` and `src/trainer_modu
 
 ## Data Preparation
 
-Two datasets are wired in (switch via `data.name`); both feed into the model in slot order **ECG=0, PPG=1, ABP=2**, and both apply BP normalization `(x - 100) / 50` to slot 2 inside `CardiacDataset.__getitem__`. Slots are never indexed by raw channel order downstream.
+The project targets MIMIC-BP exclusively. Subject-level split is fixed by `data/mimicbp/{train,val,test}_subjects.txt`, and the three `(N, 3, 500)` float32 slice files at `data/mimicbp/{Train,Val,Test}_mimicbp_500.npy` are produced once by `script/convert_mimicbp_to_500.py` (each 30 s @125 Hz segment → 7 non-overlapping 4 s windows; last 2 s discarded; channels stacked as ECG/PPG/ABP). **The `.npy` files must already be in slot order `(ECG, PPG, ABP)` on disk** — channel reordering belongs in the preprocessing script, not in the dataset class. `CardiacDataset.__init__` only applies BP normalization `(x - 100) / 50` to slot 2 and casts to float32. Slots are never indexed by raw channel order downstream.
 
-| `data.name`  | Files | Slot length | Channel permutation | Split |
-|--------------|-------|-------------|---------------------|-------|
-| `pulsedb` (default) | `data/pulsedb/Train_Subset_vitaldb_500.npy` + `data/pulsedb/CalFree_Test_Subset_vitaldb_500.npy` | 500 | `[0, 1, 2]` (already ECG/PPG/ABP) | Train file 80:20 → train/val; second file = test |
-| `combined` (legacy) | `data/Final_sig_combined.npy` | 500 | `[2, 0, 1]` (on-disk PPG/BP/ECG → ECG/PPG/ABP) | 20 000 val + 20 000 test + remainder train |
+Resulting split sizes: train **231 000**, val **40 950**, test **48 090** samples.
 
-Both datasets use `data.split_seed=42` for reproducibility. The PulseDB files are produced by `script/convert_h5_to_npy_csv.py` followed by `script/filter_and_split_pulsedb_to_500.py`, which keeps only VitalDB-source rows that have full demographics (height/weight/bmi) and slices each 1 250-sample window into two non-overlapping 500-sample halves.
-
-Datasets are read with `mmap_mode="r"`; only **indices** are split, so the 13 GB PulseDB file never lands in RAM. Permutation + BP normalization happen lazily per sample in `src/data_module/cardiac_dataset.py`.
+Datasets are loaded **fully into RAM** in `CardiacDataset.__init__` and shared across splits via a module-level `_CACHE: dict[str, ndarray]` keyed by file path. Per-sample work is reduced to a zero-copy `torch.from_numpy(self._data[idx])`. On Linux GPU servers the parent process pre-loads before the DataLoader spawns workers, so workers inherit the buffer via fork/CoW; on macOS local CPU debug, prefer `data.num_workers=0` to avoid spawn-mode reloads. Use `src.data_module.cardiac_dataset.clear_cache()` to release the cache explicitly (long-running tests / interactive sessions).
 
 ## Architecture
 
@@ -134,11 +129,11 @@ run/
 
 tests/                    # pytest unit tests (masks, rf_step, sampler)
 script/                   # Reusable utility scripts:
-                          #   - convert_h5_to_npy_csv.py / convert_mimicbp_to_npy_csv.py (raw → .npy)
-                          #   - split_pulsedb_to_500.py / filter_and_split_pulsedb_to_500.py (1250→500 slicing + VitalDB filter)
+                          #   - convert_mimicbp_to_npy_csv.py (raw → per-subject .npy)
+                          #   - convert_mimicbp_to_500.py (MIMIC-BP 30 s → 7×4 s slices, ECG/PPG/ABP stacked)
                           #   - plot_first_sample.py (Hydra entrypoint behind plot.sh)
                           #   - fetch_swanlog.py (also exposed as /swanlog slash command)
-data/                     # Datasets (gitignored): Final_sig_combined.npy or pulsedb/*.npy
+data/                     # Datasets (gitignored): mimicbp/*.npy + *_subjects.txt
 reports/                  # Refactor / experiment design notes (RF cascade, Tier-1, DDP)
 train.sh                  # 一键启动训练（GPU 服务器使用，固定 Tier-1 overrides）
 resume.sh                 # 续训（沿用原 run 目录，恢复 model/opt/sched/epoch）
@@ -207,7 +202,7 @@ The sampler integrates `v_θ` from `t = 0` (noise) → `t = 1` (data) with Euler
 ## Development Notes
 
 - **Adding a new task**: extend `TASK_SPECS` in `src/model_module/tasks.py` *and* give it a non-zero entry in `trainer.task_weights` (the sampler drops zero-weight tasks). The mask builder handles any slot subset; no model surgery needed. Adding a task with a new `target_slot` will trigger a `torch.compile` re-specialization on the first batch hitting it.
-- **Switching dataset**: flip `data.name=pulsedb|combined` (or override on the CLI). `slot_length` resolves automatically from the matching subsection via Hydra interpolation, so the model config (which references `${data.slot_length}`) stays in sync — never edit `slot_length` in two places.
+- **Adding / overriding data paths**: the project is wired to MIMIC-BP only (`data/mimicbp/{Train,Val,Test}_mimicbp_500.npy`). Override on the CLI with `data.train_path=... data.val_path=... data.test_path=...` if you need to point at a different file (must be `(N, 3, 500)` float32 in `(ECG, PPG, ABP)` order). The model config references `${data.slot_length}` so any new slot length must be set in `run/conf/data/default.yaml` once.
 - **Single-GPU → multi-GPU**: the checkpoint save/load path unwraps `nn.DataParallel`, `DistributedDataParallel`, and `torch.compile`'s `OptimizedModule` (`_orig_mod`) — so saved `state_dict` keys stay aligned with the architecture regardless of wrapping order. For DDP, wrap before calling `train()`; the logger and ckpt code are DDP-safe per process.
 - **macOS**: 本地只用 CPU 做错误调试与 smoke test；不走 MPS（部分算子未实现，不值得维护）。
 - **Reproducibility**: `set_seed(cfg.seed)` is called at both entrypoints. Set `deterministic: true` to force cuDNN determinism (slower).

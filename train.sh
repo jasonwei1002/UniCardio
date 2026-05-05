@@ -13,9 +13,9 @@ LOG_FILE="logs/train_$(date +%Y%m%d_%H%M%S).log"
 python run/pipeline/train.py \
     device=cuda \
     data.batch_size=512 \
-    data.num_workers=8 \
+    data.num_workers=12 \
     trainer.amp.enabled=true \
     trainer.compile.enabled=false \
     trainer.compile.mode=reduce-overhead \
-    trainer.val_every=2 \
+    trainer.val_every=1 \
     2>&1 | tee "$LOG_FILE"

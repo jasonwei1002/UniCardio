@@ -52,6 +52,11 @@ ckpt_every: 1
 itr_per_epoch: null        # null 表示遍历整个 DataLoader
 log_filename: loss.csv
 
+# 验证时是否额外做 sampling-based SBP/DBP 评估（pyvital + euler_sample）。
+# 与 val_every 同步触发；每次取 val_loader 的第一个 batch（即 data.batch_size 条），
+# 对所有 ABP-target 任务跑一次 8-step Euler 采样。CPU smoke test 建议关掉。
+val_bp_enabled: true
+
 # 可选：从 checkpoint 路径断点续训（相对/绝对路径均可）。
 # 完整恢复 model + optimizer + scheduler + epoch；lr 走原 cosine 轨迹。
 # 与 init_from 互斥。

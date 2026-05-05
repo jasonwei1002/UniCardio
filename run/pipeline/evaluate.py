@@ -27,6 +27,7 @@ from src.data_module.datamodule import build_loaders
 from src.model_module.tasks import Slot, active_task_pairs
 from src.model_module.unicardio_rf import UniCardioRF
 from src.trainer_module.sampler import euler_sample
+from src.utils.bp_metrics import bp_errors
 from src.utils.checkpoint import load_checkpoint
 from src.utils.metrics import ks_statistic, mae, pearson_corr, rmse
 from src.utils.normalization import bp_denormalize
@@ -42,10 +43,10 @@ def _resolve_device(name: str) -> torch.device:
 
 
 def _maybe_denormalize(
-    tensor: torch.Tensor, target_slot: int
+    tensor: torch.Tensor, target_slot: Slot
 ) -> torch.Tensor:
     """对 ABP 做 BP 反归一化，使指标以物理单位（mmHg）给出。"""
-    if target_slot == int(Slot.ABP):
+    if target_slot == Slot.ABP:
         return bp_denormalize(tensor)
     return tensor
 
@@ -59,6 +60,7 @@ def _eval_task(
     device: torch.device,
     n_steps: int,
     limit_batches: int | None,
+    srate: int,
 ) -> dict[str, float]:
     preds: list[np.ndarray] = []
     targets: list[np.ndarray] = []
@@ -76,10 +78,10 @@ def _eval_task(
     )
     for batch_idx, batch in enumerate(test_iter):
         signal = batch[0].to(device)
-        target = signal[:, int(task.target_slot):int(task.target_slot) + 1, :]
+        target = signal[:, task.target_slot:task.target_slot + 1, :]
         pred = euler_sample(model, signal, task, n_steps=n_steps, device=device)
-        pred = _maybe_denormalize(pred, int(task.target_slot))
-        target = _maybe_denormalize(target, int(task.target_slot))
+        pred = _maybe_denormalize(pred, task.target_slot)
+        target = _maybe_denormalize(target, task.target_slot)
         preds.append(pred.cpu().numpy())
         targets.append(target.cpu().numpy())
         done = batch_idx + 1
@@ -92,13 +94,17 @@ def _eval_task(
             break
     preds_np = np.concatenate(preds, axis=0)
     targets_np = np.concatenate(targets, axis=0)
-    return {
+    metrics: dict[str, float] = {
         "rmse": rmse(preds_np, targets_np),
         "mae": mae(preds_np, targets_np),
         "pearson": pearson_corr(preds_np, targets_np),
         "ks": ks_statistic(preds_np, targets_np),
         "n": int(preds_np.shape[0]),
     }
+    # 仅 ABP 目标任务额外计算 SBP/DBP 误差（pyvital 经典 DSP 峰检测）。
+    if task.target_slot == Slot.ABP:
+        metrics.update(bp_errors(preds_np, targets_np, srate=srate))
+    return metrics
 
 
 @hydra.main(
@@ -132,6 +138,7 @@ def main(cfg: DictConfig) -> None:
     limit_batches = cfg.get("eval", {}).get("limit_batches", None)
     if limit_batches is not None:
         limit_batches = int(limit_batches)
+    srate = int(cfg.data.srate)
 
     # 与训练保持一致：权重为 0 的任务不参与评估。
     active_tasks = [spec for spec, _ in active_task_pairs(
@@ -142,9 +149,23 @@ def main(cfg: DictConfig) -> None:
     out_dir = Path(cfg.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_csv = out_dir / "per_task_metrics.csv"
+    # (csv_column, metrics_key) — n_valid/n_total 加 bp_ 前缀以避免与已存在的 'n' 列混淆。
+    bp_fields: list[tuple[str, str]] = [
+        ("sbp_mae", "sbp_mae"),
+        ("dbp_mae", "dbp_mae"),
+        ("sbp_me", "sbp_me"),
+        ("dbp_me", "dbp_me"),
+        ("sbp_std", "sbp_std"),
+        ("dbp_std", "dbp_std"),
+        ("n_bp_valid", "n_valid"),
+        ("n_bp_total", "n_total"),
+    ]
     with out_csv.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["task", "rmse", "mae", "pearson", "ks", "n"])
+        writer.writerow([
+            "task", "rmse", "mae", "pearson", "ks", "n",
+            *(c for c, _ in bp_fields),
+        ])
         task_iter = tqdm(active_tasks, desc="tasks", total=len(active_tasks), leave=True)
         for ti, task in enumerate(task_iter, 1):
             logger.info("[%d/%d] Evaluating task %s", ti, len(active_tasks), task.name)
@@ -155,15 +176,18 @@ def main(cfg: DictConfig) -> None:
                 device=device,
                 n_steps=n_steps,
                 limit_batches=limit_batches,
+                srate=srate,
             )
-            writer.writerow([
+            row = [
                 task.name,
                 metrics["rmse"],
                 metrics["mae"],
                 metrics["pearson"],
                 metrics["ks"],
                 metrics["n"],
-            ])
+                *(metrics.get(k, "") for _, k in bp_fields),
+            ]
+            writer.writerow(row)
             logger.info(
                 "%s | rmse=%.4f | mae=%.4f | pearson=%.4f | ks=%.4f | n=%d",
                 task.name,
@@ -173,6 +197,15 @@ def main(cfg: DictConfig) -> None:
                 metrics["ks"],
                 metrics["n"],
             )
+            if "sbp_mae" in metrics:
+                logger.info(
+                    "%s | SBP MAE=%.2f ± %.2f mmHg (ME=%+.2f) | "
+                    "DBP MAE=%.2f ± %.2f mmHg (ME=%+.2f) | bp_n=%d/%d",
+                    task.name,
+                    metrics["sbp_mae"], metrics["sbp_std"], metrics["sbp_me"],
+                    metrics["dbp_mae"], metrics["dbp_std"], metrics["dbp_me"],
+                    metrics["n_valid"], metrics["n_total"],
+                )
     logger.info("Wrote %s", out_csv)
 
 
