@@ -29,8 +29,8 @@ matplotlib>=3.7
 # evaluate.py / trainer.py 的 SBP/DBP 提取（src/utils/bp_metrics.py）
 pyvital>=0.5
 
-# script/convert_h5_to_npy_csv.py 用到；不跑那个脚本可以不装
-h5py>=3.8
+# script/convert_mimicbp_to_500.py 的 ECG / PPG 默认去噪
+neurokit2>=0.2
 
 # dev
 pytest>=7.0

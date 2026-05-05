@@ -5,10 +5,14 @@
 
   - 读取 ``train_subjects.txt / val_subjects.txt / test_subjects.txt``
     （文件内是单行 Python list 字面量）；
+  - 在 30 s 段层面用 NeuroKit2 默认参数对 ECG / PPG 去噪（
+    ``method='neurokit'`` / ``method='elgendi'``），ABP 不去噪；
+    在 30 s 上滤波避免 4 s 切片在 zero-phase filter edge 留 artifact；
   - 对每个 30 s 段取前 28 s，切成 7 个 ``500`` 长度的不重叠 4 s 片段，
     丢弃最后 250 个样本点（2 s）；
   - 沿 channel 轴按 ``(ECG, PPG, ABP)`` 拼接，输出形状 ``(N, 3, 500)``；
-  - 不做任何归一化（``CardiacDataset`` 内部对 slot=2 应用 BP 归一化）；
+  - 不做任何归一化（``CardiacDataset`` 内部对 slot=2 应用 BP 归一化、
+    对 slot 0/1 应用 per-sample min-max）；
   - dtype 统一为 ``float32``。
 
 输出：
@@ -24,6 +28,7 @@ import ast
 import logging
 from pathlib import Path
 
+import neurokit2 as nk
 import numpy as np
 
 logging.basicConfig(
@@ -57,16 +62,32 @@ def load_subject_ids(txt_path: Path) -> list[str]:
     return ids
 
 
+def _denoise_ecg(seg: np.ndarray) -> np.ndarray:
+    return nk.ecg_clean(seg, sampling_rate=FS, method="neurokit").astype(np.float32)
+
+
+def _denoise_ppg(seg: np.ndarray) -> np.ndarray:
+    return nk.ppg_clean(seg, sampling_rate=FS, method="elgendi").astype(np.float32)
+
+
 def load_subject_signals(sid: str) -> np.ndarray:
-    """返回 ``(SEGS_PER_SUBJ, 3, SEG_LEN)``，channel 顺序 = (ECG, PPG, ABP)。"""
-    arrs = []
+    """返回 ``(SEGS_PER_SUBJ, 3, SEG_LEN)``，channel 顺序 = (ECG, PPG, ABP)。
+
+    ECG / PPG 在 30 s 段上做 NeuroKit2 默认带通去噪；ABP 直接保留原始波形
+    （有创动脉压本身干净，任何低通会扭曲 dicrotic notch）。
+    """
+    arrs = {}
     for wav in WAVES:
         path = MIMIC_DIR / wav / f"{sid}_{wav}.npy"
-        a = np.load(path, mmap_mode="r")
+        a = np.load(path).astype(np.float32, copy=False)
         if a.shape != (SEGS_PER_SUBJ, SEG_LEN):
             raise ValueError(f"{path} shape {a.shape} != ({SEGS_PER_SUBJ}, {SEG_LEN})")
-        arrs.append(a)
-    return np.stack(arrs, axis=1).astype(np.float32, copy=False)  # (30, 3, 3750)
+        arrs[wav] = a
+
+    arrs["ecg"] = np.stack([_denoise_ecg(seg) for seg in arrs["ecg"]])
+    arrs["ppg"] = np.stack([_denoise_ppg(seg) for seg in arrs["ppg"]])
+
+    return np.stack([arrs[w] for w in WAVES], axis=1)  # (30, 3, 3750) float32
 
 
 def slice_subject(stack: np.ndarray) -> np.ndarray:
