@@ -53,16 +53,8 @@ itr_per_epoch: null        # null 表示遍历整个 DataLoader
 log_filename: loss.csv
 
 # 验证时是否额外做 sampling-based SBP/DBP 评估（pyvital + euler_sample）。
-# 与 val_every 同步触发；每次取 val_loader 的第一个 batch（即 data.batch_size 条），
-# 对所有 ABP-target 任务跑一次 8-step Euler 采样。CPU smoke test 建议关掉。
+# 与 val_every 同步触发；遍历**整个** val_loader，对每个 ABP-target 任务跑
+# 8-step Euler 采样、提取逐搏 SBP/DBP、聚合成 per-task MAE/ME/std。
+# pyvital 缺失会自动降级为关。CPU smoke test 建议关掉。
 val_bp_enabled: true
 
-# 可选：从 checkpoint 路径断点续训（相对/绝对路径均可）。
-# 完整恢复 model + optimizer + scheduler + epoch；lr 走原 cosine 轨迹。
-# 与 init_from 互斥。
-resume_from: null
-
-# 可选：从 checkpoint 加载**仅模型权重**作为初始化（fine-tune 入口）。
-# optimizer / scheduler / epoch 都按当前 cfg 新建——可以换 lr / 换 warmup /
-# 换 epochs。与 resume_from 互斥。
-init_from: null

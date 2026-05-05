@@ -17,7 +17,7 @@ from typing import Any, Mapping, Sequence
 import swanlab
 import torch
 from omegaconf import DictConfig, OmegaConf
-from torch import Tensor, nn
+from torch import nn
 from torch.optim import Adam, Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.data import DataLoader
@@ -26,8 +26,12 @@ from tqdm import tqdm
 from cosine_annealing_warmup import CosineAnnealingWarmupRestarts
 
 from ..model_module.tasks import TASK_LIST, Slot, TaskSpec, active_task_pairs
-from ..utils.bp_metrics import bp_errors
-from ..utils.checkpoint import load_checkpoint, save_checkpoint
+from ..utils.bp_metrics import (
+    bp_aggregate_errors,
+    bp_per_sample_errors,
+    pyvital_available,
+)
+from ..utils.checkpoint import save_checkpoint
 from ..utils.normalization import bp_denormalize
 from .csv_logger import SimpleCSVLogger
 from .rectified_flow import rf_train_step
@@ -109,38 +113,60 @@ def _csv_fields() -> list[str]:
 @torch.inference_mode()
 def _evaluate_sampling_bp(
     model: nn.Module,
-    val_signal: Tensor,
+    val_loader: DataLoader,
     tasks: Sequence[TaskSpec],
     *,
     n_steps: int,
     srate: int,
     device: torch.device,
 ) -> dict[str, dict[str, float]]:
-    """对一个 val batch 跑 Euler sampler，并对每个 ABP-target 任务计算 SBP/DBP 误差。
+    """跑完整个 val_loader，对每个 ABP-target 任务用 Euler sampler 计算 SBP/DBP 误差。
 
     Args:
-        val_signal: 形状 ``(B, 3, L)`` 的验证信号（已搬到 device）。
+        val_loader: 验证集 DataLoader；返回 ``(signal,)`` tuple，``signal``
+            shape 为 ``(B, 3, L)``。
         tasks: 待评估任务集合；非 ABP-target 任务会被跳过。
         n_steps: Euler 采样步数（来自 ``cfg.sampler.n_steps``）。
         srate: ABP 采样率（Hz），传给 pyvital 的 detect_peaks。
 
     Returns:
         ``{task_name: bp_errors_dict}``，仅包含 ABP-target 任务。
-        ``bp_errors_dict`` 的内容见 :func:`src.utils.bp_metrics.bp_errors`。
+        ``bp_errors_dict`` 的内容见 :func:`src.utils.bp_metrics.bp_errors`；
+        若 pyvital 缺失，每个 task 的 dict 为 ``{}``。
     """
-    out: dict[str, dict[str, float]] = {}
-    for task in tasks:
-        if task.target_slot != Slot.ABP:
-            continue
-        pred = euler_sample(
-            model, val_signal, task, n_steps=n_steps, device=device
-        )
-        target = val_signal[:, task.target_slot:task.target_slot + 1, :]
-        # detect_peaks 阈值（mmHg）必须在物理量纲下生效；.float() 把潜在的 bf16 提到 fp32。
-        pred_mmHg = bp_denormalize(pred).float().cpu().numpy()
-        target_mmHg = bp_denormalize(target).float().cpu().numpy()
-        out[task.name] = bp_errors(pred_mmHg, target_mmHg, srate=srate)
-    return out
+    abp_tasks = [t for t in tasks if t.target_slot == Slot.ABP]
+    if not abp_tasks:
+        return {}
+
+    sbp_acc: dict[str, list[float]] = {t.name: [] for t in abp_tasks}
+    dbp_acc: dict[str, list[float]] = {t.name: [] for t in abp_tasks}
+    n_total: dict[str, int] = {t.name: 0 for t in abp_tasks}
+
+    was_training = model.training
+    model.eval()
+    try:
+        for batch in tqdm(val_loader, desc="val_bp", leave=False, mininterval=5.0):
+            val_signal = batch[0].to(device, non_blocking=True)
+            for task in abp_tasks:
+                pred = euler_sample(
+                    model, val_signal, task, n_steps=n_steps, device=device
+                )
+                target = val_signal[:, task.target_slot:task.target_slot + 1, :]
+                # detect_peaks 阈值（mmHg）必须在物理量纲下生效；.float() 把潜在的 bf16 提到 fp32。
+                pred_mmHg = bp_denormalize(pred).float().cpu().numpy()
+                target_mmHg = bp_denormalize(target).float().cpu().numpy()
+                sbp, dbp, n = bp_per_sample_errors(pred_mmHg, target_mmHg, srate=srate)
+                sbp_acc[task.name].extend(sbp)
+                dbp_acc[task.name].extend(dbp)
+                n_total[task.name] += n
+    finally:
+        if was_training:
+            model.train()
+
+    return {
+        name: bp_aggregate_errors(sbp_acc[name], dbp_acc[name], n_total[name])
+        for name in sbp_acc
+    }
 
 
 @torch.inference_mode()
@@ -227,10 +253,6 @@ def train(
     ckpt_every = int(cfg_dict.get("ckpt_every", 1))
     itr_per_epoch = cfg_dict.get("itr_per_epoch")
 
-    # Move model to device BEFORE building optimizer / loading state. Otherwise
-    # optimizer is built over CPU params, and load_checkpoint(..., map_location=device)
-    # would land Adam moments on CPU while later model.to(device) moves only params,
-    # crashing on the next optimizer.step().
     model.to(device)
     optimizer = _build_optimizer(model, cfg_dict)
     steps_per_epoch = len(train_loader) if itr_per_epoch is None else int(itr_per_epoch)
@@ -254,17 +276,24 @@ def train(
     logger.info("Training tasks: %s", [t.name for t in active_tasks])
 
     # 验证时是否对 ABP-target 任务跑 sampling-based SBP/DBP 评估。
-    # 仅当上游传入 sampler_n_steps / srate 且配置未显式关闭时生效。
+    # 需同时满足：配置未关、上游传入 sampler_n_steps / srate、active_tasks 含 ABP-target、
+    # 以及 pyvital 已安装（缺失时静默跳过会让用户看不到任何 SBP/DBP 指标，所以显式守卫）。
     val_bp_enabled = bool(cfg_dict.get("val_bp_enabled", True))
     val_bp_active = (
         val_bp_enabled
         and sampler_n_steps is not None
         and srate is not None
         and any(t.target_slot == Slot.ABP for t in active_tasks)
+        and pyvital_available()
     )
+    if val_bp_enabled and not pyvital_available():
+        logger.warning(
+            "val_bp_enabled=True but pyvital is missing; SBP/DBP metrics will be skipped. "
+            "Install via `pip install pyvital`."
+        )
     if val_bp_active:
         logger.info(
-            "Sampling BP val enabled: n_steps=%d, srate=%d Hz, batch from val_loader",
+            "Sampling BP val enabled: n_steps=%d, srate=%d Hz, full val_loader",
             int(sampler_n_steps), int(srate),
         )
 
@@ -275,27 +304,6 @@ def train(
 
     start_epoch = 0
     best_val = float("inf")
-    resume_from = cfg_dict.get("resume_from")
-    init_from = cfg_dict.get("init_from")
-    if resume_from and init_from:
-        raise ValueError(
-            "trainer.resume_from and trainer.init_from are mutually exclusive. "
-            "Use resume_from to continue a run (restores optimizer/scheduler/epoch), "
-            "or init_from to start fresh from given model weights (fine-tune)."
-        )
-    if resume_from:
-        payload = load_checkpoint(
-            resume_from,
-            model=model,
-            optimizer=optimizer,
-            lr_scheduler=scheduler,
-            map_location=device,
-        )
-        start_epoch = int(payload.get("epoch", 0)) + 1
-        logger.info("Resuming from epoch %d", start_epoch)
-    elif init_from:
-        load_checkpoint(init_from, model=model, map_location=device)
-        logger.info("Initialized model from %s (fine-tune mode, fresh optim/sched)", init_from)
 
     model.train()
 
@@ -408,11 +416,8 @@ def train(
 
             if val_bp_active:
                 try:
-                    val_signal = next(iter(val_loader))[0].to(
-                        device, non_blocking=True
-                    )
                     bp_per_task = _evaluate_sampling_bp(
-                        model, val_signal, active_tasks,
+                        model, val_loader, active_tasks,
                         n_steps=int(sampler_n_steps),
                         srate=int(srate),
                         device=device,

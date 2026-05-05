@@ -60,15 +60,6 @@ python run/pipeline/train.py
 python run/pipeline/train.py device=cpu trainer.epochs=2 data.num_workers=0
 python run/pipeline/train.py trainer.compile.enabled=false   # skip Dynamo when iterating
 
-# Resume from a checkpoint (model + optimizer + scheduler + epoch; reuses the
-# original run dir so loss.csv / swanlog append cleanly).
-bash resume.sh                               # picks latest.pt automatically
-bash resume.sh path/to/latest.pt trainer.epochs=600
-
-# Fine-tune: load **only the model weights** as init, fresh optimizer / scheduler /
-# epoch, new Hydra run dir. Useful for swapping task_weights or lr.
-bash finetune.sh path/to/best.pt trainer.lr=1e-4
-
 # Evaluation with a checkpoint. On the GPU server prefer `bash test.sh [ckpt]`,
 # which auto-picks the latest `run/outputs/*/checkpoints/best.pt` if no path is given.
 python run/pipeline/evaluate.py +checkpoint=run/outputs/<run>/checkpoints/best.pt
@@ -136,8 +127,6 @@ script/                   # Reusable utility scripts:
 data/                     # Datasets (gitignored): mimicbp/*.npy + *_subjects.txt
 reports/                  # Refactor / experiment design notes (RF cascade, Tier-1, DDP)
 train.sh                  # 一键启动训练（GPU 服务器使用，固定 Tier-1 overrides）
-resume.sh                 # 续训（沿用原 run 目录，恢复 model/opt/sched/epoch）
-finetune.sh               # 仅以 ckpt 权重做 init，新 run 目录、新 opt/sched
 test.sh                   # 一键启动评估（默认挑最新 best.pt，可传入 ckpt 路径）
 plot.sh                   # 一键可视化（test 第 0 条样本，每个 active task 一张图）
 ```
@@ -182,7 +171,7 @@ Per batch: sample one task from the active set (zero-weight tasks are pre-filter
 4. Assembles `(B, 1, 3*L)` input with clean conditions + `x_t` in the target slot.
 5. Calls the model and returns MSE between predicted and target velocity.
 
-Optimizer: Adam (default lr 1e-3, wd 1e-6). Gradient clipping: L2 norm capped at `trainer.grad_clip_norm` (default `1.0`; set to 0/null to disable) between `backward()` and `optimizer.step()` — non-optional under bf16 + Adam on RF velocity MSE, an earlier 2e-3 run diverged mid-warmup around epoch 10 without clipping. Schedule: **`cosine_annealing_warmup.CosineAnnealingWarmupRestarts`** (no warm restart — `first_cycle_steps = total_steps` so training ends before the cycle wraps). Linear warmup for `trainer.warmup_pct` (fraction of total steps in `[0, 1)`, default `0.005` ≈ 1–2 epochs at current schedule; step count derived at runtime via `round(warmup_pct * total_steps)`) from `min_lr` up to `lr` (= the library's `max_lr`), then cosine anneal from `lr` down to `lr_scheduler.min_lr` (default `1e-6`) across the remaining steps; all step-granularity internally. AMP: bf16-only on CUDA, no GradScaler; CPU silently falls back to fp32. Checkpoints every epoch (`latest.pt`); best tracked by mean validation RF loss (`best.pt`); `trainer.resume_from` resumes from any saved checkpoint.
+Optimizer: Adam (default lr 1e-3, wd 1e-6). Gradient clipping: L2 norm capped at `trainer.grad_clip_norm` (default `1.0`; set to 0/null to disable) between `backward()` and `optimizer.step()` — non-optional under bf16 + Adam on RF velocity MSE, an earlier 2e-3 run diverged mid-warmup around epoch 10 without clipping. Schedule: **`cosine_annealing_warmup.CosineAnnealingWarmupRestarts`** (no warm restart — `first_cycle_steps = total_steps` so training ends before the cycle wraps). Linear warmup for `trainer.warmup_pct` (fraction of total steps in `[0, 1)`, default `0.005` ≈ 1–2 epochs at current schedule; step count derived at runtime via `round(warmup_pct * total_steps)`) from `min_lr` up to `lr` (= the library's `max_lr`), then cosine anneal from `lr` down to `lr_scheduler.min_lr` (default `1e-6`) across the remaining steps; all step-granularity internally. AMP: bf16-only on CUDA, no GradScaler; CPU silently falls back to fp32. Checkpoints every epoch (`latest.pt`); best tracked by mean validation RF loss (`best.pt`).
 
 ### Inference API
 
