@@ -25,17 +25,10 @@ from tqdm import tqdm
 
 from cosine_annealing_warmup import CosineAnnealingWarmupRestarts
 
-from ..model_module.tasks import TASK_LIST, Slot, TaskSpec, active_task_pairs
-from ..utils.bp_metrics import (
-    bp_aggregate_errors,
-    bp_per_sample_errors,
-    pyvital_available,
-)
+from ..model_module.tasks import TASK_LIST, TaskSpec, active_task_pairs
 from ..utils.checkpoint import save_checkpoint
-from ..utils.normalization import bp_denormalize
 from .csv_logger import SimpleCSVLogger
 from .rectified_flow import rf_train_step
-from .sampler import euler_sample
 
 logger = logging.getLogger(__name__)
 
@@ -93,80 +86,12 @@ def _sample_task(pairs: Sequence[tuple[TaskSpec, float]]) -> TaskSpec:
     return random.choices(tasks, weights=weights, k=1)[0]
 
 
-def _abp_tasks() -> list[TaskSpec]:
-    """以 TASK_LIST 顺序返回所有 target_slot == ABP 的任务（保持 CSV 列稳定）。"""
-    return [t for t in TASK_LIST if t.target_slot == Slot.ABP]
-
-
 def _csv_fields() -> list[str]:
     fields = ["epoch", "lr", "epoch_time_s", "avg_loss"]
     fields.extend(f"loss_{t.name}" for t in TASK_LIST)
     fields.extend(f"val_loss_{t.name}" for t in TASK_LIST)
     fields.append("val_loss_mean")
-    # 验证时若启用 sampling-based BP eval，会写入这两列（每 ABP-target 任务一对）。
-    for t in _abp_tasks():
-        fields.append(f"val_sbp_mae_{t.name}")
-        fields.append(f"val_dbp_mae_{t.name}")
     return fields
-
-
-@torch.inference_mode()
-def _evaluate_sampling_bp(
-    model: nn.Module,
-    val_loader: DataLoader,
-    tasks: Sequence[TaskSpec],
-    *,
-    n_steps: int,
-    srate: int,
-    device: torch.device,
-) -> dict[str, dict[str, float]]:
-    """跑完整个 val_loader，对每个 ABP-target 任务用 Euler sampler 计算 SBP/DBP 误差。
-
-    Args:
-        val_loader: 验证集 DataLoader；返回 ``(signal,)`` tuple，``signal``
-            shape 为 ``(B, 3, L)``。
-        tasks: 待评估任务集合；非 ABP-target 任务会被跳过。
-        n_steps: Euler 采样步数（来自 ``cfg.sampler.n_steps``）。
-        srate: ABP 采样率（Hz），传给 pyvital 的 detect_peaks。
-
-    Returns:
-        ``{task_name: bp_errors_dict}``，仅包含 ABP-target 任务。
-        ``bp_errors_dict`` 的内容见 :func:`src.utils.bp_metrics.bp_errors`；
-        若 pyvital 缺失，每个 task 的 dict 为 ``{}``。
-    """
-    abp_tasks = [t for t in tasks if t.target_slot == Slot.ABP]
-    if not abp_tasks:
-        return {}
-
-    sbp_acc: dict[str, list[float]] = {t.name: [] for t in abp_tasks}
-    dbp_acc: dict[str, list[float]] = {t.name: [] for t in abp_tasks}
-    n_total: dict[str, int] = {t.name: 0 for t in abp_tasks}
-
-    was_training = model.training
-    model.eval()
-    try:
-        for batch in tqdm(val_loader, desc="val_bp", leave=False, mininterval=5.0):
-            val_signal = batch[0].to(device, non_blocking=True)
-            for task in abp_tasks:
-                pred = euler_sample(
-                    model, val_signal, task, n_steps=n_steps, device=device
-                )
-                target = val_signal[:, task.target_slot:task.target_slot + 1, :]
-                # detect_peaks 阈值（mmHg）必须在物理量纲下生效；.float() 把潜在的 bf16 提到 fp32。
-                pred_mmHg = bp_denormalize(pred).float().cpu().numpy()
-                target_mmHg = bp_denormalize(target).float().cpu().numpy()
-                sbp, dbp, n = bp_per_sample_errors(pred_mmHg, target_mmHg, srate=srate)
-                sbp_acc[task.name].extend(sbp)
-                dbp_acc[task.name].extend(dbp)
-                n_total[task.name] += n
-    finally:
-        if was_training:
-            model.train()
-
-    return {
-        name: bp_aggregate_errors(sbp_acc[name], dbp_acc[name], n_total[name])
-        for name in sbp_acc
-    }
 
 
 @torch.inference_mode()
@@ -224,8 +149,6 @@ def train(
     *,
     device: torch.device,
     output_dir: str | Path,
-    sampler_n_steps: int | None = None,
-    srate: int | None = None,
 ) -> None:
     """执行完整的 Rectified Flow 训练循环。
 
@@ -274,28 +197,6 @@ def train(
     task_pairs = active_task_pairs(cfg_dict.get("task_weights"))
     active_tasks: list[TaskSpec] = [spec for spec, _ in task_pairs]
     logger.info("Training tasks: %s", [t.name for t in active_tasks])
-
-    # 验证时是否对 ABP-target 任务跑 sampling-based SBP/DBP 评估。
-    # 需同时满足：配置未关、上游传入 sampler_n_steps / srate、active_tasks 含 ABP-target、
-    # 以及 pyvital 已安装（缺失时静默跳过会让用户看不到任何 SBP/DBP 指标，所以显式守卫）。
-    val_bp_enabled = bool(cfg_dict.get("val_bp_enabled", True))
-    val_bp_active = (
-        val_bp_enabled
-        and sampler_n_steps is not None
-        and srate is not None
-        and any(t.target_slot == Slot.ABP for t in active_tasks)
-        and pyvital_available()
-    )
-    if val_bp_enabled and not pyvital_available():
-        logger.warning(
-            "val_bp_enabled=True but pyvital is missing; SBP/DBP metrics will be skipped. "
-            "Install via `pip install pyvital`."
-        )
-    if val_bp_active:
-        logger.info(
-            "Sampling BP val enabled: n_steps=%d, srate=%d Hz, full val_loader",
-            int(sampler_n_steps), int(srate),
-        )
 
     csv_logger = SimpleCSVLogger(
         log_dir / cfg_dict.get("log_filename", "loss.csv"),
@@ -387,7 +288,6 @@ def train(
             "avg_loss": avg,
             **per_task,
         }
-        bp_per_task: dict[str, dict[str, float]] = {}
 
         if val_loader is not None and (epoch + 1) % val_every == 0:
             val_losses = _evaluate(
@@ -414,29 +314,6 @@ def train(
                     extra={"val_loss_mean": mean_val},
                 )
 
-            if val_bp_active:
-                try:
-                    bp_per_task = _evaluate_sampling_bp(
-                        model, val_loader, active_tasks,
-                        n_steps=int(sampler_n_steps),
-                        srate=int(srate),
-                        device=device,
-                    )
-                except Exception as e:  # noqa: BLE001
-                    logger.warning("Sampling BP val failed: %s", e)
-                for task_name, bp in bp_per_task.items():
-                    if not bp:
-                        continue
-                    row[f"val_sbp_mae_{task_name}"] = bp["sbp_mae"]
-                    row[f"val_dbp_mae_{task_name}"] = bp["dbp_mae"]
-                    logger.info(
-                        "  %s | SBP MAE %.2f (ME %+.2f) | DBP MAE %.2f (ME %+.2f) | bp_n=%d/%d",
-                        task_name,
-                        bp["sbp_mae"], bp["sbp_me"],
-                        bp["dbp_mae"], bp["dbp_me"],
-                        bp["n_valid"], bp["n_total"],
-                    )
-
         csv_logger.log_mapping(row)
 
         epoch_metrics: dict[str, float] = {
@@ -449,13 +326,6 @@ def train(
             epoch_metrics["val/loss_mean"] = row["val_loss_mean"]
             for t in active_tasks:
                 epoch_metrics[f"val/loss_{t.name}"] = row[f"val_loss_{t.name}"]
-        for task_name, bp in bp_per_task.items():
-            if not bp:
-                continue
-            for k in ("sbp_mae", "dbp_mae", "sbp_me", "dbp_me",
-                      "sbp_std", "dbp_std"):
-                epoch_metrics[f"val/{k}_{task_name}"] = bp[k]
-            epoch_metrics[f"val/bp_n_valid_{task_name}"] = bp["n_valid"]
         swanlab.log(epoch_metrics, step=epoch)
 
         if (epoch + 1) % ckpt_every == 0:

@@ -100,8 +100,6 @@ def main(cfg: DictConfig) -> None:
             val_loader,
             device=device,
             output_dir=cfg.output_dir,
-            sampler_n_steps=int(cfg.sampler.n_steps),
-            srate=int(cfg.data.srate),
         )
     finally:
         swanlab.finish()
