@@ -15,8 +15,10 @@ from pathlib import Path
 
 import hydra
 import numpy as np
+import pandas as pd
 import torch
 from omegaconf import DictConfig, OmegaConf
+from torch.utils.data import SequentialSampler
 from tqdm import tqdm
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -27,7 +29,7 @@ from src.data_module.datamodule import build_loaders
 from src.model_module.tasks import Slot, active_task_pairs
 from src.model_module.unicardio_rf import UniCardioRF
 from src.trainer_module.sampler import euler_sample
-from src.utils.bp_metrics import bp_errors
+from src.utils.bp_metrics import bp_errors_from_labels
 from src.utils.checkpoint import load_checkpoint
 from src.utils.metrics import ks_statistic, mae, pearson_corr, rmse
 from src.utils.normalization import bp_denormalize
@@ -51,6 +53,23 @@ def _maybe_denormalize(
     return tensor
 
 
+def _load_bp_labels(npy_path: str | Path) -> np.ndarray | None:
+    """从 npy 路径推同名 csv，加载 ``(N, 2)`` 的 (sbp, dbp) ground-truth 矩阵。
+
+    PulseDB / MIMIC-BP 的 csv 与 npy 行序一一对应，row i 即 sample i。
+    csv 缺失时返回 None，调用方应回退到 DSP-only 评估或跳过 BP 指标。
+    """
+    csv_path = Path(npy_path).with_suffix(".csv")
+    try:
+        df = pd.read_csv(csv_path, usecols=["sbp", "dbp"])
+    except FileNotFoundError:
+        logger.warning("BP label csv not found at %s; skipping label-based BP metrics", csv_path)
+        return None
+    arr = df.to_numpy(dtype=np.float64)
+    logger.info("Loaded BP labels from %s: shape=%s", csv_path, arr.shape)
+    return arr
+
+
 @torch.no_grad()
 def _eval_task(
     model: torch.nn.Module,
@@ -61,6 +80,7 @@ def _eval_task(
     n_steps: int,
     limit_batches: int | None,
     srate: int,
+    bp_labels: np.ndarray | None = None,
 ) -> dict[str, float]:
     preds: list[np.ndarray] = []
     targets: list[np.ndarray] = []
@@ -101,9 +121,14 @@ def _eval_task(
         "ks": ks_statistic(preds_np, targets_np),
         "n": int(preds_np.shape[0]),
     }
-    # 仅 ABP 目标任务额外计算 SBP/DBP 误差（pyvital 经典 DSP 峰检测）。
-    if task.target_slot == Slot.ABP:
-        metrics.update(bp_errors(preds_np, targets_np, srate=srate))
+    # 仅 ABP 目标任务额外计算 SBP/DBP 误差。
+    # target 真值优先用 csv 标签（PulseDB ground truth），缺失时跳过 BP 指标。
+    # pred 端无法绕过 DSP — 模型只输出 ABP 波形，需 pyvital 提取峰值。
+    if task.target_slot == Slot.ABP and bp_labels is not None:
+        n_processed = preds_np.shape[0]
+        metrics.update(
+            bp_errors_from_labels(preds_np, bp_labels[:n_processed], srate=srate)
+        )
     return metrics
 
 
@@ -139,6 +164,17 @@ def main(cfg: DictConfig) -> None:
     if limit_batches is not None:
         limit_batches = int(limit_batches)
     srate = int(cfg.data.srate)
+
+    # 真值 SBP/DBP 直接读 csv（与 test npy 同名同行序），避免对 target 波形再做一次 DSP。
+    # csv row i ↔ dataset sample i 这条配对前提依赖 test_loader 不打乱顺序；
+    # 如果未来有人把 test_loader 改成 shuffle=True，下面 fail-fast 而不是静默错配。
+    bp_labels = _load_bp_labels(cfg.data.test_path)
+    if bp_labels is not None and not isinstance(test_loader.sampler, SequentialSampler):
+        raise RuntimeError(
+            f"BP label evaluation requires a sequential test_loader; got "
+            f"sampler={type(test_loader.sampler).__name__}. Either set shuffle=False "
+            f"in build_loaders or remove the BP label csv to fall back to DSP-only eval."
+        )
 
     # 与训练保持一致：权重为 0 的任务不参与评估。
     active_tasks = [spec for spec, _ in active_task_pairs(
@@ -177,6 +213,7 @@ def main(cfg: DictConfig) -> None:
                 n_steps=n_steps,
                 limit_batches=limit_batches,
                 srate=srate,
+                bp_labels=bp_labels,
             )
             row = [
                 task.name,

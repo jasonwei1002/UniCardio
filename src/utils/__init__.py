@@ -11,9 +11,7 @@ from .normalization import (
 from .checkpoint import load_checkpoint, save_checkpoint, unwrap_model
 from .metrics import ks_statistic, mae, rmse
 from .bp_metrics import (
-    bp_aggregate_errors,
-    bp_errors,
-    bp_per_sample_errors,
+    bp_errors_from_labels,
     extract_sbp_dbp,
     pyvital_available,
 )
@@ -21,11 +19,9 @@ from .bp_metrics import (
 __all__ = [
     "BP_OFFSET",
     "BP_SCALE",
-    "bp_aggregate_errors",
     "bp_denormalize",
-    "bp_errors",
+    "bp_errors_from_labels",
     "bp_normalize",
-    "bp_per_sample_errors",
     "extract_sbp_dbp",
     "ks_statistic",
     "load_checkpoint",

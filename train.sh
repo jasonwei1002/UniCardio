@@ -11,7 +11,7 @@ LOG_FILE="logs/train_$(date +%Y%m%d_%H%M%S).log"
 
 python run/pipeline/train.py \
     device=cuda \
-    data.batch_size=512 \
+    data.batch_size=1024 \
     data.num_workers=12 \
     trainer.amp.enabled=true \
     trainer.compile.enabled=true \
