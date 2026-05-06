@@ -15,6 +15,7 @@ from torch import Tensor, nn
 
 from ..model_module.attention_masks import build_task_mask
 from ..model_module.tasks import TaskSpec
+from ..utils import unwrap_model
 from .rectified_flow import assemble_x_full
 
 
@@ -57,9 +58,12 @@ def euler_sample(
     B, _, L = conditions.shape
     target = int(task.target_slot)
     conditions = conditions.to(device)
-    # mask 只与 (task.name, L, device, dtype) 有关，n_steps 个步骤共用一份。
+    # patch-tokenization 后 mask 在 patch 粒度上构造（token count = n_patches_per_slot）。
+    # unwrap_model 剥掉 torch.compile / DDP / DataParallel 的包装，统一拿底层模型。
+    # mask 只与 (task.name, n_patches, device, dtype) 有关，n_steps 个步骤共用一份。
+    n_patches = unwrap_model(model).n_patches_per_slot
     mask = build_task_mask(
-        task.name, L, device=str(device), dtype=torch.bool
+        task.name, n_patches, device=str(device), dtype=torch.bool
     )
 
     x = torch.randn(B, 1, L, device=device)  # x_{t=0} ~ N(0, I)

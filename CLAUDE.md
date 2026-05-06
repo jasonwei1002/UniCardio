@@ -83,9 +83,11 @@ SwanLab is wired in `run/pipeline/train.py::_init_swanlab` and `src/trainer_modu
 
 ## Data Preparation
 
-The project targets MIMIC-BP exclusively. Subject-level split is fixed by `data/mimicbp/{train,val,test}_subjects.txt`, and the three `(N, 3, 500)` float32 slice files at `data/mimicbp/{Train,Val,Test}_mimicbp_500.npy` are produced once by `script/convert_mimicbp_to_500.py` (each 30 s @125 Hz segment → 7 non-overlapping 4 s windows; last 2 s discarded; channels stacked as ECG/PPG/ABP). **The `.npy` files must already be in slot order `(ECG, PPG, ABP)` on disk** — channel reordering belongs in the preprocessing script, not in the dataset class. `CardiacDataset.__init__` only applies BP normalization `(x - 100) / 50` to slot 2 and casts to float32. Slots are never indexed by raw channel order downstream.
+The project targets PulseDB exclusively (since 2026-05-06; previously MIMIC-BP). Two `(N, 3, 1250)` float32 files at `data/pulsedb/{Train_Subset,CalFree_Test_Subset}.npy` (10 s @125 Hz windows; channels stacked as ECG/PPG/ABP, ECG/PPG already per-sample min-max'd to [0, 1] on disk, ABP in mmHg). **The `.npy` files must be in slot order `(ECG, PPG, ABP)` on disk** — channel reordering belongs in preprocessing. `CardiacDataset.__init__` re-runs per-sample min-max on slot 0/1 (idempotent) and applies BP normalization `(x - 100) / 50` to slot 2.
 
-Resulting split sizes: train **231 000**, val **40 950**, test **48 090** samples.
+Train / val split: `Train_Subset.npy` is split internally by `sklearn.model_selection.train_test_split` (default `val_split=0.2`, `split_seed=42`). This is sample-level random split — same-subject windows can leak across train/val and the val loss is used **only as the best.pt selection signal**. `CalFree_Test_Subset.npy` is a subject-disjoint calibration-free test set; final evaluation is leak-free.
+
+Resulting split sizes: train **721 728**, val **180 432** (from 902 160 train windows), test **111 600** samples.
 
 Datasets are loaded **fully into RAM** in `CardiacDataset.__init__` and shared across splits via a module-level `_CACHE: dict[str, ndarray]` keyed by file path. Per-sample work is reduced to a zero-copy `torch.from_numpy(self._data[idx])`. On Linux GPU servers the parent process pre-loads before the DataLoader spawns workers, so workers inherit the buffer via fork/CoW; on macOS local CPU debug, prefer `data.num_workers=0` to avoid spawn-mode reloads. Use `src.data_module.cardiac_dataset.clear_cache()` to release the cache explicitly (long-running tests / interactive sessions).
 

@@ -41,6 +41,9 @@ class UniCardioRF(nn.Module):
         super().__init__()
         self.backbone = UniCardioBackbone(config)
         self.L = self.backbone.L
+        # patch-tokenization 后 mask 长度 = patch 数；trainer / sampler 通过
+        # ``model.n_patches_per_slot`` 直读，避免穿到 backbone.cfg。
+        self.n_patches_per_slot = self.backbone.n_patches_per_slot
 
     def forward(
         self,

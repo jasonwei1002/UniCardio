@@ -10,7 +10,7 @@ from src.model_module.tasks import TASK_LIST
 from src.model_module.unicardio_rf import UniCardioRF
 from src.trainer_module.sampler import euler_sample
 
-SLOT_LEN = 32
+SLOT_LEN = 50  # 必须能被默认 patch_size=25 整除（50 / 25 = 2 patch/slot）
 B = 2
 
 

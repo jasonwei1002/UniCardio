@@ -1,11 +1,11 @@
-# UniCardioRF 模型结构配置
-
+# UniCardioRF 模型结构配置（patch-tokenization 版）
 
 slot_length: ${data.slot_length}
-channels: 288          # 6 个卷积核 * 每个核 48 通道
-nheads: 9              
-n_layers: 5
+patch_size: 25         # token = 25 个 sample（200 ms @125 Hz ≈ 1 个心动相位）
+channels: 384          # 6 个卷积核 * 每个核 64 通道；nheads × 64 → head_dim=64
+nheads: 6              # 384 / 6 = 64
+n_layers: 8
 time_embedding_dim: 256
 kernel_sizes: [1, 3, 5, 7, 9, 11]
-per_kernel_channels: 48
-ffn_dim: 1152          # 4 * channels（标准 Transformer 比例）
+per_kernel_channels: 64
+ffn_dim: 1536          # 4 * channels（标准 Transformer 比例）

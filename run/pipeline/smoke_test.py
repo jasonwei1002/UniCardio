@@ -37,7 +37,7 @@ from src.utils.seed import set_seed
 
 logger = logging.getLogger(__name__)
 
-SMOKE_SLOT_LENGTH = 64
+SMOKE_SLOT_LENGTH = 250  # 10 patch/slot @ patch_size=25，更贴近生产 patch 密度（50 patch/slot）
 SMOKE_BATCH = 4
 
 

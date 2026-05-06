@@ -15,7 +15,7 @@ from src.trainer_module.rectified_flow import (
     sample_t_logit_normal,
 )
 
-SLOT_LEN = 32
+SLOT_LEN = 50  # 必须能被默认 patch_size=25 整除（50 / 25 = 2 patch/slot）
 B = 2
 
 

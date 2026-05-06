@@ -1,17 +1,27 @@
-"""UniCardio 的 3-slot Rectified Flow 主干网络。
+"""UniCardio 的 3-slot Rectified Flow 主干网络（patch-tokenization 版）。
 
-替换了原扩散代码库中的 4-slot ``diff_CSDI`` 模块。主要差异：
+token 粒度从 sample (8 ms @125 Hz) 重构为 patch (``patch_size`` 个 sample)，
+让 attention 在事件级（R 峰 / systolic foot / dicrotic notch ≈ 80–200 ms）
+跑关联，而不是浪费在亚事件冗余上。详见
+``reports/vit-patch-model-reactive-barto.md``。
 
-* 3 个 slot（ECG=0、PPG=1、ABP=2）——去掉了原先零填充的占位 slot 以及
-  相关的 ``borrow_mode`` 输出头路由。
-* 使用 :class:`FlowTimeEmbedding`（``t ∈ [0, 1]``）做连续时间条件，取代
-  原本基于整数步数的 ``DiffusionEmbedding``。
-* mask 由调用方传入（在别处按任务构造），不再从 7 个硬编码的预注册 mask
-  中选择。
+数据流（保持外部契约 ``(B, 1, 3*L_slot) → (B, 1, L_slot)`` 不变）：
 
-原样保留的结构：:class:`SignalEncoder`、:class:`ResidualBlock`、
-按 slot 划分的 :class:`LayerNorm`、每个 slot 的 2 级输出头、以及
-乘以 ``1 / sqrt(n_layers)`` 的 skip-sum 聚合。
+* 输入 ``(B, 1, 3*L)`` 按 slot 切片 → 3× :class:`SignalEncoder`（多尺度
+  Conv1d，stride=1 same-padding）→ 3× ``PatchProj`` (``Conv1d(C, C,
+  kernel=patch_size, stride=patch_size)``) → 3× ``LayerNorm(C)``
+  channel-last。
+* concat → ``(B, C, 3 * n_patches_per_slot)``，加入按 patch 数生成的
+  sinusoidal PE。
+* 5–8 层 :class:`ResidualBlock`（block 本身 L-agnostic，无需改动）。
+* CSDI 风格 skip-sum / sqrt(n_layers)。
+* 切出 target slot 的 patch 区块 → ``PatchUnproj`` (``ConvTranspose1d(C,
+  C, kernel=patch_size, stride=patch_size)``) 还原到 sample-rate → 复用
+  现有 :class:`_OutputHead` (Conv1d 288→288→1) 输出 ``(B, 1, L_slot)``。
+
+注意 attention mask 的 ``L_slot`` 参数语义在 patch 化后变为 *token count*
+（即 ``n_patches_per_slot``），由调用方（``rf_train_step`` /
+``euler_sample``）通过 :attr:`UniCardioBackbone.n_patches_per_slot` 读取。
 """
 
 from __future__ import annotations
@@ -50,6 +60,24 @@ class BackboneConfig:
     kernel_sizes: tuple[int, ...] = DEFAULT_KERNELS
     per_kernel_channels: int = DEFAULT_CHANNELS_PER_KERNEL
     ffn_dim: int = 64
+    # patch-tokenization：每个 transformer token 由 ``patch_size`` 个 sample 折叠而成。
+    # ``slot_length`` 必须能被 ``patch_size`` 整除，否则 ConvTranspose 还原长度对不齐。
+    patch_size: int = 25
+
+    def __post_init__(self) -> None:
+        if self.patch_size <= 0:
+            raise ValueError(f"patch_size must be positive; got {self.patch_size}")
+        if self.slot_length % self.patch_size != 0:
+            raise ValueError(
+                f"slot_length ({self.slot_length}) must be divisible by "
+                f"patch_size ({self.patch_size}); got remainder "
+                f"{self.slot_length % self.patch_size}"
+            )
+
+    @property
+    def n_patches_per_slot(self) -> int:
+        """每 slot 折叠后的 transformer token 数。"""
+        return self.slot_length // self.patch_size
 
     @classmethod
     def from_mapping(cls, cfg: Mapping[str, Any]) -> "BackboneConfig":
@@ -65,6 +93,7 @@ class BackboneConfig:
                 cfg.get("per_kernel_channels", DEFAULT_CHANNELS_PER_KERNEL)
             ),
             ffn_dim=int(cfg.get("ffn_dim", 64)),
+            patch_size=int(cfg.get("patch_size", 25)),
         )
 
 
@@ -80,14 +109,37 @@ class _OutputHead(nn.Module):
         return self.proj2(F.relu(self.proj1(x)))
 
 
+def _patch_proj_conv(channels: int, patch_size: int) -> nn.Conv1d:
+    """patch projection：``stride=patch_size`` 无重叠卷积，把 ``(B, C, L)`` 折叠到 ``(B, C, L/patch_size)``。"""
+    layer = nn.Conv1d(
+        channels, channels, kernel_size=patch_size, stride=patch_size
+    )
+    nn.init.kaiming_normal_(layer.weight)
+    return layer
+
+
+def _patch_unproj_conv(channels: int, patch_size: int) -> nn.ConvTranspose1d:
+    """patch un-projection：与 ``_patch_proj_conv`` 镜像，把 patch 序列展开回 sample-rate。
+
+    ``kernel_size == stride`` 保证输出长度恰好 ``n_patches × patch_size = L_slot``。
+    """
+    layer = nn.ConvTranspose1d(
+        channels, channels, kernel_size=patch_size, stride=patch_size
+    )
+    nn.init.kaiming_normal_(layer.weight)
+    return layer
+
+
 class UniCardioBackbone(nn.Module):
-    """按 slot 独立编码、并通过任务头输出的 Transformer 主干。
+    """按 slot 独立编码、patch 折叠、并通过任务头输出的 Transformer 主干。
 
     Forward 签名：``forward(x, t, mask, target_slot)``，其中
 
-    * ``x``: ``(B, 1, 3 * L_slot)`` —— 拼接后的 slot 张量。
+    * ``x``: ``(B, 1, 3 * L_slot)`` —— 按 slot 顺序 (ECG, PPG, ABP) 拼接、
+      已把 target slot 替换成 ``x_t`` 的张量。
     * ``t``: ``(B,)`` —— 取值于 ``[0, 1]`` 的连续时间。
-    * ``mask``: ``(3 * L_slot, 3 * L_slot)`` —— 加性注意力 mask。
+    * ``mask``: ``(3 * n_patches_per_slot, 3 * n_patches_per_slot)`` 的注意力
+      mask；调用方传入时 ``L_slot`` 参数 = :attr:`n_patches_per_slot`。
     * ``target_slot``: ``int`` —— 选择使用的输出头。
     """
 
@@ -102,6 +154,8 @@ class UniCardioBackbone(nn.Module):
         self.L = cfg.slot_length
         self.channels = cfg.channels
         self.n_layers = cfg.n_layers
+        self.patch_size = cfg.patch_size
+        self.n_patches_per_slot = cfg.n_patches_per_slot
 
         # 编码器 bank 的特征维必须与 self.channels 一致。
         encoded_channels = cfg.per_kernel_channels * len(cfg.kernel_sizes)
@@ -123,15 +177,20 @@ class UniCardioBackbone(nn.Module):
                 for _ in range(N_SLOTS)
             ]
         )
+        # patch projection 把每 slot 从 sample-rate (B, C, L) 折叠到 (B, C, L/patch_size)。
+        self.patch_proj = nn.ModuleList(
+            [_patch_proj_conv(self.channels, self.patch_size) for _ in range(N_SLOTS)]
+        )
+        # 切到 channel-last 维度（patch token），LayerNorm 不再被 L 耦合。
         self.input_norms = nn.ModuleList(
-            [nn.LayerNorm([self.channels, self.L]) for _ in range(N_SLOTS)]
+            [nn.LayerNorm(self.channels) for _ in range(N_SLOTS)]
         )
 
         self.time_embedding = FlowTimeEmbedding(
             embedding_dim=cfg.time_embedding_dim
         )
 
-        transformer_total_length = self.L * N_SLOTS
+        transformer_total_length = self.n_patches_per_slot * N_SLOTS
         self.residual_layers = nn.ModuleList(
             [
                 ResidualBlock(
@@ -144,18 +203,22 @@ class UniCardioBackbone(nn.Module):
             ]
         )
 
-        # Sinusoidal PE 一次性注入到 residual stack 输入端，让每层 self-attn
-        # 都能通过残差路径看到 token-level 位置信息。预转置到 (C, L_total)
-        # 与残差流 ``(B, C, L_total)`` 对齐，避免每次 forward 重复 transpose。
+        # Sinusoidal PE 在 patch 粒度上注入。预转置到 (C, transformer_total_length)
+        # 与残差流 (B, C, L_total_patches) 对齐，避免 forward 里重复 transpose。
         pe = sinusoidal_position_embedding(transformer_total_length, self.channels)
         self.register_buffer("pe", pe.t().contiguous(), persistent=False)
 
+        # patch un-projection 把 target slot 的 patch 序列还原回 sample-rate；后接已有的 _OutputHead。
+        self.patch_unproj = nn.ModuleList(
+            [_patch_unproj_conv(self.channels, self.patch_size) for _ in range(N_SLOTS)]
+        )
         self.output_heads = nn.ModuleList(
             [_OutputHead(self.channels) for _ in range(N_SLOTS)]
         )
 
     @property
     def total_length(self) -> int:
+        """sample-rate 下的拼接长度（input 仍按 sample-rate 给）。"""
         return self.L * N_SLOTS
 
     def forward(
@@ -184,13 +247,14 @@ class UniCardioBackbone(nn.Module):
         slot_feats: list[Tensor] = []
         for i in range(N_SLOTS):
             start, end = i * self.L, (i + 1) * self.L
-            encoded = self.input_encoders[i](x[:, :, start:end])
-            encoded = encoded.reshape(B, self.channels, self.L)
-            encoded = self.input_norms[i](encoded)
-            slot_feats.append(encoded)
+            encoded = self.input_encoders[i](x[:, :, start:end])  # (B, C, L_slot)
+            patched = self.patch_proj[i](encoded)                  # (B, C, n_patches)
+            # channel-last 上 LayerNorm 后再回到 (B, C, n_patches)。
+            normed = self.input_norms[i](patched.transpose(1, 2)).transpose(1, 2)
+            slot_feats.append(normed)
 
-        h = torch.cat(slot_feats, dim=-1)
-        h = h + self.pe.unsqueeze(0)        # (1, C, L_total) 广播
+        h = torch.cat(slot_feats, dim=-1)        # (B, C, 3 * n_patches)
+        h = h + self.pe.unsqueeze(0)              # (1, C, 3 * n_patches) 广播
         time_emb = self.time_embedding(t)
 
         skip_list: list[Tensor] = []
@@ -199,6 +263,8 @@ class UniCardioBackbone(nn.Module):
             skip_list.append(skip)
 
         h = torch.stack(skip_list, dim=0).sum(dim=0) / math.sqrt(self.n_layers)
-        start = target_slot * self.L
-        end = start + self.L
-        return self.output_heads[target_slot](h[:, :, start:end])
+        start = target_slot * self.n_patches_per_slot
+        end = start + self.n_patches_per_slot
+        slice_ = h[:, :, start:end]               # (B, C, n_patches)
+        upsampled = self.patch_unproj[target_slot](slice_)  # (B, C, L_slot)
+        return self.output_heads[target_slot](upsampled)

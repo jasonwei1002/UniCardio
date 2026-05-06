@@ -1,9 +1,12 @@
 # 训练循环配置
 
-epochs: 300
-lr: 1.0e-3                
+epochs: 120
+lr: 1.0e-3
 
-weight_decay: 1.0e-6
+# subject-level split + ~1100 train subjects 下，1e-6 等于无正则；
+# 上一轮（2026-05-05 mimic-bp run）从 ep 58 开始 val 反弹、ep 195 时 val 比最佳点高 22.6%。
+# 1e-4 是 Adam（耦合 wd）下相对保守的起点，不动 optimizer 也能拉一档泛化。
+weight_decay: 1.0e-4
 
 # 梯度范数裁剪（L2）。RF 速度 MSE 偶尔会因某个 outlier batch 产生爆炸 step，
 # Adam 第二动量累积后尤其明显。≤0 / null 关闭。1.0 是 SD3 / Flow Matching

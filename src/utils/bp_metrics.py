@@ -163,6 +163,16 @@ def bp_aggregate_errors(
 ) -> dict[str, float]:
     """把 :func:`bp_per_sample_errors` 累出来的原始误差列表聚合成 MAE / ME / std。
 
+    公式与 cuffless BP 文献一致（Mousavi et al. 2022, MDPI Bioengineering 9(9):446
+    eq. 18–20；同样符合 ANSI/AAMI/ISO 81060-2 的精神）：
+
+        ME  = Σ(pred_i − ref_i) / n
+        MAE = Σ|pred_i − ref_i| / n
+        SD  = sqrt( Σ(e_i − ē)² / n )         # 分母 N (population)，对应 numpy ddof=0
+
+    误差方向：``pred − reference``（正值 = 系统性高估）。
+    聚合层级：所有 valid window 全池求 ME / SD（不是先 per-subject 再平均）。
+
     pyvital 缺失（``_HAS_PYVITAL=False``）时返回空字典；列表非空但 0 valid
     （所有 sample 都被丢弃）时返回带 NaN 的字典，``n_valid=0``。
     """

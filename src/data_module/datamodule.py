@@ -1,9 +1,12 @@
-"""DataLoader 构造器：全量 RAM 装载 MIMIC-BP 三个 split 的 .npy。
+"""DataLoader 构造器：从单一 train .npy 切出 train/val，外加独立 test .npy。
 
-数据来源是 ``script/convert_mimicbp_to_500.py`` 预生成的三份 ``(N, 3, 500)``
-float32 文件，channel 顺序已是 (ECG, PPG, ABP)。装载、归一化与样本张量
-化全部在 :class:`CardiacDataset` 内完成（``__getitem__`` 是 zero-copy
-切片）。
+数据来源是 PulseDB 预生成的两份 ``(N, 3, 1250)`` float32：
+  - ``train_path``：内部按 ``val_split`` 用 :func:`sklearn.model_selection.train_test_split`
+    随机切训练 / 验证（同一 subject 的多个窗口可能跨切，仅作 best.pt 选择信号）。
+  - ``test_path``：独立的 subject-disjoint 测试集。
+
+装载、归一化与样本张量化全部在 :class:`CardiacDataset` 内完成；切分通过
+:class:`torch.utils.data.Subset` 包索引，不复制数据 buffer。
 """
 
 from __future__ import annotations
@@ -11,7 +14,9 @@ from __future__ import annotations
 import logging
 from typing import Any, Mapping
 
-from torch.utils.data import DataLoader
+import numpy as np
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Subset
 
 from ..utils.seed import worker_init_fn
 from .cardiac_dataset import CardiacDataset
@@ -27,21 +32,30 @@ def build_loaders(
     """根据数据配置构造 ``(train, val, test)`` 三个 DataLoader。
 
     Args:
-        cfg: 数据配置，需包含 ``train_path / val_path / test_path``、
-            ``batch_size``、``num_workers``、``pin_memory`` 等键。
+        cfg: 数据配置，需包含 ``train_path / test_path / val_split / split_seed``、
+            ``batch_size / num_workers / pin_memory``。
         num_workers_override: 若提供则覆盖 ``cfg['num_workers']``。CPU
             smoke test 等场景下，worker 启动延迟较大，可设为 0。
     """
     train_path = str(cfg["train_path"])
-    val_path = str(cfg["val_path"])
     test_path = str(cfg["test_path"])
+    val_split = float(cfg.get("val_split", 0.2))
+    if not 0.0 < val_split < 1.0:
+        raise ValueError(f"val_split must be in (0, 1); got {val_split}")
+    split_seed = int(cfg.get("split_seed", 42))
 
-    train_ds = CardiacDataset(train_path)
-    val_ds = CardiacDataset(val_path)
+    full_train = CardiacDataset(train_path)
     test_ds = CardiacDataset(test_path)
+
+    indices = np.arange(len(full_train))
+    train_idx, val_idx = train_test_split(
+        indices, test_size=val_split, random_state=split_seed, shuffle=True,
+    )
+    train_ds = Subset(full_train, train_idx)
+    val_ds = Subset(full_train, val_idx)
     logger.info(
-        "Data splits — train %d, val %d, test %d",
-        len(train_ds), len(val_ds), len(test_ds),
+        "Data splits — train %d, val %d (val_split=%.2f, seed=%d), test %d",
+        len(train_ds), len(val_ds), val_split, split_seed, len(test_ds),
     )
 
     batch_size = int(cfg.get("batch_size", 128))

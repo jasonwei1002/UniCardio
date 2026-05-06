@@ -22,6 +22,7 @@ from torch import Tensor, nn
 
 from ..model_module.attention_masks import build_task_mask
 from ..model_module.tasks import TaskSpec
+from ..utils import unwrap_model
 
 
 def sample_t_logit_normal(
@@ -124,9 +125,11 @@ def rf_train_step(
     x_full, t, _, v_target = build_rf_inputs(
         batch_signal, task, t_mean=t_mean, t_std=t_std
     )
-    L_slot = x_full.size(-1) // 3
+    # patch-tokenization 后 mask 长度 = patch 数；x_full 仍是 sample-rate (B, 1, 3*L)。
+    # unwrap_model 剥掉 torch.compile / DDP / DataParallel 的包装，统一拿底层模型。
+    n_patches = unwrap_model(model).n_patches_per_slot
     mask = build_task_mask(
-        task.name, L_slot, device=str(x_full.device), dtype=torch.bool
+        task.name, n_patches, device=str(x_full.device), dtype=torch.bool
     )
     v_pred = model(x_full, t, mask, int(task.target_slot))
     if v_pred.shape != v_target.shape:

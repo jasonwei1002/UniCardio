@@ -8,7 +8,7 @@ from .normalization import (
     bp_normalize,
     minmax_normalize_per_sample_inplace,
 )
-from .checkpoint import load_checkpoint, save_checkpoint
+from .checkpoint import load_checkpoint, save_checkpoint, unwrap_model
 from .metrics import ks_statistic, mae, rmse
 from .bp_metrics import (
     bp_aggregate_errors,
@@ -35,4 +35,5 @@ __all__ = [
     "rmse",
     "save_checkpoint",
     "set_seed",
+    "unwrap_model",
 ]
