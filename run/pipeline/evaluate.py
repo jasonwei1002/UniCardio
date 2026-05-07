@@ -28,6 +28,7 @@ if str(_REPO_ROOT) not in sys.path:
 from src.data_module.datamodule import build_loaders
 from src.model_module.tasks import Slot, active_task_pairs
 from src.model_module.unicardio_rf import UniCardioRF
+from src.trainer_module.regression import regression_sample
 from src.trainer_module.sampler import euler_sample
 from src.utils.bp_metrics import bp_errors_from_labels
 from src.utils.checkpoint import load_checkpoint
@@ -80,6 +81,7 @@ def _eval_task(
     n_steps: int,
     limit_batches: int | None,
     srate: int,
+    objective: str = "rf",
     bp_labels: np.ndarray | None = None,
 ) -> dict[str, float]:
     preds: list[np.ndarray] = []
@@ -99,7 +101,10 @@ def _eval_task(
     for batch_idx, batch in enumerate(test_iter):
         signal = batch[0].to(device)
         target = signal[:, task.target_slot:task.target_slot + 1, :]
-        pred = euler_sample(model, signal, task, n_steps=n_steps, device=device)
+        if objective == "regression":
+            pred = regression_sample(model, signal, task, device=device)
+        else:
+            pred = euler_sample(model, signal, task, n_steps=n_steps, device=device)
         pred = _maybe_denormalize(pred, task.target_slot)
         target = _maybe_denormalize(target, task.target_slot)
         preds.append(pred.cpu().numpy())
@@ -164,6 +169,8 @@ def main(cfg: DictConfig) -> None:
     if limit_batches is not None:
         limit_batches = int(limit_batches)
     srate = int(cfg.data.srate)
+    objective = str(cfg.trainer.get("objective", "rf"))
+    logger.info("Evaluation objective: %s", objective)
 
     # 真值 SBP/DBP 直接读 csv（与 test npy 同名同行序），避免对 target 波形再做一次 DSP。
     # csv row i ↔ dataset sample i 这条配对前提依赖 test_loader 不打乱顺序；
@@ -213,6 +220,7 @@ def main(cfg: DictConfig) -> None:
                 n_steps=n_steps,
                 limit_batches=limit_batches,
                 srate=srate,
+                objective=objective,
                 bp_labels=bp_labels,
             )
             row = [

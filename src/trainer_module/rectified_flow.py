@@ -138,3 +138,28 @@ def rf_train_step(
             f"!= target {tuple(v_target.shape)}"
         )
     return (v_pred - v_target).pow(2).mean()
+
+
+def rf_loss_at_fixed_t(
+    model: nn.Module,
+    batch_signal: Tensor,
+    task: TaskSpec,
+    t_value: float,
+) -> Tensor:
+    """以固定 ``t_value`` 在整个 batch 上计算 RF velocity MSE。
+
+    用于 t-bin 诊断：plateau 是否由 ``t≈0`` / ``t≈1`` 等 ε 主导段贡献？
+    """
+    if not 0.0 < t_value < 1.0:
+        raise ValueError(f"t_value must be in (0, 1); got {t_value}")
+    B = batch_signal.size(0)
+    t = torch.full(
+        (B,), float(t_value), device=batch_signal.device, dtype=batch_signal.dtype
+    )
+    x_full, _, _, v_target = build_rf_inputs(batch_signal, task, t=t)
+    n_patches = unwrap_model(model).n_patches_per_slot
+    mask = build_task_mask(
+        task.name, n_patches, device=str(x_full.device), dtype=torch.bool
+    )
+    v_pred = model(x_full, t, mask, int(task.target_slot))
+    return (v_pred - v_target).pow(2).mean()

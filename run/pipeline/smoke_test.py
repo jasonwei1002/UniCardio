@@ -32,6 +32,7 @@ from src.model_module.backbone import BackboneConfig
 from src.model_module.tasks import TASK_SPECS, TaskSpec
 from src.model_module.unicardio_rf import UniCardioRF
 from src.trainer_module.rectified_flow import rf_train_step
+from src.trainer_module.regression import regression_sample, regression_train_step
 from src.trainer_module.sampler import euler_sample
 from src.utils.seed import set_seed
 
@@ -73,6 +74,7 @@ def _run_overfit(
     steps: int,
     lr: float,
     device: torch.device,
+    objective: str,
 ) -> tuple[float, float]:
     model = _build_tiny_model().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -82,9 +84,12 @@ def _run_overfit(
 
     model.train()
     losses: list[float] = []
+    train_step = (
+        regression_train_step if objective == "regression" else rf_train_step
+    )
     for step in range(steps):
         optimizer.zero_grad(set_to_none=True)
-        loss = rf_train_step(model, batch, task)
+        loss = train_step(model, batch, task)
         loss.backward()
         if step == 0:
             _assert_non_target_heads_quiet(model, task)
@@ -100,12 +105,18 @@ def _run_overfit(
         final / max(initial, 1e-12),
     )
 
-    # 在过拟合后的权重上用 Euler 采样器重建 target。
     model.eval()
     target = batch[:, int(task.target_slot):int(task.target_slot) + 1, :]
-    sample = euler_sample(model, batch, task, n_steps=16, device=device)
+    if objective == "regression":
+        sample = regression_sample(model, batch, task, device=device)
+        sampler_label = "regression (1 forward)"
+    else:
+        sample = euler_sample(model, batch, task, n_steps=16, device=device)
+        sampler_label = "Euler 16 steps"
     recon_mse = float(((sample - target) ** 2).mean().item())
-    logger.info("  task=%s recon MSE (Euler 16 steps) %.4f", task.name, recon_mse)
+    logger.info(
+        "  task=%s recon MSE (%s) %.4f", task.name, sampler_label, recon_mse,
+    )
     return final / max(initial, 1e-12), recon_mse
 
 
@@ -115,10 +126,11 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=700)
     parser.add_argument("--lr", type=float, default=3.0e-3)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--objective", default="rf", choices=("rf", "regression"))
     parser.add_argument("--loss-drop-threshold", type=float, default=0.3,
                         help="final/initial loss 比例的 PASS 阈值。")
     parser.add_argument("--recon-mse-threshold", type=float, default=0.6,
-                        help="Euler 重建 MSE 的 PASS 阈值。")
+                        help="重建 MSE 的 PASS 阈值。")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -131,11 +143,13 @@ def main() -> None:
     task_names = [args.task] if args.task else list(TASK_SPECS.keys())
 
     failures: list[str] = []
+    logger.info("smoke: objective=%s", args.objective)
     for name in task_names:
         task = TASK_SPECS[name]
         logger.info("smoke: overfitting task %s for %d steps", name, args.steps)
         ratio, recon_mse = _run_overfit(
-            task, steps=args.steps, lr=args.lr, device=device
+            task, steps=args.steps, lr=args.lr, device=device,
+            objective=args.objective,
         )
         ok_drop = ratio < args.loss_drop_threshold
         ok_recon = recon_mse < args.recon_mse_threshold

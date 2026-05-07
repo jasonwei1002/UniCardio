@@ -1,4 +1,12 @@
 # 训练循环配置
+#
+# objective: 切换训练目标。
+#   - rf:         Rectified Flow（v-prediction，logit-normal t，Euler 采样）
+#   - regression: deterministic baseline，单 forward 直接 MSE(pred_x1, x1)
+#                 与 RF 共享 backbone；t 固定为 0、target slot 填零作为模式 token。
+#                 推断时调 src.trainer_module.regression.regression_sample（单 forward）。
+
+objective: rf
 
 epochs: 120
 lr: 1.0e-3
@@ -31,11 +39,19 @@ compile:
   enabled: true
   mode: default
 
-# Logit-normal 时间采样（Esser 等人 2024 "SD3"）。
+# Logit-normal 时间采样（Esser 等人 2024 "SD3"）。仅 RF objective 使用。
 t_sampler:
   name: logit_normal
   mean: 0.0
   std: 1.0
+
+# RF t-bin 验证诊断：在 5 个固定 t 值各跑一遍 val（前 max_batches 个 batch），
+# 看 plateau 是否由 t≈0 / t≈1（ε 主导段）贡献。仅 objective=rf 时生效。
+t_bin_diagnostic:
+  enabled: false
+  t_values: [0.1, 0.3, 0.5, 0.7, 0.9]
+  max_batches: 64
+  every: 5
 
 # 任务采样权重。当前聚焦 cuffless BP 估计，只训练 3 个 ABP-target 任务；
 # ECG↔PPG 两个方向都属于 "易得 → 易得"，不构成独立的临床产品功能，设 0

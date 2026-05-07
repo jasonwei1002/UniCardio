@@ -1,9 +1,10 @@
 """训练循环：按权重采样任务、Adam + cosine annealing (含 warmup)、按 epoch 保存 checkpoint。
 
 每个 batch 进行一次优化器更新：先从 ``TASK_LIST`` 中按权重随机采样一个任务，
-再对该任务调用 :func:`rf_train_step`。每个 epoch 结束时把按任务的滑动均值、
-学习率、epoch 耗时写入 CSV。验证（每 ``val_every`` 个 epoch 触发一次）会在
-验证集上计算 5 个任务的平均 RF 损失，并以此维护 ``best.pt``。
+再按 ``cfg.trainer.objective`` 调用 :func:`rf_train_step`（``rf``）或
+:func:`regression_train_step`（``regression``）。每个 epoch 结束时把按任务的
+滑动均值、学习率、epoch 耗时写入 CSV。验证（每 ``val_every`` 个 epoch 触发一次）
+会在验证集上计算各任务的平均 loss，并以此维护 ``best.pt``。
 """
 
 from __future__ import annotations
@@ -28,9 +29,29 @@ from cosine_annealing_warmup import CosineAnnealingWarmupRestarts
 from ..model_module.tasks import TASK_LIST, TaskSpec, active_task_pairs
 from ..utils.checkpoint import save_checkpoint
 from .csv_logger import SimpleCSVLogger
-from .rectified_flow import rf_train_step
+from .rectified_flow import rf_loss_at_fixed_t, rf_train_step
+from .regression import regression_train_step
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_step_fn(objective: str):
+    """根据 ``objective`` 选 RF / regression 的训练 step。"""
+    name = str(objective).lower()
+    if name == "rf":
+        return rf_train_step, True   # 第二个返回值：是否需要 t_mean/t_std
+    if name == "regression":
+        return regression_train_step, False
+    raise ValueError(
+        f"Unknown trainer.objective '{objective}'; expected 'rf' or 'regression'."
+    )
+
+
+def _call_step(step_fn, needs_t, model, signal, task, *, t_mean, t_std):
+    """统一调用入口；regression 路径忽略 t_mean / t_std。"""
+    if needs_t:
+        return step_fn(model, signal, task, t_mean=t_mean, t_std=t_std)
+    return step_fn(model, signal, task)
 
 def _amp_enabled(cfg: Mapping[str, Any], device: torch.device) -> bool:
     """AMP 仅在 CUDA 上启用，始终使用 bfloat16（无需 GradScaler）。"""
@@ -95,18 +116,63 @@ def _csv_fields() -> list[str]:
 
 
 @torch.inference_mode()
+def _evaluate_t_bins(
+    model: nn.Module,
+    val_loader: DataLoader,
+    device: torch.device,
+    *,
+    t_values: Sequence[float],
+    amp_enabled: bool,
+    max_batches: int,
+    tasks: Sequence[TaskSpec],
+) -> dict[str, float]:
+    """RF 专用：把 ``t`` 固定在若干 bin 中心，看 plateau 由哪段 ``t`` 贡献。
+
+    返回 ``{"t={t_value}/{task}": loss}`` 字典，便于直接转 swanlab metrics。
+    """
+    model.eval()
+    sums: dict[str, torch.Tensor] = {
+        f"t={t_v:.1f}/{task.name}": torch.zeros((), device=device)
+        for t_v in t_values for task in tasks
+    }
+    counts: dict[str, int] = {k: 0 for k in sums}
+    for batch_idx, batch in enumerate(val_loader):
+        if batch_idx >= max_batches:
+            break
+        signal = batch[0].to(device, non_blocking=True)
+        for t_v in t_values:
+            for task in tasks:
+                key = f"t={t_v:.1f}/{task.name}"
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.bfloat16,
+                    enabled=amp_enabled,
+                ):
+                    loss = rf_loss_at_fixed_t(model, signal, task, float(t_v))
+                sums[key] += loss
+                counts[key] += 1
+    model.train()
+    return {
+        k: (sums[k].item() / counts[k]) if counts[k] else float("nan")
+        for k in sums
+    }
+
+
+@torch.inference_mode()
 def _evaluate(
     model: nn.Module,
     val_loader: DataLoader,
     device: torch.device,
     *,
+    step_fn,
+    needs_t: bool,
     t_mean: float,
     t_std: float,
     amp_enabled: bool = False,
     max_batches: int | None = None,
     tasks: Sequence[TaskSpec] = TASK_LIST,
 ) -> dict[str, float]:
-    """在验证集上按任务计算平均 RF loss；``tasks`` 指定评估集合。"""
+    """在验证集上按任务计算平均 loss；``step_fn`` 与训练侧保持一致。"""
     model.eval()
     sums = {t.name: torch.zeros((), device=device) for t in tasks}
     counts = {t.name: 0 for t in tasks}
@@ -127,8 +193,9 @@ def _evaluate(
                 dtype=torch.bfloat16,
                 enabled=amp_enabled,
             ):
-                loss = rf_train_step(
-                    model, signal, task, t_mean=t_mean, t_std=t_std
+                loss = _call_step(
+                    step_fn, needs_t, model, signal, task,
+                    t_mean=t_mean, t_std=t_std,
                 )
             sums[task.name] += loss
             counts[task.name] += 1
@@ -175,6 +242,21 @@ def train(
     val_every = int(cfg_dict.get("val_every", 10))
     ckpt_every = int(cfg_dict.get("ckpt_every", 1))
     itr_per_epoch = cfg_dict.get("itr_per_epoch")
+    objective = str(cfg_dict.get("objective", "rf"))
+    step_fn, needs_t = _resolve_step_fn(objective)
+    logger.info("Training objective: %s", objective)
+
+    # RF-only：t-bin 验证诊断（plateau 是否由 t≈0 / t≈1 段贡献）。
+    t_bins_cfg = cfg_dict.get("t_bin_diagnostic", {}) or {}
+    t_bins_enabled = bool(t_bins_cfg.get("enabled", False)) and objective == "rf"
+    t_bin_values = list(t_bins_cfg.get("t_values", [0.1, 0.3, 0.5, 0.7, 0.9]))
+    t_bin_max_batches = int(t_bins_cfg.get("max_batches", 64))
+    t_bin_every = int(t_bins_cfg.get("every", 5))  # 每 N epoch 跑一次诊断
+    if t_bins_enabled:
+        logger.info(
+            "RF t-bin diagnostic enabled: t_values=%s, max_batches=%d, every %d epochs",
+            t_bin_values, t_bin_max_batches, t_bin_every,
+        )
 
     model.to(device)
     optimizer = _build_optimizer(model, cfg_dict)
@@ -232,8 +314,9 @@ def train(
                 dtype=torch.bfloat16,
                 enabled=amp_enabled,
             ):
-                loss = rf_train_step(
-                    model, signal, task, t_mean=t_mean, t_std=t_std
+                loss = _call_step(
+                    step_fn, needs_t, model, signal, task,
+                    t_mean=t_mean, t_std=t_std,
                 )
             loss.backward()
             if grad_clip_norm > 0:
@@ -289,13 +372,27 @@ def train(
             **per_task,
         }
 
+        t_bin_metrics: dict[str, float] = {}
         if val_loader is not None and (epoch + 1) % val_every == 0:
             val_losses = _evaluate(
                 model, val_loader, device,
+                step_fn=step_fn, needs_t=needs_t,
                 t_mean=t_mean, t_std=t_std,
                 amp_enabled=amp_enabled,
                 tasks=active_tasks,
             )
+            if t_bins_enabled and (epoch + 1) % t_bin_every == 0:
+                t_bin_metrics = _evaluate_t_bins(
+                    model, val_loader, device,
+                    t_values=t_bin_values,
+                    amp_enabled=amp_enabled,
+                    max_batches=t_bin_max_batches,
+                    tasks=active_tasks,
+                )
+                logger.info(
+                    "  t-bin loss summary: %s",
+                    {k: round(v, 5) for k, v in t_bin_metrics.items()},
+                )
             for name, v in val_losses.items():
                 row[f"val_loss_{name}"] = v
             mean_val = sum(val_losses.values()) / len(val_losses)
@@ -326,6 +423,8 @@ def train(
             epoch_metrics["val/loss_mean"] = row["val_loss_mean"]
             for t in active_tasks:
                 epoch_metrics[f"val/loss_{t.name}"] = row[f"val_loss_{t.name}"]
+        for k, v in t_bin_metrics.items():
+            epoch_metrics[f"val_tbin/{k}"] = v
         swanlab.log(epoch_metrics, step=epoch)
 
         if (epoch + 1) % ckpt_every == 0:

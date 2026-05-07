@@ -1,0 +1,23 @@
+# Deterministic regression baseline 配置
+#
+# 用法（任选其一）：
+#   bash train.sh trainer=regression
+#   python run/pipeline/train.py trainer=regression
+#
+# 与 RF 默认配置的差异：
+# - objective: regression（loss = MSE(pred_x1, x1)，单 forward）。
+# - lr 同样用 1e-3，但因为 step 路径完全一致（仍走 backbone forward），
+#   warmup / cosine 结构不动。
+# - 不需要 t_sampler / t_bin_diagnostic（regression 路径不存在 t 维度）。
+# - 推断走 regression_sample（单 forward），不再做 8-step Euler 积分。
+# - SBP/DBP MAE 是关键指标——避免被 RF 的 MC 方差托高。
+
+defaults:
+  - default
+  - _self_
+
+objective: regression
+
+# 关掉 RF 专属选项；trainer 内部对 regression objective 时已忽略，但保留为显式记录。
+t_bin_diagnostic:
+  enabled: false
