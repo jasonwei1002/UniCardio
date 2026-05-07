@@ -53,6 +53,16 @@ t_bin_diagnostic:
   max_batches: 64
   every: 5
 
+# 跨 objective 端到端 recon MSE：
+# 每次 val 时跑 max_batches 批 sampler 输出（RF: euler n_steps / regression: 单 forward），
+# 直接对 ground-truth target slot 求 MSE。
+# 这是真正可比的指标——R0 / R1 在同一坐标系画。
+# n_steps 仅 RF objective 使用；regression 路径是单 forward。
+recon_eval:
+  enabled: true
+  max_batches: 8
+  n_steps: 8
+
 # 任务采样权重。当前聚焦 cuffless BP 估计，只训练 3 个 ABP-target 任务；
 # ECG↔PPG 两个方向都属于 "易得 → 易得"，不构成独立的临床产品功能，设 0
 # 从训练采样里剔除（`_weighted_task_sampler` 接受 0 权重，只要总和 > 0）。

@@ -30,7 +30,8 @@ from ..model_module.tasks import TASK_LIST, TaskSpec, active_task_pairs
 from ..utils.checkpoint import save_checkpoint
 from .csv_logger import SimpleCSVLogger
 from .rectified_flow import rf_loss_at_fixed_t, rf_train_step
-from .regression import regression_train_step
+from .regression import regression_sample, regression_train_step
+from .sampler import euler_sample
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,8 @@ def _csv_fields() -> list[str]:
     fields.extend(f"loss_{t.name}" for t in TASK_LIST)
     fields.extend(f"val_loss_{t.name}" for t in TASK_LIST)
     fields.append("val_loss_mean")
+    fields.extend(f"val_recon_mse_{t.name}" for t in TASK_LIST)
+    fields.append("val_recon_mse_mean")
     return fields
 
 
@@ -155,6 +158,56 @@ def _evaluate_t_bins(
     return {
         k: (sums[k].item() / counts[k]) if counts[k] else float("nan")
         for k in sums
+    }
+
+
+@torch.inference_mode()
+def _evaluate_recon(
+    model: nn.Module,
+    val_loader: DataLoader,
+    device: torch.device,
+    *,
+    objective: str,
+    n_steps: int,
+    max_batches: int,
+    amp_enabled: bool,
+    tasks: Sequence[TaskSpec],
+) -> dict[str, float]:
+    """跨 objective 统一的端到端重建 MSE：调各自 sampler 拿 pred，再和 target 求 MSE。
+
+    这是真正可比的指标——不依赖 ``t``、不依赖 v / x1 反推：
+      - RF objective:        ``euler_sample`` 跑 ``n_steps`` 步 Euler ODE。
+      - regression objective: ``regression_sample`` 单 forward。
+    返回每任务的 mean MSE，单位是模型空间（BP 已除 50）。
+    """
+    model.eval()
+    sums: dict[str, torch.Tensor] = {
+        t.name: torch.zeros((), device=device) for t in tasks
+    }
+    counts: dict[str, int] = {t.name: 0 for t in tasks}
+    for batch_idx, batch in enumerate(val_loader):
+        if batch_idx >= max_batches:
+            break
+        signal = batch[0].to(device, non_blocking=True)
+        for task in tasks:
+            target = signal[:, int(task.target_slot):int(task.target_slot) + 1, :]
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+                enabled=amp_enabled,
+            ):
+                if objective == "regression":
+                    pred = regression_sample(model, signal, task, device=device)
+                else:
+                    pred = euler_sample(
+                        model, signal, task, n_steps=n_steps, device=device
+                    )
+            sums[task.name] += (pred.float() - target.float()).pow(2).mean()
+            counts[task.name] += 1
+    model.train()
+    return {
+        name: (sums[name].item() / counts[name]) if counts[name] else float("nan")
+        for name in sums
     }
 
 
@@ -256,6 +309,17 @@ def train(
         logger.info(
             "RF t-bin diagnostic enabled: t_values=%s, max_batches=%d, every %d epochs",
             t_bin_values, t_bin_max_batches, t_bin_every,
+        )
+
+    # Reconstruction MSE (跨 objective 可比)：每 val 时跑一小批 sampler，对齐 evaluate 阶段输出。
+    recon_cfg = cfg_dict.get("recon_eval", {}) or {}
+    recon_enabled = bool(recon_cfg.get("enabled", True))
+    recon_max_batches = int(recon_cfg.get("max_batches", 8))
+    recon_n_steps = int(recon_cfg.get("n_steps", 8))
+    if recon_enabled:
+        logger.info(
+            "recon eval enabled: max_batches=%d, n_steps=%d (only used for RF objective)",
+            recon_max_batches, recon_n_steps,
         )
 
     model.to(device)
@@ -373,6 +437,7 @@ def train(
         }
 
         t_bin_metrics: dict[str, float] = {}
+        recon_metrics: dict[str, float] = {}
         if val_loader is not None and (epoch + 1) % val_every == 0:
             val_losses = _evaluate(
                 model, val_loader, device,
@@ -392,6 +457,24 @@ def train(
                 logger.info(
                     "  t-bin loss summary: %s",
                     {k: round(v, 5) for k, v in t_bin_metrics.items()},
+                )
+            if recon_enabled:
+                recon_metrics = _evaluate_recon(
+                    model, val_loader, device,
+                    objective=objective,
+                    n_steps=recon_n_steps,
+                    max_batches=recon_max_batches,
+                    amp_enabled=amp_enabled,
+                    tasks=active_tasks,
+                )
+                recon_mean = (
+                    sum(recon_metrics.values()) / len(recon_metrics)
+                    if recon_metrics else float("nan")
+                )
+                logger.info(
+                    "  recon_mse_mean=%.6f | per-task=%s",
+                    recon_mean,
+                    {k: round(v, 5) for k, v in recon_metrics.items()},
                 )
             for name, v in val_losses.items():
                 row[f"val_loss_{name}"] = v
@@ -425,6 +508,14 @@ def train(
                 epoch_metrics[f"val/loss_{t.name}"] = row[f"val_loss_{t.name}"]
         for k, v in t_bin_metrics.items():
             epoch_metrics[f"val_tbin/{k}"] = v
+        if recon_metrics:
+            recon_mean_val = sum(recon_metrics.values()) / len(recon_metrics)
+            epoch_metrics["val/recon_mse_mean"] = recon_mean_val
+            for name, v in recon_metrics.items():
+                epoch_metrics[f"val/recon_mse_{name}"] = v
+            row["val_recon_mse_mean"] = recon_mean_val
+            for name, v in recon_metrics.items():
+                row[f"val_recon_mse_{name}"] = v
         swanlab.log(epoch_metrics, step=epoch)
 
         if (epoch + 1) % ckpt_every == 0:
