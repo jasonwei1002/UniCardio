@@ -91,7 +91,7 @@ def main(cfg: DictConfig) -> None:
 
     compile_cfg = (cfg.trainer.get("compile") or {}) if "compile" in cfg.trainer else {}
     if bool(compile_cfg.get("enabled", False)) and device.type == "cuda":
-        compile_mode = str(compile_cfg.get("mode", "reduce-overhead"))
+        compile_mode = str(compile_cfg.get("mode", "max-autotune"))
         logger.info("torch.compile enabled (mode=%s, fullgraph=False)", compile_mode)
         model = torch.compile(model, mode=compile_mode, fullgraph=False)
     elif bool(compile_cfg.get("enabled", False)):

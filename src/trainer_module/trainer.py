@@ -206,24 +206,12 @@ def train(
     if stage not in ("pretrain", "finetune"):
         raise ValueError(f"trainer.stage must be 'pretrain' or 'finetune'; got {stage!r}")
 
-    resume_from = cfg_dict.get("resume_from")
     init_from = cfg_dict.get("init_from")
-    if resume_from and init_from:
-        raise ValueError(
-            "trainer.resume_from and trainer.init_from are mutually exclusive. "
-            "Use resume_from to continue a run (restores optimizer/scheduler/epoch), "
-            "or init_from to start fresh from given model weights (fine-tune)."
-        )
 
     if stage == "finetune":
         if not init_from:
             raise ValueError(
                 "trainer.stage='finetune' requires trainer.init_from=<阶段一 ckpt 路径>"
-            )
-        if resume_from:
-            raise ValueError(
-                "trainer.stage='finetune' is incompatible with trainer.resume_from; "
-                "use init_from to load only the backbone weights."
             )
         load_checkpoint(init_from, model=model, map_location=device)
         n_unfrozen = int(cfg_dict.get("finetune", {}).get("n_unfrozen_blocks", 2))
@@ -262,19 +250,8 @@ def train(
         fieldnames=_csv_fields(),
     )
 
-    start_epoch = 0
     best_val = float("inf")
-    if resume_from:
-        payload = load_checkpoint(
-            resume_from,
-            model=model,
-            optimizer=optimizer,
-            lr_scheduler=scheduler,
-            map_location=device,
-        )
-        start_epoch = int(payload.get("epoch", 0)) + 1
-        logger.info("Resuming from epoch %d", start_epoch)
-    elif init_from and stage == "pretrain":
+    if init_from and stage == "pretrain":
         # stage='finetune' 已在前面加载 + 冻结过，避免重复加载。
         load_checkpoint(init_from, model=model, map_location=device)
         logger.info("Initialized model from %s (fine-tune mode, fresh optim/sched)", init_from)
@@ -282,7 +259,7 @@ def train(
     model.train()
 
     global_step = 0
-    for epoch in range(start_epoch, epochs):
+    for epoch in range(epochs):
         epoch_start = time.time()
         task_loss_sum = {t.name: 0.0 for t in active_tasks}
         task_loss_count = {t.name: 0 for t in active_tasks}
