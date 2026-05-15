@@ -2,8 +2,11 @@
 
 数据集通过 ``cfg.name`` 切换：
     - ``combined``：Final_sig_combined.npy 单文件三划分（legacy）
-    - ``pulsedb`` ：PulseDB Train_Subset.npy 8:2 划分得 train/val，
-                  CalFree_Test_Subset.npy 作为 test。
+    - ``pulsedb`` ：两阶段训练，由 ``mode`` 控制：
+        * ``mode='pretrain'``：Train_Subset.npy 8:2 划分得 train/val，
+          CalFree_Test_Subset.npy 整体作 test。
+        * ``mode='finetune'``：CalFree_Test_Subset.npy 三划分得
+          train/val/test（默认 80/10/10），Train_Subset.npy 不参与。
 
 划分时只切**索引**（``np.arange(N)``），不切数据；样本到张量的转换在
 :class:`CardiacDataset.__getitem__` 内按需做，包含通道置换与 BP 归一化。
@@ -55,7 +58,14 @@ def _split_three_way_indices(
 _DatasetSpec = tuple[str, np.ndarray, Sequence[int]]   # (path, indices, channel_permutation)
 
 
-def _plan_combined(cfg: Mapping[str, Any]) -> tuple[_DatasetSpec, _DatasetSpec, _DatasetSpec]:
+def _plan_combined(
+    cfg: Mapping[str, Any], *, mode: str = "pretrain"
+) -> tuple[_DatasetSpec, _DatasetSpec, _DatasetSpec]:
+    # combined 数据集只有 pretrain 一种切法；mode 仅吸收以保持 planner 签名一致。
+    if mode != "pretrain":
+        raise ValueError(
+            f"data.name='combined' only supports mode='pretrain'; got mode={mode!r}"
+        )
     sub = cfg["combined"]
     path = str(sub["data_path"])
     perm = tuple(sub["channel_permutation"])
@@ -69,21 +79,47 @@ def _plan_combined(cfg: Mapping[str, Any]) -> tuple[_DatasetSpec, _DatasetSpec, 
     return (path, train_idx, perm), (path, val_idx, perm), (path, test_idx, perm)
 
 
-def _plan_pulsedb(cfg: Mapping[str, Any]) -> tuple[_DatasetSpec, _DatasetSpec, _DatasetSpec]:
+def _plan_pulsedb(
+    cfg: Mapping[str, Any], *, mode: str = "pretrain"
+) -> tuple[_DatasetSpec, _DatasetSpec, _DatasetSpec]:
     sub = cfg["pulsedb"]
-    train_path = str(sub["train_path"])
-    test_path = str(sub["test_path"])
     perm = tuple(sub["channel_permutation"])
-    n_train = _peek_length(train_path)
-    n_test = _peek_length(test_path)
-    val_ratio = float(sub.get("val_ratio", 0.2))
-    train_idx, val_idx = train_test_split(
-        np.arange(n_train),
-        test_size=val_ratio,
-        random_state=int(cfg.get("split_seed", 42)),
-    )
-    test_idx = np.arange(n_test)
-    return (train_path, train_idx, perm), (train_path, val_idx, perm), (test_path, test_idx, perm)
+    seed = int(cfg.get("split_seed", 42))
+
+    if mode == "pretrain":
+        train_path = str(sub["train_path"])
+        test_path = str(sub["test_path"])
+        n_train = _peek_length(train_path)
+        n_test = _peek_length(test_path)
+        val_ratio = float(sub.get("val_ratio", 0.2))
+        train_idx, val_idx = train_test_split(
+            np.arange(n_train), test_size=val_ratio, random_state=seed,
+        )
+        test_idx = np.arange(n_test)
+        return (
+            (train_path, train_idx, perm),
+            (train_path, val_idx, perm),
+            (test_path, test_idx, perm),
+        )
+
+    if mode == "finetune":
+        # 阶段二：CalFree 内部三划分；复用 _split_three_way_indices 的两步切法。
+        path = str(sub["test_path"])
+        n = _peek_length(path)
+        val_ratio = float(sub.get("finetune_val_ratio", 0.1))
+        test_ratio = float(sub.get("finetune_test_ratio", 0.1))
+        val_size = int(round(val_ratio * n))
+        test_size = int(round(test_ratio * n))
+        if val_size + test_size >= n:
+            raise ValueError(
+                f"finetune val+test ({val_size}+{test_size}) must leave room for train; n={n}"
+            )
+        train_idx, val_idx, test_idx = _split_three_way_indices(
+            n, val_size, test_size, seed,
+        )
+        return (path, train_idx, perm), (path, val_idx, perm), (path, test_idx, perm)
+
+    raise ValueError(f"Unknown data mode={mode!r}; expected 'pretrain' or 'finetune'")
 
 
 _PLANNERS = {
@@ -96,6 +132,7 @@ def build_loaders(
     cfg: Mapping[str, Any],
     *,
     num_workers_override: int | None = None,
+    mode: str = "pretrain",
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """根据配置字典构造 ``(train, val, test)`` 三个 DataLoader（mmap-backed）。
 
@@ -104,17 +141,20 @@ def build_loaders(
             ``num_workers``、``pin_memory`` 等键。
         num_workers_override: 若提供则覆盖 ``cfg['num_workers']``。在 CPU
             smoke test 等场景下，worker 启动延迟较大，可设为 0。
+        mode: ``'pretrain'`` 走数据集默认切分；``'finetune'`` 走阶段二切分
+            （pulsedb 模式下：CalFree 内部 train/val/test）。
     """
     name = str(cfg.get("name", "combined"))
     if name not in _PLANNERS:
         raise ValueError(
             f"Unknown data.name='{name}'; expected one of {sorted(_PLANNERS)}"
         )
-    train_spec, val_spec, test_spec = _PLANNERS[name](cfg)
+    train_spec, val_spec, test_spec = _PLANNERS[name](cfg, mode=mode)
 
     logger.info(
-        "Data splits (%s) — train %d, val %d, test %d",
+        "Data splits (%s, mode=%s) — train %d, val %d, test %d",
         name,
+        mode,
         train_spec[1].size,
         val_spec[1].size,
         test_spec[1].size,

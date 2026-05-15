@@ -61,3 +61,16 @@ resume_from: null
 # optimizer / scheduler / epoch 都按当前 cfg 新建——可以换 lr / 换 warmup /
 # 换 epochs。与 resume_from 互斥。
 init_from: null
+
+# 训练阶段：
+#   - 'pretrain'：阶段一，正常训练完整 UniCardioRF（默认）。
+#   - 'finetune'：阶段二，加载 init_from 后冻结 backbone，仅解冻
+#     finetune.n_unfrozen_blocks 个 ResidualBlock + 全部 output_heads；
+#     训练结束后自动在 test split 上跑一次 RF loss 评估。
+#     需配合 trainer.init_from=<阶段一 ckpt>，且数据用 mode='finetune'
+#     做 80/10/10 划分（详见 src/data_module/datamodule.py）。
+stage: pretrain
+finetune:
+  # 解冻最后 N 个 ResidualBlock；output_heads 始终解冻。
+  # 0 表示仅微调 output_heads；>=5 等价于只冻结 input stem + time embedding。
+  n_unfrozen_blocks: 2

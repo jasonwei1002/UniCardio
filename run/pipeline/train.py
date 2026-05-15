@@ -78,7 +78,10 @@ def main(cfg: DictConfig) -> None:
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("high")
 
-    train_loader, val_loader, _ = build_loaders(cfg.data)
+    # 阶段决定数据切分方式：'pretrain' 走默认切分；'finetune' 让
+    # CalFree_Test_Subset 内部三划分（详见 src/data_module/datamodule.py）。
+    stage = str(cfg.trainer.get("stage", "pretrain"))
+    train_loader, val_loader, test_loader = build_loaders(cfg.data, mode=stage)
 
     model = UniCardioRF(cfg.model)
     logger.info(
@@ -94,6 +97,12 @@ def main(cfg: DictConfig) -> None:
     elif bool(compile_cfg.get("enabled", False)):
         logger.info("torch.compile requested but device=%s; skipping.", device.type)
 
+    # finetune 模式下，从数据 .npy 同源的 .csv 读 sbp/dbp 标签做信号域 BP 评估。
+    bp_test_csv = None
+    sampler_n_steps = int(cfg.sampler.get("n_steps", 8)) if "sampler" in cfg else 8
+    if stage == "finetune" and str(cfg.data.get("name")) == "pulsedb":
+        bp_test_csv = str(cfg.data.pulsedb.test_path).replace(".npy", ".csv")
+
     _init_swanlab(cfg)
     try:
         train(
@@ -103,6 +112,9 @@ def main(cfg: DictConfig) -> None:
             val_loader,
             device=device,
             output_dir=cfg.output_dir,
+            test_loader=test_loader if stage == "finetune" else None,
+            bp_test_csv=bp_test_csv,
+            sampler_n_steps=sampler_n_steps,
         )
     finally:
         swanlab.finish()

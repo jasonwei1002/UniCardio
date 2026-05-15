@@ -49,7 +49,6 @@ class BackboneConfig:
     kernel_sizes: tuple[int, ...] = DEFAULT_KERNELS
     per_kernel_channels: int = DEFAULT_CHANNELS_PER_KERNEL
     ffn_dim: int = 64
-    downsample_factor: int = 1
 
     @classmethod
     def from_mapping(cls, cfg: Mapping[str, Any]) -> "BackboneConfig":
@@ -65,7 +64,6 @@ class BackboneConfig:
                 cfg.get("per_kernel_channels", DEFAULT_CHANNELS_PER_KERNEL)
             ),
             ffn_dim=int(cfg.get("ffn_dim", 64)),
-            downsample_factor=int(cfg.get("downsample_factor", 1)),
         )
 
 
@@ -79,23 +77,6 @@ class _OutputHead(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.proj2(F.relu(self.proj1(x)))
-
-
-def _make_resampler(
-    channels: int, ds: int, *, transpose: bool
-) -> nn.Module:
-    """slot 内 (上/下) 采样模块；``ds=1`` 退化为 ``nn.Identity``。
-
-    使用 ``kernel = 2 * ds, stride = ds, padding = ds // 2``：偶数 ds 且
-    ``L % ds == 0`` 时 ``Conv1d`` L → L/ds 与 ``ConvTranspose1d`` L/ds → L
-    严格 round-trip。Kaiming-normal 初始化与其他卷积一致。
-    """
-    if ds == 1:
-        return nn.Identity()
-    cls = nn.ConvTranspose1d if transpose else nn.Conv1d
-    layer = cls(channels, channels, kernel_size=2 * ds, stride=ds, padding=ds // 2)
-    nn.init.kaiming_normal_(layer.weight)
-    return layer
 
 
 class UniCardioBackbone(nn.Module):
@@ -120,9 +101,6 @@ class UniCardioBackbone(nn.Module):
         self.L = cfg.slot_length
         self.channels = cfg.channels
         self.n_layers = cfg.n_layers
-        self.transformer_slot_length = self._validate_downsample(
-            self.L, cfg.downsample_factor
-        )
 
         # 编码器 bank 的特征维必须与 self.channels 一致。
         encoded_channels = cfg.per_kernel_channels * len(cfg.kernel_sizes)
@@ -148,20 +126,11 @@ class UniCardioBackbone(nn.Module):
             [nn.LayerNorm([self.channels, self.L]) for _ in range(N_SLOTS)]
         )
 
-        # ds=1 时退化成 nn.Identity，避免 forward 里 if-None 分支。
-        ds = cfg.downsample_factor
-        self.downsamplers = nn.ModuleList(
-            [_make_resampler(self.channels, ds, transpose=False) for _ in range(N_SLOTS)]
-        )
-        self.upsamplers = nn.ModuleList(
-            [_make_resampler(self.channels, ds, transpose=True) for _ in range(N_SLOTS)]
-        )
-
         self.time_embedding = FlowTimeEmbedding(
             embedding_dim=cfg.time_embedding_dim
         )
 
-        transformer_total_length = self.transformer_slot_length * N_SLOTS
+        transformer_total_length = self.L * N_SLOTS
         self.residual_layers = nn.ModuleList(
             [
                 ResidualBlock(
@@ -178,23 +147,6 @@ class UniCardioBackbone(nn.Module):
         self.output_heads = nn.ModuleList(
             [_OutputHead(self.channels) for _ in range(N_SLOTS)]
         )
-
-    @staticmethod
-    def _validate_downsample(slot_length: int, ds: int) -> int:
-        # 仅允许 1 与 2 的幂：偶数 ds 时下采样/上采样的 kernel/stride/padding
-        # 公式可严格 round-trip，奇数 ds 会引入非整数长度。
-        if ds < 1:
-            raise ValueError(f"downsample_factor must be >= 1; got {ds}")
-        if ds > 1 and (ds & (ds - 1)) != 0:
-            raise ValueError(
-                f"downsample_factor must be a power of 2 (or 1); got {ds}"
-            )
-        if slot_length % ds != 0:
-            raise ValueError(
-                f"slot_length ({slot_length}) must be divisible by "
-                f"downsample_factor ({ds})."
-            )
-        return slot_length // ds
 
     @property
     def total_length(self) -> int:
@@ -229,10 +181,8 @@ class UniCardioBackbone(nn.Module):
             encoded = self.input_encoders[i](x[:, :, start:end])
             encoded = encoded.reshape(B, self.channels, self.L)
             encoded = self.input_norms[i](encoded)
-            encoded = self.downsamplers[i](encoded)
             slot_feats.append(encoded)
 
-        L_inner = self.transformer_slot_length
         h = torch.cat(slot_feats, dim=-1)
         time_emb = self.time_embedding(t)
 
@@ -242,7 +192,6 @@ class UniCardioBackbone(nn.Module):
             skip_list.append(skip)
 
         h = torch.stack(skip_list, dim=0).sum(dim=0) / math.sqrt(self.n_layers)
-        start = target_slot * L_inner
-        end = start + L_inner
-        target_feat = self.upsamplers[target_slot](h[:, :, start:end])
-        return self.output_heads[target_slot](target_feat)
+        start = target_slot * self.L
+        end = start + self.L
+        return self.output_heads[target_slot](h[:, :, start:end])

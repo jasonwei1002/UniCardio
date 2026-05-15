@@ -54,6 +54,11 @@ class CardiacDataset(Dataset):
                 f"channel_permutation must have 3 entries, got {self._perm.tolist()}"
             )
 
+    @property
+    def indices(self) -> np.ndarray:
+        """该 split 在原始 .npy / 同名 .csv 里的行号（一维 int64 数组）。"""
+        return self._indices
+
     def __len__(self) -> int:
         return int(self._indices.shape[0])
 

@@ -41,8 +41,6 @@ class UniCardioRF(nn.Module):
         super().__init__()
         self.backbone = UniCardioBackbone(config)
         self.L = self.backbone.L
-        # trainer / sampler 据此构造 attention mask 的形状，下采样后必须用内部长度。
-        self.transformer_slot_length = self.backbone.transformer_slot_length
 
     def forward(
         self,
@@ -66,3 +64,22 @@ class UniCardioRF(nn.Module):
             target slot 的速度预测 ``(B, 1, L_slot)``。
         """
         return self.backbone(x_full, t, mask, target_slot=target_slot)
+
+    def freeze_for_finetune(self, n_unfrozen_blocks: int) -> None:
+        """阶段二微调：冻结 backbone，仅解冻最后 N 个 ResidualBlock + 全部 output_heads。
+
+        - ``n_unfrozen_blocks=0``：仅解冻 ``output_heads``。
+        - ``n_unfrozen_blocks >= len(residual_layers)``：解冻所有 ResidualBlock
+          + ``output_heads``，等价于只冻结 stem (encoders / norms + time embedding)。
+        """
+        for p in self.parameters():
+            p.requires_grad = False
+        bb = self.backbone
+        n = max(0, min(int(n_unfrozen_blocks), len(bb.residual_layers)))
+        if n > 0:
+            for blk in bb.residual_layers[-n:]:
+                for p in blk.parameters():
+                    p.requires_grad = True
+        for head in bb.output_heads:
+            for p in head.parameters():
+                p.requires_grad = True

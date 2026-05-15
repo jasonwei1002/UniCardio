@@ -26,7 +26,8 @@ from tqdm import tqdm
 from cosine_annealing_warmup import CosineAnnealingWarmupRestarts
 
 from ..model_module.tasks import TASK_LIST, TaskSpec, active_task_pairs
-from ..utils.checkpoint import load_checkpoint, save_checkpoint
+from ..utils.checkpoint import load_checkpoint, save_checkpoint, unwrap_model
+from .bp_metrics import evaluate_bp_test
 from .csv_logger import SimpleCSVLogger
 from .rectified_flow import rf_train_step
 
@@ -39,13 +40,17 @@ def _amp_enabled(cfg: Mapping[str, Any], device: torch.device) -> bool:
 
 
 def _build_optimizer(model: nn.Module, cfg: Mapping[str, Any]) -> Optimizer:
+    # 只把 requires_grad=True 的参数交给 Adam：阶段二冻结 backbone 后，剩下的
+    # 张量上不会有 grad，传它们给 fused-Adam 在某些 PyTorch 版本会触发 zero-grad
+    # 兜底路径报错；显式过滤更干净。
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    if not trainable:
+        raise ValueError("No trainable parameters; check freeze configuration.")
     # fused=True 走 CUDA 的多张量融合路径，单 step 比逐参数版本省可观的 launch 开销；
     # CPU 上不支持，退回默认实现。
-    fused = torch.cuda.is_available() and any(
-        p.is_cuda for p in model.parameters()
-    )
+    fused = torch.cuda.is_available() and any(p.is_cuda for p in trainable)
     return Adam(
-        model.parameters(),
+        trainable,
         lr=float(cfg["lr"]),
         weight_decay=float(cfg.get("weight_decay", 1.0e-6)),
         fused=fused,
@@ -152,6 +157,9 @@ def train(
     *,
     device: torch.device,
     output_dir: str | Path,
+    test_loader: DataLoader | None = None,
+    bp_test_csv: str | Path | None = None,
+    sampler_n_steps: int = 8,
 ) -> None:
     """执行完整的 Rectified Flow 训练循环。
 
@@ -162,6 +170,13 @@ def train(
         val_loader: 可选的验证 loader，需满足相同的输出契约。
         device: PyTorch device。
         output_dir: 本次运行的输出目录（由 Hydra 创建）。
+        test_loader: 仅 ``stage='finetune'`` 使用。训练结束后用 best.pt 在该
+            split 上跑一次 RF loss 评估并写入 SwanLab + CSV。
+        bp_test_csv: 仅 ``stage='finetune'`` 使用。指向与 test_loader 同源的
+            ``.csv``（含 ``sbp``、``dbp`` 列）。提供时会在 RF loss 之外，
+            额外用 :func:`evaluate_bp_test` 计算每个 ABP-target task 的
+            SBP/DBP ME 与 SD（mmHg）。
+        sampler_n_steps: BP 评估用的 Euler ODE 步数。
     """
     if isinstance(cfg, DictConfig):
         cfg_dict = OmegaConf.to_container(cfg, resolve=True)
@@ -184,6 +199,43 @@ def train(
     # would land Adam moments on CPU while later model.to(device) moves only params,
     # crashing on the next optimizer.step().
     model.to(device)
+
+    # Stage routing: 阶段二（finetune）必须在 _build_optimizer 之前完成
+    # ckpt 加载 + 参数冻结，否则 Adam 会把 frozen 参数也收进 param_groups。
+    stage = str(cfg_dict.get("stage", "pretrain"))
+    if stage not in ("pretrain", "finetune"):
+        raise ValueError(f"trainer.stage must be 'pretrain' or 'finetune'; got {stage!r}")
+
+    resume_from = cfg_dict.get("resume_from")
+    init_from = cfg_dict.get("init_from")
+    if resume_from and init_from:
+        raise ValueError(
+            "trainer.resume_from and trainer.init_from are mutually exclusive. "
+            "Use resume_from to continue a run (restores optimizer/scheduler/epoch), "
+            "or init_from to start fresh from given model weights (fine-tune)."
+        )
+
+    if stage == "finetune":
+        if not init_from:
+            raise ValueError(
+                "trainer.stage='finetune' requires trainer.init_from=<阶段一 ckpt 路径>"
+            )
+        if resume_from:
+            raise ValueError(
+                "trainer.stage='finetune' is incompatible with trainer.resume_from; "
+                "use init_from to load only the backbone weights."
+            )
+        load_checkpoint(init_from, model=model, map_location=device)
+        n_unfrozen = int(cfg_dict.get("finetune", {}).get("n_unfrozen_blocks", 2))
+        unwrap_model(model).freeze_for_finetune(n_unfrozen)
+        n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        n_total = sum(p.numel() for p in model.parameters())
+        logger.info(
+            "Finetune: loaded backbone from %s; %.2fM / %.2fM params trainable "
+            "(n_unfrozen_blocks=%d)",
+            init_from, n_train / 1e6, n_total / 1e6, n_unfrozen,
+        )
+
     optimizer = _build_optimizer(model, cfg_dict)
     steps_per_epoch = len(train_loader) if itr_per_epoch is None else int(itr_per_epoch)
     scheduler = _build_scheduler(optimizer, cfg_dict, epochs * steps_per_epoch)
@@ -212,14 +264,6 @@ def train(
 
     start_epoch = 0
     best_val = float("inf")
-    resume_from = cfg_dict.get("resume_from")
-    init_from = cfg_dict.get("init_from")
-    if resume_from and init_from:
-        raise ValueError(
-            "trainer.resume_from and trainer.init_from are mutually exclusive. "
-            "Use resume_from to continue a run (restores optimizer/scheduler/epoch), "
-            "or init_from to start fresh from given model weights (fine-tune)."
-        )
     if resume_from:
         payload = load_checkpoint(
             resume_from,
@@ -230,7 +274,8 @@ def train(
         )
         start_epoch = int(payload.get("epoch", 0)) + 1
         logger.info("Resuming from epoch %d", start_epoch)
-    elif init_from:
+    elif init_from and stage == "pretrain":
+        # stage='finetune' 已在前面加载 + 冻结过，避免重复加载。
         load_checkpoint(init_from, model=model, map_location=device)
         logger.info("Initialized model from %s (fine-tune mode, fresh optim/sched)", init_from)
 
@@ -370,3 +415,74 @@ def train(
                 config=cfg_dict,
                 task_list=[t.name for t in active_tasks],
             )
+
+    # 阶段二：训练循环结束后用 best.pt 在独立 test split 上跑一次 RF loss 评估。
+    # 评估用 RF 速度损失（与 val 同口径，便于与 best_val 对齐）；如果需要
+    # RMSE/MAE/KS 等信号域指标，请单独跑 run/pipeline/evaluate.py。
+    if stage == "finetune" and test_loader is not None:
+        best_path = ckpt_dir / "best.pt"
+        if best_path.exists():
+            load_checkpoint(best_path, model=model, map_location=device)
+            logger.info("Reloaded best.pt for finetune test evaluation.")
+        else:
+            # epochs < val_every 时 best.pt 永不会被保存。退化为用最后 step 的
+            # 权重评估，并显式 warn 让用户感知（默认 val_every=1 时不会触发）。
+            logger.warning(
+                "best.pt not found at %s; evaluating with current (last-step) weights. "
+                "Increase trainer.val_every coverage if this is unexpected.",
+                best_path,
+            )
+        test_losses = _evaluate(
+            model, test_loader, device,
+            t_mean=t_mean, t_std=t_std,
+            amp_enabled=amp_enabled,
+            tasks=active_tasks,
+        )
+        test_mean = sum(test_losses.values()) / len(test_losses)
+        logger.info("Finetune test (RF loss) mean=%.6f per_task=%s", test_mean, test_losses)
+        swanlab.log(
+            {
+                "finetune/test_loss_mean": test_mean,
+                **{f"finetune/test_loss_{name}": v for name, v in test_losses.items()},
+            }
+        )
+        # 在 CSV 里用 epoch=-1 这一行专门记录 finetune test 评估结果。
+        csv_logger.log_mapping(
+            {
+                "epoch": -1,
+                "lr": 0.0,
+                "epoch_time_s": 0.0,
+                "avg_loss": test_mean,
+                **{f"loss_{t.name}": float("nan") for t in active_tasks},
+                **{f"val_loss_{name}": v for name, v in test_losses.items()},
+                "val_loss_mean": test_mean,
+            }
+        )
+
+        # 信号域 BP 指标：Euler 重建 → 反归一化 → max=SBP, min=DBP → vs CSV 标签。
+        # 与 RF loss 同 split、同 best.pt；写到独立的 CSV 文件以保持 loss.csv schema 干净。
+        if bp_test_csv is not None:
+            bp_results = evaluate_bp_test(
+                model, test_loader,
+                tasks=active_tasks,
+                csv_path=bp_test_csv,
+                n_steps=sampler_n_steps,
+                device=device,
+                amp_enabled=amp_enabled,
+            )
+            bp_swan: dict[str, float] = {}
+            for task_name, m in bp_results.items():
+                for k, v in m.items():
+                    bp_swan[f"finetune/bp_{task_name}_{k}"] = v
+            if bp_swan:
+                swanlab.log(bp_swan)
+            bp_csv_path = log_dir / "finetune_bp_metrics.csv"
+            bp_fields = ["task", "n", "sbp_me", "sbp_sd", "dbp_me", "dbp_sd"]
+            bp_logger = SimpleCSVLogger(bp_csv_path, fieldnames=bp_fields)
+            for task_name, m in bp_results.items():
+                bp_logger.log_mapping({
+                    "task": task_name,
+                    "n": int(m["n"]),
+                    "sbp_me": m["sbp_me"], "sbp_sd": m["sbp_sd"],
+                    "dbp_me": m["dbp_me"], "dbp_sd": m["dbp_sd"],
+                })

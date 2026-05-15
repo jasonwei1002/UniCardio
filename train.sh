@@ -14,7 +14,6 @@ python run/pipeline/train.py \
     device=cuda \
     data.batch_size=256 \
     data.num_workers=8 \
-    model.downsample_factor=1 \
     trainer.amp.enabled=true \
     trainer.compile.enabled=true \
     trainer.compile.mode=reduce-overhead \

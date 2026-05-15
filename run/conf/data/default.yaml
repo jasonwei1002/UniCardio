@@ -34,7 +34,11 @@ pulsedb:
   test_path: data/pulsedb/CalFree_Test_Subset.npy
   channel_permutation: [0, 1, 2]
   slot_length: 1250
+  # 阶段一（pretrain）：Train_Subset 内部 train/val 划分。
   val_ratio: 0.2
+  # 阶段二（finetune）：CalFree 内部三划分（默认 80/10/10）。两者之和必须 < 1。
+  finetune_val_ratio: 0.1
+  finetune_test_ratio: 0.1
 
 split_seed: 42
 
