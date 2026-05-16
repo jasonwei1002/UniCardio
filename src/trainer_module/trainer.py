@@ -102,6 +102,30 @@ def _csv_fields() -> list[str]:
     return fields
 
 
+def _flush_train_window(
+    *,
+    task_sums: Mapping[str, Tensor],
+    task_counts: Mapping[str, int],
+    lr: float,
+    step: int,
+) -> None:
+    """把窗口内的均值用单次 stack→tolist sync 到 CPU，再写 swanlab。"""
+    total_count = sum(task_counts.values())
+    if total_count <= 0:
+        return
+    keys: list[str] = ["train/loss"]
+    vals: list[Tensor] = [sum(task_sums.values()) / total_count]
+    for name, s in task_sums.items():
+        c = task_counts[name]
+        if c > 0:
+            keys.append(f"train/loss_{name}")
+            vals.append(s / c)
+    cpu_vals = torch.stack(vals).tolist()
+    metrics = dict(zip(keys, cpu_vals))
+    metrics["train/lr"] = lr
+    swanlab.log(metrics, step=step)
+
+
 @torch.no_grad()
 def _evaluate(
     model: nn.Module,
@@ -232,6 +256,9 @@ def train(
     if grad_clip_norm > 0:
         logger.info("Grad clip: max_norm=%.2f", grad_clip_norm)
 
+    log_every_n_steps = max(1, int(cfg_dict.get("log_every_n_steps", 50)))
+    logger.info("SwanLab train-curve granularity: every %d steps", log_every_n_steps)
+
     task_pairs = active_task_pairs(cfg_dict.get("task_weights"))
     active_tasks: list[TaskSpec] = [spec for spec, _ in task_pairs]
     logger.info("Training tasks: %s", [t.name for t in active_tasks])
@@ -251,10 +278,12 @@ def train(
     global_step = 0
     for epoch in range(epochs):
         epoch_start = time.time()
-        task_loss_sum = {t.name: 0.0 for t in active_tasks}
+        task_loss_sum = {t.name: torch.zeros((), device=device) for t in active_tasks}
         task_loss_count = {t.name: 0 for t in active_tasks}
-        total_loss = 0.0
+        total_loss = torch.zeros((), device=device)
         total_batches = 0
+        window_task_sum = {t.name: torch.zeros((), device=device) for t in active_tasks}
+        window_task_count = {t.name: 0 for t in active_tasks}
 
         it = tqdm(
             train_loader,
@@ -284,32 +313,48 @@ def train(
             optimizer.step()
             scheduler.step()
 
-            val = float(loss.item())
-            task_loss_sum[task.name] += val
+            loss_d = loss.detach()
+            total_loss += loss_d
+            task_loss_sum[task.name] += loss_d
             task_loss_count[task.name] += 1
-            total_loss += val
             total_batches += 1
+            window_task_sum[task.name] += loss_d
+            window_task_count[task.name] += 1
 
-            swanlab.log(
-                {
-                    "train/loss": val,
-                    f"train/loss_{task.name}": val,
-                    "train/lr": float(optimizer.param_groups[0]["lr"]),
-                },
-                step=global_step,
-            )
             global_step += 1
+            if sum(window_task_count.values()) >= log_every_n_steps:
+                _flush_train_window(
+                    task_sums=window_task_sum,
+                    task_counts=window_task_count,
+                    lr=float(optimizer.param_groups[0]["lr"]),
+                    step=global_step,
+                )
+                for t in window_task_sum.values():
+                    t.zero_()
+                window_task_count = dict.fromkeys(window_task_count, 0)
 
             if itr_per_epoch is not None and batch_idx >= int(itr_per_epoch):
                 break
 
+        if sum(window_task_count.values()) > 0:
+            _flush_train_window(
+                task_sums=window_task_sum,
+                task_counts=window_task_count,
+                lr=float(optimizer.param_groups[0]["lr"]),
+                step=global_step,
+            )
+
         epoch_time = time.time() - epoch_start
-        avg = total_loss / max(total_batches, 1)
+        denom = max(total_batches, 1)
+        nan_gpu = torch.full((), float("nan"), device=device)
+        epoch_tensors: list[Tensor] = [total_loss / denom]
+        for t in active_tasks:
+            c = task_loss_count[t.name]
+            epoch_tensors.append(task_loss_sum[t.name] / c if c > 0 else nan_gpu)
+        epoch_vals = torch.stack(epoch_tensors).tolist()
+        avg = epoch_vals[0]
         per_task = {
-            f"loss_{name}": (task_loss_sum[name] / task_loss_count[name])
-            if task_loss_count[name] > 0
-            else float("nan")
-            for name in task_loss_sum
+            f"loss_{t.name}": epoch_vals[i + 1] for i, t in enumerate(active_tasks)
         }
         lr_val = float(optimizer.param_groups[0]["lr"])
         logger.info(

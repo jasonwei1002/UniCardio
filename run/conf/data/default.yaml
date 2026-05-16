@@ -38,7 +38,7 @@ pulsedb:
 
 split_seed: 42
 
-batch_size: 512             # Tier 1：H20 96GB + SDPA/Flash Attention 下显存充足
+batch_size: 512
 num_workers: 8
 pin_memory: true
 

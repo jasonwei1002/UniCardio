@@ -50,6 +50,10 @@ ckpt_every: 1
 itr_per_epoch: null        # null 表示遍历整个 DataLoader
 log_filename: loss.csv
 
+# SwanLab train-curve 粒度：每 N 步聚合一次 `.item()`+log，避免每步 GPU↔CPU 同步
+# 打断 compute/IO overlap。每 epoch 末额外 flush 一次残余窗口。
+log_every_n_steps: 50
+
 # 可选：从 checkpoint 加载**仅模型权重**作为初始化（fine-tune 入口）。
 # optimizer / scheduler / epoch 都按当前 cfg 新建——可以换 lr / 换 epochs。
 init_from: null

@@ -17,6 +17,7 @@ import hydra
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
+from tqdm import tqdm
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -61,7 +62,17 @@ def _eval_task(
 ) -> dict[str, float]:
     preds: list[np.ndarray] = []
     targets: list[np.ndarray] = []
-    for batch_idx, batch in enumerate(loader):
+    # total 优先取 limit_batches，否则取 loader 长度 — 否则 tqdm 在 break
+    # 退出时会停在 "73%" 之类的不完整状态。
+    total = limit_batches if limit_batches is not None else len(loader)
+    pbar = tqdm(
+        loader,
+        total=total,
+        desc=task.name,
+        mininterval=5.0,
+        maxinterval=50.0,
+    )
+    for batch_idx, batch in enumerate(pbar):
         signal = batch[0].to(device)
         target = signal[:, int(task.target_slot):int(task.target_slot) + 1, :]
         pred = euler_sample(model, signal, task, n_steps=n_steps, device=device)
