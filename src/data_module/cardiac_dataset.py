@@ -63,12 +63,9 @@ class CardiacDataset(Dataset):
         return int(self._indices.shape[0])
 
     def __getitem__(self, idx: int) -> tuple[Tensor]:
-        # 一次 advanced indexing 即完成「行选取 + 通道置换」，并产出一份 owned、
-        # writable、C-contiguous 的 ndarray（numpy 高级索引语义保证）；之后
-        # `from_numpy` 可零拷贝接管，DataLoader 的 collate + pin_memory 也安全。
-        # `astype(copy=False)` 在源已是 float32（如 PulseDB）时是 no-op；源是
-        # float64（如 Final_sig_combined.npy）时执行一次显式 cast，否则
-        # `torch.from_numpy` 会拿到 double tensor，conv1d 会报 dtype 不匹配。
+        # Advanced indexing returns an owned, writable, C-contiguous ndarray
+        # (safe for from_numpy + pin_memory). astype(copy=False) is a no-op on
+        # float32 sources, else casts to avoid conv1d dtype mismatch.
         x = self._mm[self._indices[idx], self._perm].astype(np.float32, copy=False)
         x[2] = bp_normalize(x[2])
         return (torch.from_numpy(x),)

@@ -1,18 +1,4 @@
-"""UniCardio 的 3-slot Rectified Flow 主干网络。
-
-替换了原扩散代码库中的 4-slot ``diff_CSDI`` 模块。主要差异：
-
-* 3 个 slot（ECG=0、PPG=1、ABP=2）——去掉了原先零填充的占位 slot 以及
-  相关的 ``borrow_mode`` 输出头路由。
-* 使用 :class:`FlowTimeEmbedding`（``t ∈ [0, 1]``）做连续时间条件，取代
-  原本基于整数步数的 ``DiffusionEmbedding``。
-* mask 由调用方传入（在别处按任务构造），不再从 7 个硬编码的预注册 mask
-  中选择。
-
-原样保留的结构：:class:`SignalEncoder`、:class:`ResidualBlock`、
-按 slot 划分的 :class:`LayerNorm`、每个 slot 的 2 级输出头、以及
-乘以 ``1 / sqrt(n_layers)`` 的 skip-sum 聚合。
-"""
+"""3-slot Rectified Flow backbone (ECG/PPG/ABP)."""
 
 from __future__ import annotations
 
@@ -32,6 +18,7 @@ from .embeddings import (
     SignalEncoder,
     conv1d_kaiming,
 )
+from .attention_masks import AttentionMask
 from .residual_block import ResidualBlock
 
 N_SLOTS: int = 3
@@ -39,7 +26,7 @@ N_SLOTS: int = 3
 
 @dataclass(frozen=True)
 class BackboneConfig:
-    """纯 dataclass 配置，方便在不依赖 Hydra 的场景下实例化 backbone。"""
+    """Backbone hyperparameters."""
 
     slot_length: int = 500
     channels: int = 288
@@ -68,7 +55,7 @@ class BackboneConfig:
 
 
 class _OutputHead(nn.Module):
-    """每个 slot 独立的 2 级输出头（``C -> C -> 1``，中间接 ReLU）。"""
+    """Per-slot 2-stage output head (``C -> C -> 1``, ReLU between)."""
 
     def __init__(self, channels: int) -> None:
         super().__init__()
@@ -102,7 +89,6 @@ class UniCardioBackbone(nn.Module):
         self.channels = cfg.channels
         self.n_layers = cfg.n_layers
 
-        # 编码器 bank 的特征维必须与 self.channels 一致。
         encoded_channels = cfg.per_kernel_channels * len(cfg.kernel_sizes)
         if encoded_channels != cfg.channels:
             raise ValueError(
@@ -156,7 +142,7 @@ class UniCardioBackbone(nn.Module):
         self,
         x: Tensor,
         t: Tensor,
-        mask: Tensor,
+        mask: AttentionMask,
         target_slot: int,
     ) -> Tensor:
         """只对 target slot 预测速度。

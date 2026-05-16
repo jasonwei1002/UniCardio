@@ -5,11 +5,12 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+# Hydra `hydra.run.dir` 通过 ${oc.env:UNICARDIO_STAGE,pretrain} 取这个变量做后缀。
+export UNICARDIO_STAGE=pretrain
 
 mkdir -p logs
 LOG_FILE="logs/train_$(date +%Y%m%d_%H%M%S).log"
 
-# torch.compile.mode=max-autotune 已是 trainer/default.yaml 默认值，无需 override。
 python run/pipeline/train.py \
     device=cuda \
     data.batch_size=256 \

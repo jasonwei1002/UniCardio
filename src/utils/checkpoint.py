@@ -16,11 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 def unwrap_model(model: nn.Module) -> nn.Module:
-    """剥掉 ``DataParallel`` / ``DDP`` / ``torch.compile`` 的包装。
-
-    用 ``while`` 直到稳定，可以处理 ``DDP(compile(m))`` 与 ``compile(DDP(m))``
-    两种嵌套顺序。
-    """
+    """Unwrap ``DataParallel`` / ``DDP`` / ``torch.compile`` wrappers in any nesting order."""
     while True:
         if isinstance(
             model, (nn.DataParallel, nn.parallel.DistributedDataParallel)

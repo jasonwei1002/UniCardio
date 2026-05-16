@@ -8,13 +8,9 @@
 #   1) `channel_permutation` 通道置换（让模型 slot 顺序统一为 ECG/PPG/ABP）
 #   2) ABP 通道归一化 (x - 100) / 50
 
-# 数据集选择：'combined' (Final_sig_combined.npy, slot 500) 或
-# 'pulsedb' (PulseDB Train/Test_Subset.npy, slot 1250)。切换它会自动
-# 联动 slot_length（嵌套插值从子节取），无需再单独改两处。
 name: pulsedb
 
-# 当前所选数据集的 slot 长度，从同名子节自动解析。模型配置通过
-# ${data.slot_length} 引用本字段，保证模型和数据 slot 长度恒一致。
+# 从同名子节解析；切换 name 自动联动。
 slot_length: ${.${.name}.slot_length}
 
 # Final_sig_combined.npy：单文件 train+val+test 三划分。

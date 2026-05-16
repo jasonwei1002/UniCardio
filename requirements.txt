@@ -21,9 +21,6 @@ scikit-learn>=1.2,<2.0
 tqdm>=4.65
 swanlab>=0.7,<1.0
 
-# 自带 warmup 的 cosine 调度器：trainer.py::_build_scheduler
-cosine_annealing_warmup>=2.0,<3
-
 # script/plot_first_sample.py 用到；不画图可不装
 matplotlib>=3.7
 

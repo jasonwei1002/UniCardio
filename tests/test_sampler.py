@@ -42,7 +42,7 @@ def test_euler_sample_trajectory_length(tiny_model):
         tiny_model, conditions, TASK_LIST[0], n_steps=4, return_trajectory=True
     )
     assert x0.shape == (B, 1, SLOT_LEN)
-    assert traj.shape == (5, B, 1, SLOT_LEN)  # 长度为 n_steps + 1
+    assert traj.shape == (5, B, 1, SLOT_LEN)
 
 
 def test_euler_sample_restores_train_mode(tiny_model):

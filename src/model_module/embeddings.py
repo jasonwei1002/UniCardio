@@ -1,14 +1,5 @@
-"""输入编码器与时间条件 embedding。
-
-``SignalEncoder`` 原样保留自 UniCardio 原始代码：6 条并行的 Conv1d 分支
-（卷积核 1/3/5/7/9/11，每条输出 48 通道），在通道维 concat 成 288 通道的
-特征图。权重使用 Kaiming-normal 初始化，与原实现一致。
-
-``FlowTimeEmbedding`` 在 Rectified Flow 中替换了原来的 ``DiffusionEmbedding``。
-它将连续时间 ``t ∈ [0, 1]`` 映射到正弦特征向量，再经过两层 SiLU MLP。
-频率表经过缩放，使动态范围大致与原来的整数步数 embedding（step ∈ [0, 1000]）
-保持一致。
-"""
+"""SignalEncoder (multi-scale Conv1d bank) and FlowTimeEmbedding (sinusoidal
+``t ∈ [0, 1]`` + SiLU MLP)."""
 
 from __future__ import annotations
 
@@ -26,7 +17,7 @@ DEFAULT_CHANNELS_PER_KERNEL: int = 48
 def conv1d_kaiming(
     in_channels: int, out_channels: int, kernel_size: int
 ) -> nn.Conv1d:
-    """带 Kaiming-normal 初始化的 Conv1d（保留自原始代码）。"""
+    """Conv1d with Kaiming-normal init."""
     layer = nn.Conv1d(in_channels, out_channels, kernel_size)
     nn.init.kaiming_normal_(layer.weight)
     return layer
@@ -72,14 +63,11 @@ class SignalEncoder(nn.Module):
 
 
 class FlowTimeEmbedding(nn.Module):
-    """Rectified Flow 使用的连续时间 ``t ∈ [0, 1]`` 正弦 embedding。
+    """Sinusoidal time embedding for ``t ∈ [0, 1]`` followed by a 2-layer SiLU MLP.
 
-    实现说明：
-
-    * 在做正弦基之前把 ``t`` 乘以 ``scale``（默认 1000），使有效相位范围
-      与原扩散代码中的整数步数 embedding（step ∈ [0, num_steps)）对齐。
-    * MLP 在两次 projection 之后都跟一个 SiLU，与原 ``DiffusionEmbedding``
-      模块一致，保证下游权重形状完全相同。
+    ``t`` is scaled by ``scale`` (default 1000) before the sinusoidal basis
+    so the effective phase range matches discrete-step embeddings sized for
+    ``step ∈ [0, 1000)``.
     """
 
     def __init__(
@@ -100,7 +88,6 @@ class FlowTimeEmbedding(nn.Module):
         self.embedding_dim = embedding_dim
         self.scale = scale
         half = embedding_dim // 2
-        # 频率定义与原 DiffusionEmbedding._build_embedding 保持一致。
         frequencies = 10.0 ** (
             torch.arange(half).float() / max(half - 1, 1) * max_freq_exp
         )

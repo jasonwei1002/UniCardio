@@ -1,21 +1,13 @@
-"""包裹 :class:`UniCardioBackbone` 的顶层 Rectified Flow 模型。
+"""Top-level Rectified Flow model wrapping :class:`UniCardioBackbone`.
 
-设计决定：模型内部**不**计算 loss。``UniCardioRF.forward(x_full, t, mask,
-target_slot)`` 只返回 target slot 的原始速度预测 ``(B, 1, L)``；loss、
-x_t 的构造、采样、**以及任务 → mask/target_slot 的映射**都放在
-``src.trainer_module`` 中，使本模块更易测试、checkpoint 以及在将来替换
-不同 backbone。
+``forward(x_full, t, mask, target_slot)`` returns the raw velocity prediction
+for ``target_slot`` only; loss, ``x_t`` construction, sampling, and the
+``task → mask/target_slot`` mapping all live in ``src.trainer_module``.
 
-forward 只接收张量和一个 Python ``int``，不接受 ``TaskSpec``。这样
-``torch.compile(model)`` 只会对 ``target_slot`` 的 3 个值做特化（Dynamo
-guard），而不会对 ``task.name`` 的 5 种字符串分别编一份图。历史上用
-``task`` 作为参数时，Dynamo 会把 5 × 3 = 15 种组合当成不同 frame，撞
-``recompile_limit=8`` 之后直接回退 eager。
-
-注意：``torch.compile`` 由训练入口 (``run/pipeline/train.py``) 在构造
-完成后按 ``cfg.trainer.compile`` 包一层。这样 ``UniCardioRF.state_dict()``
-的 key 前缀不会被 ``OptimizedModule`` 污染成 ``_orig_mod.*``（checkpoint
-代码里还有兜底的解包逻辑）。
+``forward`` takes a Python ``int`` rather than a ``TaskSpec`` so
+``torch.compile`` specializes on the 3 ``target_slot`` values, not 15
+(slot × task name) Dynamo frames — which would otherwise hit
+``recompile_limit=8`` and fall back to eager.
 """
 
 from __future__ import annotations
@@ -25,14 +17,16 @@ from typing import Any, Mapping
 import torch.nn as nn
 from torch import Tensor
 
+from .attention_masks import AttentionMask
 from .backbone import BackboneConfig, UniCardioBackbone
 
 
 class UniCardioRF(nn.Module):
     """包裹 :class:`UniCardioBackbone` 的 Rectified Flow 模型。
 
-    forward 签名是纯张量 + ``int``，调用方负责从 :class:`TaskSpec` 里
-    取 ``target_slot`` 并通过 :func:`build_task_mask` 构造 ``mask``。
+    forward 签名是纯张量 + mask + ``int``，调用方负责从 :class:`TaskSpec`
+    里取 ``target_slot`` 并按 device 选择 mask（CUDA 走
+    :func:`build_task_block_mask`，CPU 走 :func:`build_task_mask` bool）。
     """
 
     def __init__(
@@ -46,7 +40,7 @@ class UniCardioRF(nn.Module):
         self,
         x_full: Tensor,
         t: Tensor,
-        mask: Tensor,
+        mask: AttentionMask,
         target_slot: int,
     ) -> Tensor:
         """预测 ``target_slot`` 对应的速度。
@@ -55,9 +49,8 @@ class UniCardioRF(nn.Module):
             x_full: ``(B, 1, 3 * L_slot)`` —— condition slot + 填充了 ``x_t``
                 的 target slot 拼接后的张量。
             t: ``(B,)`` —— 取值于 ``[0, 1]`` 的连续 flow 时间。
-            mask: ``(3 * L_slot, 3 * L_slot)`` 的 bool 注意力 mask；由
-                :func:`src.model_module.attention_masks.build_task_mask`
-                以 ``dtype=torch.bool`` 生成。
+            mask: ``BlockMask``（CUDA / flex_attention 路径）或 dense bool
+                ``Tensor``（CPU / SDPA fallback）。
             target_slot: 参与重建的 slot 编号（0/1/2）。
 
         Returns:

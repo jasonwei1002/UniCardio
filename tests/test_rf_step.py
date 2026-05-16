@@ -24,7 +24,7 @@ def tiny_model() -> UniCardioRF:
     torch.manual_seed(0)
     cfg = BackboneConfig(
         slot_length=SLOT_LEN,
-        channels=288,  # 由编码器 bank 固定：6 个卷积核 * 每核 48 通道
+        channels=288,
         n_layers=2,
         nheads=4,
         time_embedding_dim=64,
@@ -49,11 +49,8 @@ def test_assemble_x_full_replaces_target_slot():
     xt = torch.full((B, 1, SLOT_LEN), -99.0)
     out = assemble_x_full(signal, xt, target_slot=1, L=SLOT_LEN)
     assert out.shape == (B, 1, 3 * SLOT_LEN)
-    # slot 0 保持不变。
     assert torch.equal(out[:, 0, :SLOT_LEN], signal[:, 0, :])
-    # slot 1 被 xt 替换。
     assert torch.all(out[:, 0, SLOT_LEN:2 * SLOT_LEN] == -99.0)
-    # slot 2 保持不变。
     assert torch.equal(out[:, 0, 2 * SLOT_LEN:], signal[:, 2, :])
 
 
@@ -65,7 +62,6 @@ def test_build_rf_inputs_shapes_and_values():
     assert t.shape == (B,)
     assert x1.shape == (B, 1, SLOT_LEN)
     assert v.shape == (B, 1, SLOT_LEN)
-    # x1 是数据端点，必须正好等于原信号中 target slot 那一列。
     assert torch.equal(x1[:, 0, :], signal[:, task.target_slot, :])
 
 
@@ -77,7 +73,6 @@ def test_rf_train_step_produces_scalar_grad(tiny_model, task):
     assert torch.isfinite(loss)
     assert loss.requires_grad
     loss.backward()
-    # target slot 对应的输出头必须累积到非零梯度。
     head = tiny_model.backbone.output_heads[int(task.target_slot)]
     assert head.proj2.weight.grad is not None
     assert torch.any(head.proj2.weight.grad != 0)
@@ -92,6 +87,5 @@ def test_non_target_heads_receive_no_grad(tiny_model, task):
     for i, head in enumerate(tiny_model.backbone.output_heads):
         if i == int(task.target_slot):
             continue
-        # 非 target slot 的输出头从未被调用，其梯度应保持为 None。
         assert head.proj1.weight.grad is None
         assert head.proj2.weight.grad is None

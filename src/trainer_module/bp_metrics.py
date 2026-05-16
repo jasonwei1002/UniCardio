@@ -1,16 +1,9 @@
-"""信号域 BP 指标：基于 Euler 采样得到的绝对幅值 ABP 波形，计算 SBP/DBP 的 ME / SD。
+"""Signal-domain BP metrics: SBP/DBP ME and SD from Euler-reconstructed ABP.
 
-流程：
-  1) 对每个 ABP-target task，遍历 test_loader 用 :func:`euler_sample` 重建
-     target slot 的归一化 ABP 波形 ``(B, 1, L)``。
-  2) 反归一化得到 mmHg 量纲（``bp_denormalize``）。
-  3) 沿时间维取 ``max → SBP_pred``、``min → DBP_pred``。
-  4) 与 CSV 里 ``sbp`` / ``dbp`` 列按样本对齐，计算 ME（mean error）和 SD
-     （样本标准差，ddof=1，与 BHS / AAMI 规范一致）。
-
-CSV 行号对齐：DataLoader 在 ``shuffle=False`` 下顺序消费 dataset，
-``dataset.indices[batch_offset + j]`` 即第 j 个样本在原始 ``.npy`` / 同名
-``.csv`` 中的行号。
+CSV alignment invariant: with ``shuffle=False`` the loader consumes the
+dataset in index order, so ``dataset.indices[k]`` is the row of sample ``k``
+in both the ``.npy`` and the sibling ``.csv``. SD uses ``ddof=1`` per
+BHS / AAMI convention.
 """
 
 from __future__ import annotations
@@ -57,7 +50,6 @@ def _predict_one_task(
             device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled
         ):
             out = euler_sample(model, signal, task, n_steps=n_steps, device=device)
-        # out: (B, 1, L) 归一化空间 → (B, L) mmHg
         wave_mmHg = bp_denormalize(out.squeeze(1).float())
         sbp_chunks.append(wave_mmHg.amax(dim=-1).detach().cpu().numpy())
         dbp_chunks.append(wave_mmHg.amin(dim=-1).detach().cpu().numpy())

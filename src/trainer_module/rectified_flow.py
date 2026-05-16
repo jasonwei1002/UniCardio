@@ -1,18 +1,5 @@
-"""Rectified Flow 训练步：时间采样、x_t 构造、损失计算。
-
-约定 Lipman Flow Matching 方向：``t = 0`` 是噪声端，``t = 1`` 是数据端。
-
-    x_t     = (1 - t) * eps + t * x_1,   eps ~ N(0, I),   t ∈ (0, 1)
-    v_true  = x_1 - eps                   # dx_t / dt
-    loss    = E_{x_1, eps, t} [ || v_theta(x_t, t) - v_true ||^2 ]
-
-``x_1`` 指代 target slot 的干净数据端点（Lipman 记号里数据在 t=1）；与
-diffusion 文献里 ``x_0`` 同义，只是换了时间坐标。网络只对 target slot 预测
-速度；非 target slot 保存干净的条件信号，不参与损失计算。
-
-时间采样采用 SD3 的 logit-normal：``u ~ N(0, 1); t = sigmoid(u)``。
-分布关于 ``t = 0.5`` 对称，方向翻转后密度不变。
-"""
+"""Rectified Flow training step under Lipman convention (``t=0`` noise,
+``t=1`` data). Time sampling is SD3-style logit-normal."""
 
 from __future__ import annotations
 
@@ -21,7 +8,7 @@ from typing import Tuple
 import torch
 from torch import Tensor, nn
 
-from ..model_module.attention_masks import build_task_mask
+from ..model_module.attention_masks import select_task_mask
 from ..model_module.tasks import TaskSpec
 
 
@@ -118,21 +105,18 @@ def rf_train_step(
     t_mean: float = 0.0,
     t_std: float = 1.0,
 ) -> Tensor:
-    """计算单个 batch 的 Rectified Flow 标量损失。
+    """Scalar Rectified Flow loss for one batch.
 
-    模型接受 ``(x_full, t, mask, target_slot)``，返回 ``(B, 1, L)`` 的速度预测。
-    ``task`` 在这里（编译区之外）解包成 bool mask 和 int ``target_slot``，使
-    ``torch.compile`` 只对 3 种 ``target_slot`` 做 Dynamo 特化，不会因为
-    ``task.name`` 的 5 种字符串撞 recompile limit。
+    ``task`` is unpacked into a bool mask + ``int target_slot`` outside the
+    compile region so ``torch.compile`` specializes on 3 ``target_slot`` values,
+    not 15 (slot × task name) Dynamo frames.
     """
     x_full, t, _, v_target = build_rf_inputs(
         batch_signal, task, t_mean=t_mean, t_std=t_std
     )
     _, _, L_total = x_full.shape
     L_slot = L_total // 3
-    mask = build_task_mask(
-        task.name, L_slot, device=str(x_full.device), dtype=torch.bool
-    )
+    mask = select_task_mask(task.name, L_slot, x_full.device)
     v_pred = model(x_full, t, mask, int(task.target_slot))
     if v_pred.shape != v_target.shape:
         raise RuntimeError(

@@ -100,7 +100,6 @@ def _run_overfit(
         final / max(initial, 1e-12),
     )
 
-    # 在过拟合后的权重上用 Euler 采样器重建 target。
     model.eval()
     target = batch[:, int(task.target_slot):int(task.target_slot) + 1, :]
     sample = euler_sample(model, batch, task, n_steps=16, device=device)

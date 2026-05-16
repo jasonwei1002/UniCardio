@@ -37,7 +37,7 @@ Device is read from the Hydra config (`device: cuda | cpu`); on macOS `cuda` aut
 pip install -r requirements.txt
 ```
 
-Python 3.10+, PyTorch 2.x, Hydra 1.3.
+Python 3.10+, PyTorch ≥2.5 (FlexAttention 用 BlockMask + flex_attention，CPU 走 SDPA fallback), Hydra 1.3. 当前实测 torch 2.11。
 
 ## Key Commands
 
@@ -131,7 +131,12 @@ Total token sequence length = `3 * slot_length = 1500`. Slot token ranges in the
 | 1    | PPG      | `[500, 1000)`|
 | 2    | ABP      | `[1000, 1500)`|
 
-`build_task_mask(task_name, L_slot, *, dtype=...)` returns a `(L_total, L_total)` mask. Both training (`rf_train_step`) and the Euler sampler call it with `dtype=torch.bool` (`True`=allowed) — that's what `ResidualBlock` feeds into `F.scaled_dot_product_attention`, which routes to Flash Attention on Hopper bf16. The legacy `dtype=torch.float32` path returns the additive `0`/`-inf` form for compatibility with `nn.MultiheadAttention` but isn't used in the runtime hot path. Rule: every participating slot attends to itself; the target slot additionally attends to all condition slots; condition slots cross-attend to each other (only matters for `ecgppg2abp`); non-participating slot rows are fully blocked.
+Attention is dispatched on mask type inside `_FlexAttentionFFN`:
+
+- **CUDA path**: `build_task_block_mask(task_name, L_slot, device)` returns a `BlockMask`; `flex_attention(q, k, v, block_mask=...)` skips all-False 128-block tiles at kernel level. Inside the top-level `torch.compile` region this fuses into a Triton kernel. Sparsity savings: single-cond tasks ~33% density → ~3× FLOP cut; `ecgppg2abp` ~79% density → modest cut.
+- **CPU fallback**: `build_task_mask(task_name, L_slot, dtype=torch.bool)` returns a dense `(L_total, L_total)` bool tensor; `_FlexAttentionFFN` routes it to `F.scaled_dot_product_attention`. **Required because FlexAttention has no CPU backward as of torch 2.11** — without this, `rf_train_step` on CPU crashes. Selection happens in `rf_train_step` / `euler_sample` via `device.type == "cuda"` branch.
+
+Mask rule (same for both paths): every participating slot attends to itself; the target slot additionally attends to all condition slots; condition slots cross-attend each other (only matters for `ecgppg2abp`); non-participating slot rows are fully blocked.
 
 ### Model (`UniCardioRF` / `UniCardioBackbone`)
 
@@ -159,7 +164,7 @@ Per batch: sample one task from the active set (zero-weight tasks are pre-filter
 4. Assembles `(B, 1, 3*L)` input with clean conditions + `x_t` in the target slot.
 5. Calls the model and returns MSE between predicted and target velocity.
 
-Optimizer: Adam (default lr 1e-3, wd 1e-6). Gradient clipping: L2 norm capped at `trainer.grad_clip_norm` (default `1.0`; set to 0/null to disable) between `backward()` and `optimizer.step()` — non-optional under bf16 + Adam on RF velocity MSE, an earlier 2e-3 run diverged mid-warmup around epoch 10 without clipping. Schedule: **`cosine_annealing_warmup.CosineAnnealingWarmupRestarts`** (no warm restart — `first_cycle_steps = total_steps` so training ends before the cycle wraps). Linear warmup for `trainer.warmup_pct` (fraction of total steps in `[0, 1)`, default `0.005` ≈ 1–2 epochs at current schedule; step count derived at runtime via `round(warmup_pct * total_steps)`) from `min_lr` up to `lr` (= the library's `max_lr`), then cosine anneal from `lr` down to `lr_scheduler.min_lr` (default `1e-6`) across the remaining steps; all step-granularity internally. AMP: bf16-only on CUDA, no GradScaler; CPU silently falls back to fp32. `torch.compile(mode="default")` wraps the top-level `UniCardioRF` on CUDA — `mode="reduce-overhead"` was tried and rejected because the CUDA-Graphs private pool burns ~14 GB at this batch size. Checkpoints every epoch (`latest.pt`); best tracked by mean validation RF loss (`best.pt`); `trainer.resume_from` resumes from any saved checkpoint.
+Optimizer: Adam (default lr 1e-3, wd 1e-6). Gradient clipping: L2 norm capped at `trainer.grad_clip_norm` (default `1.0`; set to 0/null to disable) between `backward()` and `optimizer.step()` — non-optional under bf16 + Adam on RF velocity MSE, an earlier 2e-3 run diverged around epoch 10 without clipping. Schedule: torch built-in `CosineAnnealingLR`（`lr_scheduler.first_cycle_pct=1.0`，单 cosine）或 `CosineAnnealingWarmRestarts`（`<1.0`，`cycle_mult` 控制周期增长）。**No warmup.** 当前默认 `first_cycle_pct=0.5` → 200 epoch 训练拆成两个等长 cosine 周期，每个从 `lr=1e-3` 退到 `min_lr=1e-6`；restart 回到 peak `lr`（torch 自带不支持峰值衰减）。 AMP: bf16-only on CUDA, no GradScaler; CPU silently falls back to fp32. `torch.compile(mode="default")` wraps the top-level `UniCardioRF` on CUDA — `mode="reduce-overhead"` was tried and rejected because the CUDA-Graphs private pool burns ~14 GB at this batch size. Checkpoints every epoch (`latest.pt`); best tracked by mean validation RF loss (`best.pt`); `trainer.resume_from` resumes from any saved checkpoint.
 
 ### Inference API
 

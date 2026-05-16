@@ -61,7 +61,6 @@ _DatasetSpec = tuple[str, np.ndarray, Sequence[int]]   # (path, indices, channel
 def _plan_combined(
     cfg: Mapping[str, Any], *, mode: str = "pretrain"
 ) -> tuple[_DatasetSpec, _DatasetSpec, _DatasetSpec]:
-    # combined 数据集只有 pretrain 一种切法；mode 仅吸收以保持 planner 签名一致。
     if mode != "pretrain":
         raise ValueError(
             f"data.name='combined' only supports mode='pretrain'; got mode={mode!r}"
@@ -103,7 +102,6 @@ def _plan_pulsedb(
         )
 
     if mode == "finetune":
-        # 阶段二：CalFree 内部三划分；复用 _split_three_way_indices 的两步切法。
         path = str(sub["test_path"])
         n = _peek_length(path)
         val_ratio = float(sub.get("finetune_val_ratio", 0.1))
@@ -174,7 +172,7 @@ def build_loaders(
         "pin_memory": pin_memory,
         "worker_init_fn": worker_init_fn if num_workers > 0 else None,
     }
-    # 长 epoch 下 worker 重启 + mmap 重开开销不可忽略；prefetch 提到 4 让 GPU 不饿。
+    # Persistent workers + prefetch=4: avoid mmap reopen cost, keep GPU fed.
     if num_workers > 0:
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 4

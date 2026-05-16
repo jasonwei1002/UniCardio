@@ -15,13 +15,19 @@ import math
 import pytest
 import torch
 
-from src.model_module.attention_masks import build_task_mask, clear_mask_cache
-from src.model_module.tasks import TASK_LIST
+from torch.nn.attention.flex_attention import create_mask
 
-L_SLOT = 16  # 取小一点，可以逐 cell 检查且速度快
+from src.model_module.attention_masks import (
+    _make_mask_mod,
+    build_task_block_mask,
+    build_task_mask,
+    clear_mask_cache,
+)
+from src.model_module.tasks import TASK_LIST, TASK_SPECS
 
-# 每个任务手工推导出的允许 (query, key) 块集合。
-# 规则回顾：target↔target、cond→cond 自注意力、cond↔cond 成对、target←cond。
+L_SLOT = 16
+
+# Rule: target↔target + cond→cond self-attn; cond↔cond pairwise; target←cond.
 EXPECTED_ALLOWED: dict[str, set[tuple[int, int]]] = {
     # ecg2ppg  —— cond={0}, target=1
     "ecg2ppg": {(0, 0), (1, 1), (1, 0)},
@@ -31,7 +37,7 @@ EXPECTED_ALLOWED: dict[str, set[tuple[int, int]]] = {
     "ecg2abp": {(0, 0), (2, 2), (2, 0)},
     # ppg2abp  —— cond={1}, target=2
     "ppg2abp": {(1, 1), (2, 2), (2, 1)},
-    # ecgppg2abp —— cond={0,1}, target=2 → cond↔cond + target←两个 cond + 自注意力
+    # ecgppg2abp —— cond={0,1}, target=2
     "ecgppg2abp": {
         (0, 0), (1, 1), (2, 2),
         (0, 1), (1, 0),
@@ -86,5 +92,28 @@ def test_mask_cache_hits():
     clear_mask_cache()
     m1 = build_task_mask("ppg2abp", L_SLOT)
     m2 = build_task_mask("ppg2abp", L_SLOT)
-    # lru_cache 命中时会返回同一个对象。
     assert m1 is m2
+
+
+@pytest.mark.parametrize("task", TASK_LIST, ids=lambda t: t.name)
+def test_mask_mod_matches_dense(task):
+    """``mask_mod`` 展开成 element-wise dense mask 应与 build_task_mask(bool) 一致。"""
+    spec = TASK_SPECS[task.name]
+    L_total = 3 * L_SLOT
+    mask_mod = _make_mask_mod(spec, L_SLOT)
+    flex_dense = create_mask(
+        mask_mod, B=1, H=1, Q_LEN=L_total, KV_LEN=L_total, device="cpu"
+    ).squeeze().bool()
+    reference = build_task_mask(task.name, L_SLOT, dtype=torch.bool)
+    assert flex_dense.shape == reference.shape
+    assert torch.equal(flex_dense, reference), (
+        f"Task {task.name}: flex mask_mod != build_task_mask(bool)"
+    )
+
+
+@pytest.mark.parametrize("task", TASK_LIST, ids=lambda t: t.name)
+def test_build_task_block_mask_returns_blockmask(task):
+    """`build_task_block_mask` 返回非空 BlockMask；BLOCK_SIZE 必须整除 3*L。"""
+    bm = build_task_block_mask(task.name, L_SLOT, BLOCK_SIZE=8)
+    # to_dense 给 block-level (num_blocks_q, num_blocks_kv) bool；至少有一个 True。
+    assert bm.to_dense().any()

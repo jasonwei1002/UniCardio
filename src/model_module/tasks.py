@@ -91,10 +91,9 @@ def get_task(name: str) -> TaskSpec:
 def active_task_pairs(
     weights_cfg: Mapping[str, float] | None,
 ) -> list[tuple[TaskSpec, float]]:
-    """返回权重 > 0 的 ``(task, weight)`` 对，用于训练 / 验证 / 评估。
+    """Return ``(task, weight)`` pairs with weight > 0.
 
-    权重为 0 视作"显式禁用该任务"；NaN / Inf / 负数直接 raise。训练采样、
-    val、evaluate 都以这里的返回值作为 active tasks，不再各自过滤。
+    Weight 0 disables the task; NaN/Inf/negative raises.
     """
     weights_cfg = weights_cfg or {}
     pairs: list[tuple[TaskSpec, float]] = []

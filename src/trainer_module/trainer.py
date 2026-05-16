@@ -1,10 +1,5 @@
-"""训练循环：按权重采样任务、Adam + cosine annealing (含 warmup)、按 epoch 保存 checkpoint。
-
-每个 batch 进行一次优化器更新：先从 ``TASK_LIST`` 中按权重随机采样一个任务，
-再对该任务调用 :func:`rf_train_step`。每个 epoch 结束时把按任务的滑动均值、
-学习率、epoch 耗时写入 CSV。验证（每 ``val_every`` 个 epoch 触发一次）会在
-验证集上计算 5 个任务的平均 RF 损失，并以此维护 ``best.pt``。
-"""
+"""Training loop: weighted task sampling, Adam + cosine annealing (optional
+warm restart), per-epoch checkpointing and CSV logging."""
 
 from __future__ import annotations
 
@@ -19,11 +14,13 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from torch import Tensor, nn
 from torch.optim import Adam, Optimizer
-from torch.optim.lr_scheduler import _LRScheduler
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+    CosineAnnealingWarmRestarts,
+    _LRScheduler,
+)
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-
-from cosine_annealing_warmup import CosineAnnealingWarmupRestarts
 
 from ..model_module.tasks import TASK_LIST, TaskSpec, active_task_pairs
 from ..utils.checkpoint import load_checkpoint, save_checkpoint, unwrap_model
@@ -40,14 +37,10 @@ def _amp_enabled(cfg: Mapping[str, Any], device: torch.device) -> bool:
 
 
 def _build_optimizer(model: nn.Module, cfg: Mapping[str, Any]) -> Optimizer:
-    # 只把 requires_grad=True 的参数交给 Adam：阶段二冻结 backbone 后，剩下的
-    # 张量上不会有 grad，传它们给 fused-Adam 在某些 PyTorch 版本会触发 zero-grad
-    # 兜底路径报错；显式过滤更干净。
+    # Filter frozen params (finetune stage); fused-Adam needs all-CUDA tensors.
     trainable = [p for p in model.parameters() if p.requires_grad]
     if not trainable:
         raise ValueError("No trainable parameters; check freeze configuration.")
-    # fused=True 走 CUDA 的多张量融合路径，单 step 比逐参数版本省可观的 launch 开销；
-    # CPU 上不支持，退回默认实现。
     fused = torch.cuda.is_available() and any(p.is_cuda for p in trainable)
     return Adam(
         trainable,
@@ -62,38 +55,36 @@ def _build_scheduler(
     cfg: Mapping[str, Any],
     total_steps: int,
 ) -> _LRScheduler:
-    """构造 step 级调度器：线性 warmup + cosine 退火（无 restart）。
-
-    使用 ``cosine_annealing_warmup.CosineAnnealingWarmupRestarts``（自带
-    warmup）。把 ``first_cycle_steps = total_steps`` 让整个训练留在第一个
-    cycle 内，就实现了"no restart"：warmup 阶段 lr 从 ``min_lr`` 线性升到
-    ``max_lr = cfg.lr``，之后剩余步数从 ``max_lr`` cosine 退火到 ``min_lr``。
-    整套调度按 step 推进，trainer 每个 step 后 ``scheduler.step()`` 一次。
-
-    Warmup 长度用 ``cfg.warmup_pct`` 配置，填 [0, 1) 的小数表示占总训练的
-    比例（例如 ``0.05`` 即 5%）。真正的 step 数在这里实时换算：
-    ``warmup_steps = round(warmup_pct * total_steps)``，这样 epochs / batch /
-    数据量变了，warmup 占比仍然保持不变。
-    """
+    """Step 级 cosine 调度；``first_cycle_pct < 1.0`` 时启用 warm restart。"""
     sched_cfg = cfg["lr_scheduler"]
     name = str(sched_cfg["name"]).lower()
     if name != "cosine":
         raise ValueError(f"Unsupported lr_scheduler '{name}'.")
 
-    warmup_pct = float(cfg.get("warmup_pct", 0.0))
-    if not 0.0 <= warmup_pct < 1.0:
+    min_lr = float(sched_cfg.get("min_lr", 0.0))
+    first_cycle_pct = float(sched_cfg.get("first_cycle_pct", 1.0))
+    if not 0.0 < first_cycle_pct <= 1.0:
         raise ValueError(
-            f"warmup_pct must be in [0, 1); got {warmup_pct}"
+            f"first_cycle_pct must be in (0, 1]; got {first_cycle_pct}"
         )
-    # CosineAnnealingWarmupRestarts 内部 assert warmup_steps < first_cycle_steps；
-    # round 在 warmup_pct → 1.0 时会把结果推到 total_steps 触发断言，在这里截断。
-    warmup_steps = min(int(round(warmup_pct * total_steps)), total_steps - 1)
-    return CosineAnnealingWarmupRestarts(
+
+    if first_cycle_pct >= 1.0:
+        return CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=min_lr)
+
+    cycle_mult = int(sched_cfg.get("cycle_mult", 1))
+    if cycle_mult < 1:
+        raise ValueError(f"cycle_mult must be a positive int; got {cycle_mult}")
+    first_cycle_steps = int(round(first_cycle_pct * total_steps))
+    if first_cycle_steps < 2:
+        raise ValueError(
+            f"first_cycle_pct * total_steps = {first_cycle_steps} < 2; "
+            f"increase first_cycle_pct (got {first_cycle_pct}) or total_steps."
+        )
+    return CosineAnnealingWarmRestarts(
         optimizer,
-        first_cycle_steps=total_steps,
-        max_lr=float(cfg["lr"]),
-        min_lr=float(sched_cfg.get("min_lr", 0.0)),
-        warmup_steps=warmup_steps,
+        T_0=first_cycle_steps,
+        T_mult=cycle_mult,
+        eta_min=min_lr,
     )
 
 
@@ -252,7 +243,6 @@ def train(
 
     best_val = float("inf")
     if init_from and stage == "pretrain":
-        # stage='finetune' 已在前面加载 + 冻结过，避免重复加载。
         load_checkpoint(init_from, model=model, map_location=device)
         logger.info("Initialized model from %s (fine-tune mode, fresh optim/sched)", init_from)
 
@@ -321,8 +311,6 @@ def train(
             else float("nan")
             for name in task_loss_sum
         }
-        # 直接读 optimizer 而不是 scheduler.get_last_lr()：CosineAnnealingWarmupRestarts
-        # 在 torch 2.7+ 下 __init__ 不一定给 _last_lr 赋值，访问会 AttributeError。
         lr_val = float(optimizer.param_groups[0]["lr"])
         logger.info(
             "epoch %d/%d | avg_loss %.6f | lr %.2e | %.1fs",
@@ -367,9 +355,6 @@ def train(
                 )
 
         csv_logger.log_mapping(row)
-        # epoch/ 与 val/ 前缀的 metric 用 epoch 作为 step，让 SwanLab chart 的
-        # 横轴显示 0, 1, 2, ...（epoch 数）。SwanLab 按 key 独立维护 step 计数，
-        # 不会与 batch 级 train/loss 的 global_step 冲突。
         epoch_metrics: dict[str, float] = {
             "epoch/avg_loss": avg,
             "epoch/lr": lr_val,
@@ -393,9 +378,6 @@ def train(
                 task_list=[t.name for t in active_tasks],
             )
 
-    # 阶段二：训练循环结束后用 best.pt 在独立 test split 上跑一次 RF loss 评估。
-    # 评估用 RF 速度损失（与 val 同口径，便于与 best_val 对齐）；如果需要
-    # RMSE/MAE/KS 等信号域指标，请单独跑 run/pipeline/evaluate.py。
     if stage == "finetune" and test_loader is not None:
         best_path = ckpt_dir / "best.pt"
         if best_path.exists():
@@ -423,7 +405,6 @@ def train(
                 **{f"finetune/test_loss_{name}": v for name, v in test_losses.items()},
             }
         )
-        # 在 CSV 里用 epoch=-1 这一行专门记录 finetune test 评估结果。
         csv_logger.log_mapping(
             {
                 "epoch": -1,
@@ -436,8 +417,6 @@ def train(
             }
         )
 
-        # 信号域 BP 指标：Euler 重建 → 反归一化 → max=SBP, min=DBP → vs CSV 标签。
-        # 与 RF loss 同 split、同 best.pt；写到独立的 CSV 文件以保持 loss.csv schema 干净。
         if bp_test_csv is not None:
             bp_results = evaluate_bp_test(
                 model, test_loader,

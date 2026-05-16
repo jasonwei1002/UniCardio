@@ -11,13 +11,15 @@
 #   bash finetune.sh <ckpt>                              # 默认 cfg
 #   bash finetune.sh <ckpt> trainer.lr=5e-5              # 改 lr
 #   bash finetune.sh <ckpt> trainer.finetune.n_unfrozen_blocks=1
-#   bash finetune.sh <ckpt> trainer.epochs=80 trainer.warmup_pct=0.05
+#   bash finetune.sh <ckpt> trainer.epochs=80
 #
 # 命令行透传的 overrides 会覆盖脚本里的默认值（Hydra 后到先得）。
 set -euo pipefail
 
 cd "$(dirname "$0")"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+# Hydra `hydra.run.dir` 通过 ${oc.env:UNICARDIO_STAGE,pretrain} 取这个变量做后缀。
+export UNICARDIO_STAGE=finetune
 
 CHECKPOINT="${1:-}"
 if [ -z "$CHECKPOINT" ] || [ ! -f "$CHECKPOINT" ]; then
@@ -32,17 +34,13 @@ LOG_FILE="logs/finetune_$(date +%Y%m%d_%H%M%S).log"
 echo "Stage-2 finetune from: $CHECKPOINT" | tee "$LOG_FILE"
 echo "Extra overrides: $*" | tee -a "$LOG_FILE"
 
-# 默认值说明：
-#   - trainer.stage=finetune：触发数据 mode + 模型冻结 + 末尾 test 评估
-#   - trainer.lr=1e-4：阶段一是 1e-3；微调小数据 + 部分参数，调小一档
-#   - trainer.warmup_pct=0.02：finetune 数据少、epoch 少，适当放大 warmup 占比
-#   - trainer.epochs=50：经验值，按 CalFree 80% 训练集大小自行调
+# trainer.lr=1e-4：pretrain 是 1e-3；微调小数据 + 部分参数，调小一档。
+# trainer.epochs=50：经验值，按 CalFree 80% 训练集大小自行调。
 python run/pipeline/train.py \
     trainer.stage=finetune \
     trainer.init_from="$CHECKPOINT" \
     trainer.finetune.n_unfrozen_blocks=2 \
     trainer.lr=1.0e-4 \
-    trainer.warmup_pct=0.02 \
     trainer.epochs=50 \
     device=cuda \
     data.batch_size=256 \

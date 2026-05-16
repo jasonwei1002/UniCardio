@@ -31,9 +31,12 @@ swanlab:
 
 hydra:
   run:
-    dir: run/outputs/${now:%Y-%m-%d_%H-%M-%S}
+    # 目录名带 stage 后缀（pretrain / finetune），ls run/outputs/ 一眼分辨。
+    # hydra.run.dir 在主 cfg 合并之前解析，无法直接引用 ${trainer.stage}；
+    # 改读环境变量 UNICARDIO_STAGE，由 train.sh / finetune.sh export，默认 pretrain。
+    dir: run/outputs/${now:%Y-%m-%d_%H-%M-%S}_${oc.env:UNICARDIO_STAGE,pretrain}
   sweep:
-    dir: run/outputs/sweep_${now:%Y-%m-%d_%H-%M-%S}
+    dir: run/outputs/sweep_${now:%Y-%m-%d_%H-%M-%S}_${oc.env:UNICARDIO_STAGE,pretrain}
     subdir: ${hydra.job.num}
   job:
     chdir: false

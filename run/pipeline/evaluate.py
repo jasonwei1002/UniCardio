@@ -93,7 +93,6 @@ def main(cfg: DictConfig) -> None:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
-    # 必须通过 +checkpoint=... 显式传入 checkpoint 路径。
     if "checkpoint" not in cfg:
         raise ValueError(
             "Pass +checkpoint=path/to/best.pt to evaluate.py."
@@ -114,7 +113,6 @@ def main(cfg: DictConfig) -> None:
     if limit_batches is not None:
         limit_batches = int(limit_batches)
 
-    # 与训练保持一致：权重为 0 的任务不参与评估。
     active_tasks = [spec for spec, _ in active_task_pairs(
         cfg.trainer.task_weights
     )]

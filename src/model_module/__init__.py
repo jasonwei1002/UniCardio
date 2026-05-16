@@ -1,6 +1,6 @@
 """UniCardio Rectified Flow 模型组件。"""
 
-from .attention_masks import build_task_mask
+from .attention_masks import build_task_block_mask, build_task_mask
 from .backbone import UniCardioBackbone
 from .embeddings import FlowTimeEmbedding, SignalEncoder
 from .residual_block import ResidualBlock
@@ -17,5 +17,6 @@ __all__ = [
     "TaskSpec",
     "UniCardioBackbone",
     "UniCardioRF",
+    "build_task_block_mask",
     "build_task_mask",
 ]

@@ -1,10 +1,5 @@
-"""Rectified Flow 推断阶段的 Euler ODE 采样器。
-
-约定 Lipman 方向：``t = 0`` 噪声，``t = 1`` 数据。给定干净条件 slot 和任务
-描述后，用学到的速度场做 Euler 积分，从 ``t = 0`` 积到 ``t = 1``，步数固定。
-默认 ``n_steps = 8`` 参照 Rectified Flow 论文的观察：4~16 步已经能在
-同类任务上逼近多步扩散采样器的质量，可通过 sampler 配置继续调整。
-"""
+"""Euler ODE sampler for Rectified Flow inference (integrates ``v_theta`` from
+``t=0`` to ``t=1`` under Lipman convention)."""
 
 from __future__ import annotations
 
@@ -13,7 +8,7 @@ from typing import Tuple
 import torch
 from torch import Tensor, nn
 
-from ..model_module.attention_masks import build_task_mask
+from ..model_module.attention_masks import select_task_mask
 from ..model_module.tasks import TaskSpec
 from .rectified_flow import assemble_x_full
 
@@ -57,18 +52,15 @@ def euler_sample(
     B, _, L = conditions.shape
     target = int(task.target_slot)
     conditions = conditions.to(device)
-    # mask 只与 (task.name, L, device, dtype) 有关，n_steps 个步骤共用一份。
-    mask = build_task_mask(
-        task.name, L, device=str(device), dtype=torch.bool
-    )
+    mask = select_task_mask(task.name, L, device)
 
-    x = torch.randn(B, 1, L, device=device)  # x_{t=0} ~ N(0, I)
+    x = torch.randn(B, 1, L, device=device)
     ts = torch.linspace(0.0, 1.0, n_steps + 1, device=device)
     traj: list[Tensor] = [x.clone()] if return_trajectory else []
 
     for i in range(n_steps):
         t_cur, t_next = ts[i], ts[i + 1]
-        dt = t_next - t_cur  # 正值
+        dt = t_next - t_cur
         t_b = torch.full((B,), float(t_cur), device=device)
         x_full = assemble_x_full(conditions, x, target_slot=target, L=L)
         v = model(x_full, t_b, mask, target)
