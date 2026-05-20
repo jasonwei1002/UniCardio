@@ -39,3 +39,7 @@ venv/
 .vscode/
 .idea/
 reports/
+
+# Reference papers (PDFs, copyrighted material)
+*.pdf
+paper reference/
