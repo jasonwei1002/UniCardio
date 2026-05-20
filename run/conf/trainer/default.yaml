@@ -16,7 +16,7 @@ lr_scheduler:
   # 1.0 = single cosine (CosineAnnealingLR). <1.0 = warm restart
   # (CosineAnnealingWarmRestarts); each restart returns to peak lr
   # (torch has no peak decay).
-  first_cycle_pct: 0.5
+  first_cycle_pct: 1.0
   # Integer cycle-length multiplier; only used when first_cycle_pct < 1.0.
   # 1 = equal cycles; 2 = doubling (SGDR original).
   cycle_mult: 1

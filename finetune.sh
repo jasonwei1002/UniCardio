@@ -41,7 +41,7 @@ python run/pipeline/train.py \
     trainer.init_from="$CHECKPOINT" \
     trainer.finetune.n_unfrozen_blocks=2 \
     trainer.lr=1.0e-4 \
-    trainer.epochs=50 \
+    trainer.epochs=100 \
     device=cuda \
     data.batch_size=256 \
     data.num_workers=8 \
