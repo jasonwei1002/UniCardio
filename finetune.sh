@@ -3,7 +3,9 @@
 #
 # 行为：
 #   - 加载阶段一 ckpt 仅模型权重（optimizer/scheduler/epoch 全新）
-#   - 冻结 backbone，仅微调最后 2 个 ResidualBlock + 全部 output_heads
+#   - 冻结 stem（SignalEncoder + LayerNorm + FlowTimeEmbedding），全部 5 个
+#     ResidualBlock + output_heads 解冻；对齐 MD-ViSCo 的 calibration-based 全微调
+#     协议，给 per-subject BP 映射留足容量。
 #   - 数据集走 mode='finetune'：CalFree_Test_Subset.npy 内部 80/10/10 划分
 #   - 训练完成后自动在 10% test 上跑一次 RF loss 评估并写 SwanLab + CSV
 #
@@ -39,7 +41,7 @@ echo "Extra overrides: $*" | tee -a "$LOG_FILE"
 python run/pipeline/train.py \
     trainer.stage=finetune \
     trainer.init_from="$CHECKPOINT" \
-    trainer.finetune.n_unfrozen_blocks=2 \
+    trainer.finetune.n_unfrozen_blocks=5 \
     trainer.lr=1.0e-4 \
     trainer.epochs=100 \
     device=cuda \
