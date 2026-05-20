@@ -20,6 +20,27 @@ Training objective is **Rectified Flow** with the **Lipman Flow-Matching time co
 
 See `reports/diffusion-rectified-flow-expressive-cascade.md` for the refactor plan and architectural decisions.
 
+## Benchmark Reference (MD-ViSCo, IEEE JBHI 2026)
+
+Direct point of comparison: **MD-ViSCo** (Meyer et al., KAIST; `paper reference/MD-ViSCo_*.pdf`, arXiv 2506.08357, github `fr-meyer/MD-ViSCo`). UniCardio targets the same multi-directional vital-sign waveform conversion problem on the same PulseDB benchmark, with the same evaluation protocol — only the modeling paradigm differs.
+
+| Axis | MD-ViSCo | UniCardio |
+|------|----------|-----------|
+| Conversion direction | any-to-any across {ECG, PPG, ABP} | 5 task pairs (3 ABP-target active by default) |
+| Modeling paradigm | Deterministic 1D U-Net + Swin Transformer encoder/decoder + AdaIN style injection (target type as style indicator); two-stage approximation + refinement (refinement = PatchTSMixer SBP/DBP regression + linear rescale to mmHg) | **Rectified Flow** velocity prediction with Lipman/SD3 logit-normal `t` sampling; single backbone, no explicit refinement head; ABP recovered from normalized output by inverse of `(x-100)/50` |
+| Slot/channel scheme | Single-channel input + one-hot target-domain selector `d^{(j)}` fed through AdaIN `(γ, β)` | 3-slot concatenated `(ECG, PPG, ABP)` input + per-task attention mask + indexed per-slot output head |
+| Datasets | PulseDB (VitalDB + MIMIC-III, ~5.2 M segments, 5 361 patients, 125 Hz, 1 280-pt segments) + UCI (MIMIC-II) | PulseDB only — `data/pulsedb/Train_Subset.npy` (2 506 subjects, 902 160 samples) + `data/pulsedb/CalFree_Test_Subset.npy` (279 subjects, 111 600 samples). **Zero subject overlap between Train_Subset and CalFree.** Slot length L=1 250 (10 s @ 125 Hz). |
+| Pretrain protocol | **Patient-level (subject-disjoint) split** — "ensuring that the train and test sets contain no overlapping patients to assess whether the model generalizes to entirely unseen patients" | Stage-1 `mode='pretrain'`: `Train_Subset.npy` 80/20 train/val, `CalFree_Test_Subset.npy` as held-out test. Equivalent to MD-ViSCo's calibration-free pretrain. |
+| Finetune protocol | "**Calibration-based** setting where the same patient may appear in both training and test sets" — original test set is re-split into new train/val/test | Stage-2 `mode='finetune'`: `CalFree_Test_Subset.npy` 80/10/10 sample-level split (subjects intentionally shared across train/val/test). Equivalent to MD-ViSCo's calibration-based finetune. |
+| Reported metric | MSE + MAE on normalized waveform; AAMI/BHS on ABP in mmHg | RF velocity MSE during training; `evaluate_bp_test` reports per-task SBP/DBP ME+SD in mmHg on the stage-2 test split |
+
+**Implications for code reviewers and future Claude instances:**
+
+1. **The sample-level split inside stage-2 is by design, not a leakage bug.** It mirrors MD-ViSCo's calibration-based protocol and the standard PulseDB CalFree finetune recipe. Do not "fix" it to subject-disjoint without first reading this section.
+2. **Stage-2 best.pt is selected on subjects already seen during stage-2 training.** That is the personalized BP setting — absolute mmHg accuracy in clinical workflows requires per-patient calibration, which is what this stage models.
+3. **Stage-1 already gives calibration-free generalization signal** because `CalFree_Test_Subset.npy` (subject-disjoint from `Train_Subset`) is the stage-1 test split.
+4. **`SignalEncoder` is modality-physics-level** (multi-scale Conv1d on raw ECG/PPG/ABP) and generalizes across subjects by construction; the per-subject mapping lives in the 5 ResidualBlocks and per-slot output heads, which is why `freeze_for_finetune(n_unfrozen_blocks)` exposes the transformer-block freeze depth but keeps the stem frozen by default.
+
 ## Development Environment
 
 Hard rules — do not deviate without asking:
@@ -186,8 +207,8 @@ DataLoader uses `persistent_workers=True` + `prefetch_factor=4`; `train`/`val` s
 
 ### Two-stage training (`trainer.stage`)
 
-- **`pretrain`** (default, `bash train.sh`): standard full training on the pulsedb `Train_Subset.npy` 80/20 split.
-- **`finetune`** (`bash finetune.sh <stage1 ckpt>`): loads `trainer.init_from` model weights → `UniCardioRF.freeze_for_finetune(n)` freezes the backbone stem and unfreezes only the last `trainer.finetune.n_unfrozen_blocks` `ResidualBlock`s plus all `output_heads` → fused Adam is built **after** the freeze, so `param_groups` only see trainable tensors. Data switches to `mode='finetune'` (CalFree 80/10/10). After the last epoch, `best.pt` is reloaded and `bp_metrics.evaluate_bp_test` runs an 8-step Euler sampler on the test split, logging per-task SBP/DBP ME+SD (mmHg) to SwanLab + `logs/finetune_bp_metrics.csv`.
+- **`pretrain`** (default, `bash train.sh`) = MD-ViSCo's **calibration-free** stage: full training on `Train_Subset.npy` 80/20 split. Stage-1 test = `CalFree_Test_Subset.npy` (subject-disjoint from Train_Subset, so this is a true generalization-to-unseen-patient evaluation).
+- **`finetune`** (`bash finetune.sh <stage1 ckpt>`) = MD-ViSCo's **calibration-based** stage: loads `trainer.init_from` model weights → `UniCardioRF.freeze_for_finetune(n)` freezes the stem (`SignalEncoder` + LayerNorm + FlowTimeEmbedding) and unfreezes the last `trainer.finetune.n_unfrozen_blocks` `ResidualBlock`s plus all `output_heads` → fused Adam is built **after** the freeze, so `param_groups` only see trainable tensors. Data switches to `mode='finetune'` (CalFree 80/10/10 **sample-level**, so subjects are intentionally shared across train/val/test — this is the per-patient calibration model, not a leakage bug). After the last epoch, `best.pt` is reloaded and `bp_metrics.evaluate_bp_test` runs an 8-step Euler sampler on the stage-2 test split, logging per-task SBP/DBP ME+SD (mmHg) to SwanLab + `logs/finetune_bp_metrics.csv`. Set `trainer.finetune.n_unfrozen_blocks=5` to fully unfreeze the transformer (closest to MD-ViSCo's reported full-model finetune); stem stays frozen because it captures modality physics that does not need per-subject adaptation.
 
 ### Inference API
 
