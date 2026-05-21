@@ -79,6 +79,12 @@ def _run_overfit(
 
     torch.manual_seed(0)
     batch = torch.randn(SMOKE_BATCH, 3, SMOKE_SLOT_LENGTH, device=device)
+    # Path A: ABP slot must be per-sample minmax-normalized to [0, 1] so the
+    # smoke test exercises the same target distribution as production.
+    abp = batch[:, 2, :]
+    abp_min = abp.min(dim=-1, keepdim=True).values
+    abp_max = abp.max(dim=-1, keepdim=True).values
+    batch[:, 2, :] = (abp - abp_min) / (abp_max - abp_min).clamp(min=1e-6)
 
     model.train()
     losses: list[float] = []

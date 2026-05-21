@@ -1,9 +1,16 @@
-"""评估入口：加载 checkpoint 并对全部 5 个任务打分。
+"""Path A 评估入口：加载 RF ckpt（+ 可选 BPHead ckpt）并对所有任务打分。
 
-示例：
+例：
+    # ABP-target 任务在 mmHg 量纲下报指标（推荐）：
     python run/pipeline/evaluate.py \
-        +checkpoint=run/outputs/2026-04-20_21-00-00/checkpoints/best.pt \
-        device=cpu data.num_workers=0 eval.limit_batches=4
+        +checkpoint=run/outputs/<rf>/checkpoints/best.pt \
+        +bp_head_checkpoint=run/outputs/<bp_head>/checkpoints/best.pt \
+        device=cuda data.num_workers=8
+
+    # 仅 RF，ABP 输出留在 [0, 1] shape 空间（Pearson 仍然可比，
+    # RMSE / MAE 是无量纲量）：
+    python run/pipeline/evaluate.py \
+        +checkpoint=run/outputs/<rf>/checkpoints/best.pt
 """
 
 from __future__ import annotations
@@ -16,7 +23,7 @@ from pathlib import Path
 import hydra
 import numpy as np
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from tqdm import tqdm
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -26,10 +33,11 @@ if str(_REPO_ROOT) not in sys.path:
 from src.data_module.datamodule import build_loaders
 from src.model_module.tasks import Slot, active_task_pairs
 from src.model_module.unicardio_rf import UniCardioRF
+from src.trainer_module.bp_metrics import load_bp_head_ckpt
 from src.trainer_module.sampler import euler_sample
 from src.utils.checkpoint import load_checkpoint
 from src.utils.metrics import ks_statistic, mae, pearson_corr, rmse
-from src.utils.normalization import bp_denormalize
+from src.utils.normalization import reconstruct_mmHg
 from src.utils.seed import set_seed
 
 logger = logging.getLogger(__name__)
@@ -41,18 +49,10 @@ def _resolve_device(name: str) -> torch.device:
     return torch.device(name)
 
 
-def _maybe_denormalize(
-    tensor: torch.Tensor, target_slot: int
-) -> torch.Tensor:
-    """对 ABP 做 BP 反归一化，使指标以物理单位（mmHg）给出。"""
-    if target_slot == int(Slot.ABP):
-        return bp_denormalize(tensor)
-    return tensor
-
-
 @torch.no_grad()
 def _eval_task(
-    model: torch.nn.Module,
+    rf_model: torch.nn.Module,
+    bp_head: torch.nn.Module | None,
     loader,
     task,
     *,
@@ -60,10 +60,16 @@ def _eval_task(
     n_steps: int,
     limit_batches: int | None,
 ) -> dict[str, float]:
+    """Per-task waveform metrics.
+
+    For ABP-target tasks under Path A: if ``bp_head`` is provided, both
+    pred and target waveforms are reconstructed to mmHg via the predicted
+    ``(SBP, DBP)`` (pred) and the ground-truth ``(SBP, DBP)`` (target).
+    Otherwise both stay in shape-only ``[0, 1]`` and only Pearson is
+    physically meaningful.
+    """
     preds: list[np.ndarray] = []
     targets: list[np.ndarray] = []
-    # total 优先取 limit_batches，否则取 loader 长度 — 否则 tqdm 在 break
-    # 退出时会停在 "73%" 之类的不完整状态。
     total = limit_batches if limit_batches is not None else len(loader)
     pbar = tqdm(
         loader,
@@ -72,12 +78,19 @@ def _eval_task(
         mininterval=5.0,
         maxinterval=50.0,
     )
+    is_abp = int(task.target_slot) == int(Slot.ABP)
     for batch_idx, batch in enumerate(pbar):
         signal = batch[0].to(device)
+        sbp_dbp_true = batch[1].to(device) if len(batch) > 1 else None
         target = signal[:, int(task.target_slot):int(task.target_slot) + 1, :]
-        pred = euler_sample(model, signal, task, n_steps=n_steps, device=device)
-        pred = _maybe_denormalize(pred, int(task.target_slot))
-        target = _maybe_denormalize(target, int(task.target_slot))
+        pred = euler_sample(rf_model, signal, task, n_steps=n_steps, device=device)
+
+        if is_abp and bp_head is not None and sbp_dbp_true is not None:
+            bp_pred = bp_head(signal[:, :2, :]).float()
+            sbp_p, dbp_p = bp_pred[:, 0], bp_pred[:, 1]
+            sbp_t, dbp_t = sbp_dbp_true[:, 0], sbp_dbp_true[:, 1]
+            pred = reconstruct_mmHg(pred.squeeze(1), sbp_p, dbp_p).unsqueeze(1)
+            target = reconstruct_mmHg(target.squeeze(1), sbp_t, dbp_t).unsqueeze(1)
         preds.append(pred.cpu().numpy())
         targets.append(target.cpu().numpy())
         if limit_batches is not None and (batch_idx + 1) >= limit_batches:
@@ -105,9 +118,7 @@ def main(cfg: DictConfig) -> None:
     )
 
     if "checkpoint" not in cfg:
-        raise ValueError(
-            "Pass +checkpoint=path/to/best.pt to evaluate.py."
-        )
+        raise ValueError("Pass +checkpoint=path/to/best.pt to evaluate.py.")
 
     set_seed(int(cfg.seed), deterministic=bool(cfg.deterministic))
     device = _resolve_device(str(cfg.device))
@@ -115,18 +126,27 @@ def main(cfg: DictConfig) -> None:
 
     _, _, test_loader = build_loaders(cfg.data)
 
-    model = UniCardioRF(cfg.model)
-    load_checkpoint(cfg.checkpoint, model=model, map_location=device)
-    model.to(device).eval()
+    rf_model = UniCardioRF(cfg.model)
+    load_checkpoint(cfg.checkpoint, model=rf_model, map_location=device)
+    rf_model.to(device).eval()
+
+    bp_head_ckpt = cfg.get("bp_head_checkpoint", None)
+    bp_head = None
+    if bp_head_ckpt is not None:
+        bp_head = load_bp_head_ckpt(str(bp_head_ckpt), device)
+        logger.info("BPHead loaded from %s; ABP-target metrics in mmHg.", bp_head_ckpt)
+    else:
+        logger.warning(
+            "No +bp_head_checkpoint provided; ABP-target metrics stay in "
+            "shape-only [0, 1] space (Pearson still valid; RMSE/MAE unit-less)."
+        )
 
     n_steps = int(cfg.sampler.n_steps)
     limit_batches = cfg.get("eval", {}).get("limit_batches", None)
     if limit_batches is not None:
         limit_batches = int(limit_batches)
 
-    active_tasks = [spec for spec, _ in active_task_pairs(
-        cfg.trainer.task_weights
-    )]
+    active_tasks = [spec for spec, _ in active_task_pairs(cfg.trainer.task_weights)]
     logger.info("Active tasks: %s", [t.name for t in active_tasks])
 
     out_dir = Path(cfg.output_dir)
@@ -138,29 +158,19 @@ def main(cfg: DictConfig) -> None:
         for task in active_tasks:
             logger.info("Evaluating task %s", task.name)
             metrics = _eval_task(
-                model,
-                test_loader,
-                task,
-                device=device,
-                n_steps=n_steps,
-                limit_batches=limit_batches,
+                rf_model, bp_head, test_loader, task,
+                device=device, n_steps=n_steps, limit_batches=limit_batches,
             )
             writer.writerow([
                 task.name,
-                metrics["rmse"],
-                metrics["mae"],
-                metrics["pearson"],
-                metrics["ks"],
-                metrics["n"],
+                metrics["rmse"], metrics["mae"],
+                metrics["pearson"], metrics["ks"], metrics["n"],
             ])
             logger.info(
                 "%s | rmse=%.4f | mae=%.4f | pearson=%.4f | ks=%.4f | n=%d",
                 task.name,
-                metrics["rmse"],
-                metrics["mae"],
-                metrics["pearson"],
-                metrics["ks"],
-                metrics["n"],
+                metrics["rmse"], metrics["mae"],
+                metrics["pearson"], metrics["ks"], metrics["n"],
             )
     logger.info("Wrote %s", out_csv)
 

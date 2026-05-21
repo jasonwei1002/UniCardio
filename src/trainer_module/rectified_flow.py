@@ -1,5 +1,12 @@
 """Rectified Flow training step under Lipman convention (``t=0`` noise,
-``t=1`` data). Time sampling is SD3-style logit-normal."""
+``t=1`` data). Time sampling is SD3-style logit-normal.
+
+Path A convention: ``x1 = batch_signal[:, target_slot, :]`` for ABP-target
+tasks is **per-sample min-max normalized to [0, 1]** (shape only), not the
+legacy global ``(x - 100) / 50``. The velocity field therefore learns
+shape geometry; absolute SBP/DBP is recovered by the separate ``BPHead``
+at inference time via :func:`src.utils.normalization.reconstruct_mmHg`.
+"""
 
 from __future__ import annotations
 

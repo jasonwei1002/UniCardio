@@ -181,7 +181,9 @@ def train(
     Args:
         model: :class:`UniCardioRF`（或由 :class:`nn.DataParallel` 等包裹过的版本）。
         cfg: 训练器配置（OmegaConf DictConfig 或普通 dict 均可）。
-        train_loader: 产出 ``(signal,)`` 的 DataLoader，signal 形状 ``(B, 3, L)``。
+        train_loader: 产出 ``(signal, sbp_dbp)`` 的 DataLoader（Path A 契约）。
+            signal 形状 ``(B, 3, L)``，ABP slot 已 per-sample minmax 到 [0,1]。
+            RF 训练只用 signal，忽略 sbp_dbp（后者属于 Stream 2 BP head）。
         val_loader: 可选的验证 loader，需满足相同的输出契约。
         device: PyTorch device。
         output_dir: 本次运行的输出目录（由 Hydra 创建）。
@@ -463,6 +465,7 @@ def train(
         )
 
         if bp_test_csv is not None:
+            bp_head_ckpt = cfg_dict.get("bp_head_ckpt")
             bp_results = evaluate_bp_test(
                 model, test_loader,
                 tasks=active_tasks,
@@ -470,6 +473,7 @@ def train(
                 n_steps=sampler_n_steps,
                 device=device,
                 amp_enabled=amp_enabled,
+                bp_head_ckpt=bp_head_ckpt,
             )
             bp_swan: dict[str, float] = {}
             for task_name, m in bp_results.items():
