@@ -158,6 +158,27 @@ def build_loaders(
         test_spec[1].size,
     )
 
+    # Path A: CSV-derived (sbp/dbp + demographics) tables are computed once
+    # per unique .npy and shared across train/val/test datasets that source
+    # from the same file. The first CardiacDataset built per path populates
+    # the tables; subsequent ones reuse them (avoids re-parsing 902k-row CSV
+    # twice for pulsedb-pretrain train+val splits).
+    _shared_tables: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
+    def _make_dataset(spec: _DatasetSpec) -> CardiacDataset:
+        path, indices, perm = spec
+        cached = _shared_tables.get(path)
+        if cached is None:
+            ds = CardiacDataset(path, indices, perm)
+            _shared_tables[path] = (ds.bp_labels_table, ds.demographics_table)
+            return ds
+        bp_tbl, demo_tbl = cached
+        return CardiacDataset(
+            path, indices, perm,
+            bp_labels_table=bp_tbl,
+            demographics_table=demo_tbl,
+        )
+
     batch_size = int(cfg.get("batch_size", 128))
     num_workers = (
         num_workers_override
@@ -182,12 +203,12 @@ def build_loaders(
     # batch 上重 trace。val 损失的尾样本量极小（≤ batch_size-1 / 20000 < 0.16%），
     # 远小于评估的统计误差。test 单跑、不走 compile，保留全样本。
     train_loader = DataLoader(
-        CardiacDataset(*train_spec), shuffle=True, drop_last=True, **loader_kwargs
+        _make_dataset(train_spec), shuffle=True, drop_last=True, **loader_kwargs
     )
     val_loader = DataLoader(
-        CardiacDataset(*val_spec), shuffle=False, drop_last=True, **loader_kwargs
+        _make_dataset(val_spec), shuffle=False, drop_last=True, **loader_kwargs
     )
     test_loader = DataLoader(
-        CardiacDataset(*test_spec), shuffle=False, **loader_kwargs
+        _make_dataset(test_spec), shuffle=False, **loader_kwargs
     )
     return train_loader, val_loader, test_loader
