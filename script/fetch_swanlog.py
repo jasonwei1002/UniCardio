@@ -27,6 +27,7 @@ import argparse
 import json
 import logging
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -64,9 +65,21 @@ def _format_created_at(created_at: Any) -> str:
 
 
 def _metric_keys() -> list[str]:
-    """与 trainer.py 里 swanlab.log 记录的 key 对齐。"""
+    """Curated superset of all SwanLab keys logged by trainers in this repo.
+
+    SwanLab Python API 0.7.x does not expose enumeration of a run's
+    logged keys (``run.metrics`` requires explicit ``keys=`` and there is
+    no ``run.summary`` / ``run.metric_keys``). To keep ``/swanlog`` generic
+    across trainers we list every key any trainer ever logs. The per-key
+    fetch in :func:`_fetch_metrics` silently skips 404s, so listing keys
+    absent from the current run costs nothing.
+
+    Add a trainer's keys here when a new training script is added; or
+    pass ``--extra-keys`` on the CLI for one-off ad-hoc keys.
+    """
     task_names = [t.name for t in TASK_LIST]
     return [
+        # ---- RF backbone (src/trainer_module/trainer.py) ----
         "train/loss",
         "train/lr",
         *[f"train/loss_{n}" for n in task_names],
@@ -76,27 +89,58 @@ def _metric_keys() -> list[str]:
         *[f"epoch/loss_{n}" for n in task_names],
         "val/loss_mean",
         *[f"val/loss_{n}" for n in task_names],
+        # ---- RF stage-2 finetune BP metric (src/trainer_module/bp_metrics.py) ----
+        *[
+            f"finetune/bp_{n}_{stat}"
+            for n in task_names
+            for stat in ("sbp_me", "sbp_sd", "dbp_me", "dbp_sd", "n")
+        ],
+        # ---- BP head (src/trainer_module/bp_head_trainer.py) ----
+        "epoch/train_loss",
+        "val/loss",
+        "val/mae_sbp", "val/mae_dbp", "val/mae_mean",
+        "val/me_sbp",  "val/me_dbp",
+        "val/sd_sbp",  "val/sd_dbp",
+        "test/loss",
+        "test/mae_sbp", "test/mae_dbp", "test/mae_mean",
+        "test/me_sbp",  "test/me_dbp",
+        "test/sd_sbp",  "test/sd_dbp",
     ]
 
 
-def _fetch_metrics(run: Any, keys: list[str]) -> pd.DataFrame:
-    """按 key 逐个拉取 metrics，遇到 404（该 key 不存在于此实验）就跳过。
+def _fetch_one(run: Any, key: str) -> tuple[str, pd.DataFrame | None]:
+    """Pull a single metric key; ``(key, None)`` on 404 / empty."""
+    try:
+        df = run.metrics(keys=[key], x_axis="step")
+    except ApiError as exc:
+        if "404" in str(exc):
+            return key, None
+        raise
+    if df is None or df.empty:
+        return key, None
+    return key, df
 
-    任务权重为 0 的任务不会被训练循环记录到 SwanLab，批量请求会因为单个
-    404 整体失败；逐 key 请求并合并可以兼容 3 任务 / 5 任务两种 run。
+
+def _fetch_metrics(
+    run: Any, keys: list[str], max_workers: int = 8
+) -> pd.DataFrame:
+    """Concurrently fetch each key; 404 keys are skipped silently.
+
+    SwanLab batch requests fail entirely on any missing key, so per-key
+    fetch + 404 tolerance is still required. Concurrency cuts wall time
+    from O(n_keys * latency) to O(n_keys / workers * latency); for ~30
+    keys at ~0.5 s each that goes from ~15 s to ~2 s at workers=8.
     """
     frames: list[pd.DataFrame] = []
     missing: list[str] = []
-    for key in keys:
-        try:
-            df = run.metrics(keys=[key], x_axis="step")
-        except ApiError as exc:
-            if "404" in str(exc):
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_fetch_one, run, k): k for k in keys}
+        for fut in as_completed(futures):
+            key, df = fut.result()
+            if df is None:
                 missing.append(key)
-                continue
-            raise
-        if df is not None and not df.empty:
-            frames.append(df)
+            else:
+                frames.append(df)
     if missing:
         logger.info("skipped %d missing keys: %s", len(missing), missing)
     if not frames:
@@ -176,6 +220,14 @@ def main() -> None:
             "（Asia/Singapore 时区）"
         ),
     )
+    parser.add_argument(
+        "--extra-keys", default="",
+        help=(
+            "逗号分隔的额外 SwanLab metric key，追加到内置 superset。"
+            "新增 trainer 但还没把 key 加进 _metric_keys() 时可用。"
+            "示例：--extra-keys 'val/custom_metric,test/foo'"
+        ),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -196,13 +248,21 @@ def main() -> None:
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    df = _fetch_metrics(run, _metric_keys())
+    keys = _metric_keys()
+    extra = [k.strip() for k in args.extra_keys.split(",") if k.strip()]
+    if extra:
+        keys.extend(extra)
+        logger.info("appended %d extra keys: %s", len(extra), extra)
+
+    df = _fetch_metrics(run, keys)
     metrics_path = out_dir / "metrics.csv"
     df.to_csv(metrics_path, index=True)
+    value_cols = [c for c in df.columns if not c.endswith("_timestamp")]
     logger.info(
-        "metrics: %d rows × %d cols -> %s",
-        len(df), len(df.columns), metrics_path.name,
+        "metrics: %d rows × %d cols (%d value cols) -> %s",
+        len(df), len(df.columns), len(value_cols), metrics_path.name,
     )
+    logger.info("value cols: %s", value_cols)
 
     (out_dir / "run_info.json").write_text(
         json.dumps(
