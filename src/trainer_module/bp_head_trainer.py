@@ -35,6 +35,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from ..utils.checkpoint import load_checkpoint, save_checkpoint
+from ..utils.normalization import BPLabelNorm
 from .csv_logger import SimpleCSVLogger
 
 logger = logging.getLogger(__name__)
@@ -116,11 +117,16 @@ def _evaluate(
     *,
     amp_enabled: bool,
     max_batches: int | None = None,
+    bp_norm: BPLabelNorm | None = None,
 ) -> dict[str, float]:
-    """Return MSE loss, per-channel MAE, signed ME, and SD (mmHg) on the val set.
+    """Return MSE loss + per-channel MAE / ME / SD on the val set.
 
-    AAMI-compatible metrics: ME = mean(pred - target), SD = population
-    std of (pred - target). Reported per channel (SBP, DBP).
+    ``loss`` is MSE in whichever space the dataset emits labels (raw mmHg if
+    ``bp_norm is None``; otherwise globally min-max normalized [0, 1]
+    following MD-ViSCo Sec III.D). MAE / ME / SD are always reported in
+    **mmHg** by inverting the normalization on the residual — so AAMI
+    thresholds (|ME| ≤ 5, σ ≤ 8) read off the same units regardless of
+    training space. ME = mean(pred − target); SD = population std of same.
     """
     model.eval()
     loss_sum = 0.0
@@ -139,12 +145,15 @@ def _evaluate(
             pred = model(signal[:, :2, :], demographics)
         diff = pred.float() - target.float()
         loss_sum += float((diff**2).mean(dim=-1).sum().item())
-        mae_sbp_sum += float(diff[:, 0].abs().sum().item())
-        mae_dbp_sum += float(diff[:, 1].abs().sum().item())
-        me_sbp_sum += float(diff[:, 0].sum().item())
-        me_dbp_sum += float(diff[:, 1].sum().item())
-        sq_sbp_sum += float((diff[:, 0] ** 2).sum().item())
-        sq_dbp_sum += float((diff[:, 1] ** 2).sum().item())
+        # AAMI-style metrics always in mmHg. ``vmin`` cancels on a residual,
+        # so multiply by scale only; skip alloc when norm is off.
+        diff_mmhg = bp_norm.denormalize_diff(diff) if bp_norm is not None else diff
+        mae_sbp_sum += float(diff_mmhg[:, 0].abs().sum().item())
+        mae_dbp_sum += float(diff_mmhg[:, 1].abs().sum().item())
+        me_sbp_sum += float(diff_mmhg[:, 0].sum().item())
+        me_dbp_sum += float(diff_mmhg[:, 1].sum().item())
+        sq_sbp_sum += float((diff_mmhg[:, 0] ** 2).sum().item())
+        sq_dbp_sum += float((diff_mmhg[:, 1] ** 2).sum().item())
         n_samples += int(target.shape[0])
         if max_batches is not None and (batch_idx + 1) >= max_batches:
             break
@@ -175,6 +184,7 @@ def train(
     device: torch.device,
     output_dir: str | Path,
     test_loader: DataLoader | None = None,
+    bp_norm: BPLabelNorm | None = None,
 ) -> None:
     """Train the BP head end-to-end.
 
@@ -185,6 +195,9 @@ def train(
             ``(signal, sbp_dbp)`` 2-tuples (see Path A data contract).
         device: torch device.
         output_dir: Hydra-created run directory.
+        bp_norm: when set, dataset labels are in globally min-max normalized
+            [0, 1] (MD-ViSCo Sec III.D); ``_evaluate`` inverses to mmHg for
+            AAMI metric reporting. ``None`` = raw-mmHg labels (legacy).
     """
     if isinstance(cfg, DictConfig):
         cfg_dict = OmegaConf.to_container(cfg, resolve=True)
@@ -315,7 +328,9 @@ def train(
 
         if val_loader is not None and (epoch + 1) % val_every == 0:
             val_metrics = _evaluate(
-                model, val_loader, device, amp_enabled=amp_enabled
+                model, val_loader, device,
+                amp_enabled=amp_enabled,
+                bp_norm=bp_norm,
             )
             row.update(
                 {
@@ -392,7 +407,11 @@ def train(
                 "best.pt not found at %s; evaluating with current weights.",
                 best_path,
             )
-        test_metrics = _evaluate(model, test_loader, device, amp_enabled=amp_enabled)
+        test_metrics = _evaluate(
+            model, test_loader, device,
+            amp_enabled=amp_enabled,
+            bp_norm=bp_norm,
+        )
         logger.info(
             "bp_head test | loss %.4f | mae_sbp %.2f | mae_dbp %.2f | mae_mean %.2f mmHg",
             test_metrics["loss"], test_metrics["mae_sbp"],

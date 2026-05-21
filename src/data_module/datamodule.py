@@ -23,6 +23,7 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 
+from ..utils.normalization import BPLabelNorm
 from ..utils.seed import worker_init_fn
 from .cardiac_dataset import CardiacDataset
 
@@ -165,11 +166,21 @@ def build_loaders(
     # twice for pulsedb-pretrain train+val splits).
     _shared_tables: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
+    # Optional MD-ViSCo-style global min-max normalization for SBP/DBP labels.
+    # Resolved from `data.bp_label_norm` (top-level shortcut auto-aliased to
+    # `data.<name>.bp_label_norm` in default.yaml). ``None`` → legacy raw-mmHg.
+    bp_norm = BPLabelNorm.from_cfg(cfg)
+    if bp_norm is not None:
+        logger.info(
+            "BP label global min-max normalization active: vmin=%.2f vmax=%.2f mmHg",
+            bp_norm.vmin, bp_norm.vmax,
+        )
+
     def _make_dataset(spec: _DatasetSpec) -> CardiacDataset:
         path, indices, perm = spec
         cached = _shared_tables.get(path)
         if cached is None:
-            ds = CardiacDataset(path, indices, perm)
+            ds = CardiacDataset(path, indices, perm, bp_label_norm=bp_norm)
             _shared_tables[path] = (ds.bp_labels_table, ds.demographics_table)
             return ds
         bp_tbl, demo_tbl = cached
@@ -177,6 +188,7 @@ def build_loaders(
             path, indices, perm,
             bp_labels_table=bp_tbl,
             demographics_table=demo_tbl,
+            bp_label_norm=bp_norm,
         )
 
     batch_size = int(cfg.get("batch_size", 128))

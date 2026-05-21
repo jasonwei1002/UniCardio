@@ -36,7 +36,7 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 
-from ..utils.normalization import MINMAX_EPS
+from ..utils.normalization import MINMAX_EPS, BPLabelNorm
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +150,7 @@ class CardiacDataset(Dataset):
         bp_labels_table: np.ndarray | None = None,
         demographics_table: np.ndarray | None = None,
         csv_path: str | Path | None = None,
+        bp_label_norm: "BPLabelNorm | None" = None,
     ) -> None:
         path = Path(data_path)
         self._mm = np.load(str(path), mmap_mode="r")
@@ -165,6 +166,7 @@ class CardiacDataset(Dataset):
             )
 
         n_total = int(self._mm.shape[0])
+        built_from_csv = bp_labels_table is None
         if bp_labels_table is None or demographics_table is None:
             csv = Path(csv_path) if csv_path is not None else None
             bp_built, demo_built = _build_csv_tables(path, csv, n_total)
@@ -181,8 +183,18 @@ class CardiacDataset(Dataset):
                 f"demographics_table shape must be ({n_total}, 6), got "
                 f"{demographics_table.shape}"
             )
+
+        # When ``bp_label_norm`` is set, pre-normalize once at construction
+        # (MD-ViSCo Sec III.D). __getitem__ stays branchless. Cached tables
+        # (passed from a sibling dataset via ``bp_labels_table=...``) are
+        # assumed to already be normalized by their original owner; sharing
+        # is safe because data.bp_label_norm is a single top-level config.
+        if bp_label_norm is not None and built_from_csv:
+            bp_labels_table = bp_label_norm.normalize(bp_labels_table)
+
         self._bp_labels = np.ascontiguousarray(bp_labels_table, dtype=np.float32)
         self._demographics = np.ascontiguousarray(demographics_table, dtype=np.float32)
+        self._bp_norm = bp_label_norm
 
     @property
     def indices(self) -> np.ndarray:
@@ -219,6 +231,9 @@ class CardiacDataset(Dataset):
         # `_bp_labels` / `_demographics` are C-contiguous owned arrays; advanced
         # indexing with a single int returns an owned row, so torch.from_numpy
         # is safe without .copy() (table is never mutated after dataset init).
+        # ``_bp_labels`` is already pre-normalized in __init__ when bp_label_norm
+        # is active, so __getitem__ is branchless on the hot path (called
+        # ~902k × n_epochs × n_workers times).
         sbp_dbp = torch.from_numpy(self._bp_labels[row])
         demographics = torch.from_numpy(self._demographics[row])
         return signal, sbp_dbp, demographics

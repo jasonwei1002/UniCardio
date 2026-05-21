@@ -37,7 +37,7 @@ from src.trainer_module.bp_metrics import load_bp_head_ckpt
 from src.trainer_module.sampler import euler_sample
 from src.utils.checkpoint import load_checkpoint
 from src.utils.metrics import ks_statistic, mae, pearson_corr, rmse
-from src.utils.normalization import reconstruct_mmHg
+from src.utils.normalization import BPLabelNorm, reconstruct_mmHg
 from src.utils.seed import set_seed
 
 logger = logging.getLogger(__name__)
@@ -59,6 +59,7 @@ def _eval_task(
     device: torch.device,
     n_steps: int,
     limit_batches: int | None,
+    bp_norm: BPLabelNorm | None = None,
 ) -> dict[str, float]:
     """Per-task waveform metrics.
 
@@ -67,6 +68,11 @@ def _eval_task(
     ``(SBP, DBP)`` (pred) and the ground-truth ``(SBP, DBP)`` (target).
     Otherwise both stay in shape-only ``[0, 1]`` and only Pearson is
     physically meaningful.
+
+    When ``bp_norm`` is provided (MD-ViSCo refinement-style globally min-max
+    normalized BP labels), both the BP head output and the ground-truth
+    ``sbp_dbp`` from the loader are in [0, 1] space; this function inverts
+    them to mmHg before feeding into ``reconstruct_mmHg``.
     """
     preds: list[np.ndarray] = []
     targets: list[np.ndarray] = []
@@ -88,6 +94,11 @@ def _eval_task(
 
         if is_abp and bp_head is not None and sbp_dbp_true is not None:
             bp_pred = bp_head(signal[:, :2, :], demographics).float()
+            # reconstruct_mmHg expects SBP/DBP in mmHg; inverse if labels are
+            # in normalized space.
+            if bp_norm is not None:
+                bp_pred = bp_norm.denormalize(bp_pred)
+                sbp_dbp_true = bp_norm.denormalize(sbp_dbp_true)
             sbp_p, dbp_p = bp_pred[:, 0], bp_pred[:, 1]
             sbp_t, dbp_t = sbp_dbp_true[:, 0], sbp_dbp_true[:, 1]
             pred = reconstruct_mmHg(pred.squeeze(1), sbp_p, dbp_p).unsqueeze(1)
@@ -150,6 +161,8 @@ def main(cfg: DictConfig) -> None:
     active_tasks = [spec for spec, _ in active_task_pairs(cfg.trainer.task_weights)]
     logger.info("Active tasks: %s", [t.name for t in active_tasks])
 
+    bp_norm = BPLabelNorm.from_cfg(cfg.data)
+
     out_dir = Path(cfg.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_csv = out_dir / "per_task_metrics.csv"
@@ -161,6 +174,7 @@ def main(cfg: DictConfig) -> None:
             metrics = _eval_task(
                 rf_model, bp_head, test_loader, task,
                 device=device, n_steps=n_steps, limit_batches=limit_batches,
+                bp_norm=bp_norm,
             )
             writer.writerow([
                 task.name,

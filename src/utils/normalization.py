@@ -13,7 +13,8 @@ training runs.
 from __future__ import annotations
 
 import warnings
-from typing import Union
+from dataclasses import dataclass
+from typing import Any, Mapping, Union
 
 import numpy as np
 import torch
@@ -77,6 +78,64 @@ def minmax_normalize(
     # produced a near-zero range output; report the true max anyway so
     # downstream reconstruct_mmHg yields the original flat value.
     return x_norm, x_min, x_max
+
+
+@dataclass(frozen=True)
+class BPLabelNorm:
+    """Global min-max normalization for SBP/DBP scalar labels.
+
+    Matches MD-ViSCo Sec III.D (IEEE JBHI 2026): refinement model predicts
+    SBP/DBP in a globally min-max normalized [0, 1] domain (using fixed
+    constants computed once on the training set) rather than directly in
+    mmHg. Their ablation (Appendix XI) shows this is substantially more
+    stable than direct mmHg regression.
+
+    Constants live in ``data.bp_label_norm`` in the Hydra config. ``None``
+    everywhere disables this normalization (legacy raw-mmHg path).
+    """
+
+    vmin: float
+    vmax: float
+
+    def __post_init__(self) -> None:
+        if self.vmax <= self.vmin:
+            raise ValueError(
+                f"BPLabelNorm.vmax ({self.vmax}) must exceed vmin ({self.vmin})"
+            )
+
+    @property
+    def scale(self) -> float:
+        return self.vmax - self.vmin
+
+    def normalize(self, x: Array) -> Array:
+        """mmHg → [0, 1]. Over-range samples land at <0 or >1 (no clip)."""
+        return (x - self.vmin) / self.scale
+
+    def denormalize(self, x: Array) -> Array:
+        """[0, 1] → mmHg. Inverse of :meth:`normalize`."""
+        return x * self.scale + self.vmin
+
+    def denormalize_diff(self, x: Array) -> Array:
+        """Inverse for residuals ``(pred - target)``: ``vmin`` cancels."""
+        return x * self.scale
+
+    @classmethod
+    def from_cfg(cls, data_cfg: Mapping[str, Any] | None) -> "BPLabelNorm | None":
+        """Build from a Hydra ``data`` config node. Returns ``None`` when
+        ``bp_label_norm`` is absent or empty; raises on partial config."""
+        if data_cfg is None:
+            return None
+        node = data_cfg.get("bp_label_norm")
+        if not node:
+            return None
+        vmin = node.get("vmin")
+        vmax = node.get("vmax")
+        if vmin is None or vmax is None:
+            raise ValueError(
+                "data.bp_label_norm must specify both vmin and vmax; "
+                f"got vmin={vmin}, vmax={vmax}"
+            )
+        return cls(vmin=float(vmin), vmax=float(vmax))
 
 
 def reconstruct_mmHg(shape: Array, sbp: Array, dbp: Array) -> Array:

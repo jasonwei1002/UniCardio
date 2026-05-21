@@ -6,7 +6,10 @@
 #
 # 数据加载器读取后会执行：
 #   1) `channel_permutation` 通道置换（让模型 slot 顺序统一为 ECG/PPG/ABP）
-#   2) ABP 通道归一化 (x - 100) / 50
+#   2) ABP 波形通道：per-sample min-max → [0, 1]（MD-ViSCo approximation 同款）
+#   3) 若 `bp_label_norm` 非空：SBP/DBP 标量标签按 dataset-global min-max
+#      映射到 [0, 1] 域（MD-ViSCo refinement 同款）；损失在归一化空间，
+#      ME/SD/MAE 报表反归一化回 mmHg。
 
 name: pulsedb
 
@@ -35,6 +38,12 @@ pulsedb:
   # 阶段二（finetune）：CalFree 内部三划分（默认 80/10/10）。两者之和必须 < 1。
   finetune_val_ratio: 0.1
   finetune_test_ratio: 0.1
+  # BP 标签全局 min-max 归一化（MD-ViSCo refinement 同款；IEEE JBHI 2026 Sec III.D）。
+  # 常数在 Train_Subset.csv 的 SBP+DBP 联合分布上计算，P0.5≈36.4 / P99.5≈173.9 mmHg，
+  # 取圆整边界覆盖 >99% 数据。超界样本归一化后会略 <0 或 >1，无需 clip。
+  bp_label_norm:
+    vmin: 40.0
+    vmax: 180.0
 
 split_seed: 42
 
@@ -42,6 +51,11 @@ batch_size: 512
 num_workers: 8
 pin_memory: true
 
-# BP 归一化常数，放在配置里方便评估阶段反归一化时引用，避免改动代码。
+# Legacy ABP 波形归一化（仅 `combined` 数据集旧路径用，pulsedb 已切到
+# per-sample min-max；保留这两个常数仅为兼容旧 ckpt 评估）。
 bp_offset: 100.0
 bp_scale: 50.0
+
+# 顶层快捷访问：与 `${.${.name}.bp_label_norm}` 等价，便于 trainer / evaluate
+# 入口直接读取常数。子数据集不开启时此节为 null，下游需做空值判断。
+bp_label_norm: ${.${.name}.bp_label_norm}

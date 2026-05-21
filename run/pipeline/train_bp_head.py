@@ -27,6 +27,7 @@ if str(_REPO_ROOT) not in sys.path:
 from src.data_module.datamodule import build_loaders
 from src.model_module.bp_head import build_bp_head
 from src.trainer_module.bp_head_trainer import train
+from src.utils.normalization import BPLabelNorm
 from src.utils.seed import set_seed
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,7 @@ def main(cfg: DictConfig) -> None:
         model = torch.compile(model, mode=compile_mode, fullgraph=False)
 
     _init_swanlab(cfg)
+    bp_norm = BPLabelNorm.from_cfg(cfg.data)
     try:
         train(
             model,
@@ -100,6 +102,7 @@ def main(cfg: DictConfig) -> None:
             device=device,
             output_dir=cfg.output_dir,
             test_loader=test_loader if stage == "finetune" else None,
+            bp_norm=bp_norm,
         )
     finally:
         swanlab.finish()
