@@ -1,12 +1,21 @@
-# BPHead 模型结构配置
+# BPHead v2 (Path A refinement) 模型配置
 #
-# 输入：raw ECG + PPG（slot 0 和 slot 1），共 2 通道。
-# 输出：scalar (SBP, DBP) in mmHg。
-# 默认 ~100k 参数，远小于 RF backbone（~30M），训练成本可忽略。
+# Architecture (mirrors MD-ViSCo Sec III.D):
+#   - PatchTSMixer waveform encoder on ECG+PPG: patch → token-mix MLP +
+#     channel-mix MLP × depth → GAP over patches → wave_emb
+#   - Demographic encoder on (age_z, gender, height_z, weight_z, bmi_z,
+#     mask): 2-layer MLP → demo_emb
+#   - Fusion head: concat(wave_emb, demo_emb) → 2-layer MLP → (SBP, DBP)
+#
+# Default ~460 k params; <2% of the 30 M RF backbone.
+# Output is raw mmHg; loss = MSE in mmHg² space.
 
-in_channels: 2
-hidden: 64
-depth: 3
-kernel_size: 15
-stride: 4
-mlp_hidden: 64
+in_channels: 2          # ECG (slot 0) + PPG (slot 1)
+slot_length: ${data.slot_length}
+patch_len: 50           # 50 samples = 0.4 s @ 125 Hz; 1250/50 = 25 patches
+dim: 128                # token / channel dim
+depth: 6                # PatchTSMixer blocks
+mlp_ratio: 2            # MLP hidden expansion factor
+demo_in: 6              # 5 numeric demographics + 1 missingness mask
+demo_hidden: 64
+fusion_hidden: 128
