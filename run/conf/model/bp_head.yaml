@@ -1,0 +1,12 @@
+# BPHead 模型结构配置
+#
+# 输入：raw ECG + PPG（slot 0 和 slot 1），共 2 通道。
+# 输出：scalar (SBP, DBP) in mmHg。
+# 默认 ~100k 参数，远小于 RF backbone（~30M），训练成本可忽略。
+
+in_channels: 2
+hidden: 64
+depth: 3
+kernel_size: 15
+stride: 4
+mlp_hidden: 64
