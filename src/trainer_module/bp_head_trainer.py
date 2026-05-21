@@ -117,11 +117,19 @@ def _evaluate(
     amp_enabled: bool,
     max_batches: int | None = None,
 ) -> dict[str, float]:
-    """Return MSE loss + per-channel MAE (mmHg) on the val set."""
+    """Return MSE loss, per-channel MAE, signed ME, and SD (mmHg) on the val set.
+
+    AAMI-compatible metrics: ME = mean(pred - target), SD = population
+    std of (pred - target). Reported per channel (SBP, DBP).
+    """
     model.eval()
     loss_sum = 0.0
     mae_sbp_sum = 0.0
     mae_dbp_sum = 0.0
+    me_sbp_sum = 0.0
+    me_dbp_sum = 0.0
+    sq_sbp_sum = 0.0
+    sq_dbp_sum = 0.0
     n_samples = 0
     for batch_idx, batch in enumerate(val_loader):
         signal, target, demographics = _unpack_batch(batch, device)
@@ -133,16 +141,28 @@ def _evaluate(
         loss_sum += float((diff**2).mean(dim=-1).sum().item())
         mae_sbp_sum += float(diff[:, 0].abs().sum().item())
         mae_dbp_sum += float(diff[:, 1].abs().sum().item())
+        me_sbp_sum += float(diff[:, 0].sum().item())
+        me_dbp_sum += float(diff[:, 1].sum().item())
+        sq_sbp_sum += float((diff[:, 0] ** 2).sum().item())
+        sq_dbp_sum += float((diff[:, 1] ** 2).sum().item())
         n_samples += int(target.shape[0])
         if max_batches is not None and (batch_idx + 1) >= max_batches:
             break
     model.train()
     n = max(n_samples, 1)
+    me_sbp = me_sbp_sum / n
+    me_dbp = me_dbp_sum / n
+    var_sbp = max(sq_sbp_sum / n - me_sbp**2, 0.0)
+    var_dbp = max(sq_dbp_sum / n - me_dbp**2, 0.0)
     return {
         "loss": loss_sum / n,
         "mae_sbp": mae_sbp_sum / n,
         "mae_dbp": mae_dbp_sum / n,
         "mae_mean": (mae_sbp_sum + mae_dbp_sum) / (2 * n),
+        "me_sbp": me_sbp,
+        "me_dbp": me_dbp,
+        "sd_sbp": var_sbp**0.5,
+        "sd_dbp": var_dbp**0.5,
     }
 
 
@@ -210,6 +230,7 @@ def train(
         "epoch", "lr", "epoch_time_s",
         "train_loss",
         "val_loss", "val_mae_sbp", "val_mae_dbp", "val_mae_mean",
+        "val_me_sbp", "val_sd_sbp", "val_me_dbp", "val_sd_dbp",
     ]
     csv_logger = SimpleCSVLogger(
         log_dir / str(cfg_dict.get("log_filename", "bp_head_loss.csv")),
@@ -302,12 +323,21 @@ def train(
                     "val_mae_sbp": val_metrics["mae_sbp"],
                     "val_mae_dbp": val_metrics["mae_dbp"],
                     "val_mae_mean": val_metrics["mae_mean"],
+                    "val_me_sbp": val_metrics["me_sbp"],
+                    "val_sd_sbp": val_metrics["sd_sbp"],
+                    "val_me_dbp": val_metrics["me_dbp"],
+                    "val_sd_dbp": val_metrics["sd_dbp"],
                 }
             )
             logger.info(
                 "  val | loss %.4f | mae_sbp %.2f | mae_dbp %.2f | mae_mean %.2f mmHg",
                 val_metrics["loss"], val_metrics["mae_sbp"],
                 val_metrics["mae_dbp"], val_metrics["mae_mean"],
+            )
+            logger.info(
+                "        SBP: ME %+.2f ± %.2f | DBP: ME %+.2f ± %.2f mmHg",
+                val_metrics["me_sbp"], val_metrics["sd_sbp"],
+                val_metrics["me_dbp"], val_metrics["sd_dbp"],
             )
             if val_metrics["mae_mean"] < best_val:
                 best_val = val_metrics["mae_mean"]
@@ -334,6 +364,10 @@ def train(
                     "val/mae_sbp": row["val_mae_sbp"],
                     "val/mae_dbp": row["val_mae_dbp"],
                     "val/mae_mean": row["val_mae_mean"],
+                    "val/me_sbp": row["val_me_sbp"],
+                    "val/sd_sbp": row["val_sd_sbp"],
+                    "val/me_dbp": row["val_me_dbp"],
+                    "val/sd_dbp": row["val_sd_dbp"],
                 }
             )
         swanlab.log(epoch_metrics, step=epoch)
@@ -364,6 +398,11 @@ def train(
             test_metrics["loss"], test_metrics["mae_sbp"],
             test_metrics["mae_dbp"], test_metrics["mae_mean"],
         )
+        logger.info(
+            "             SBP: ME %+.2f ± %.2f | DBP: ME %+.2f ± %.2f mmHg",
+            test_metrics["me_sbp"], test_metrics["sd_sbp"],
+            test_metrics["me_dbp"], test_metrics["sd_dbp"],
+        )
         swanlab.log({f"test/{k}": v for k, v in test_metrics.items()})
         csv_logger.log_mapping(
             {
@@ -375,5 +414,9 @@ def train(
                 "val_mae_sbp": test_metrics["mae_sbp"],
                 "val_mae_dbp": test_metrics["mae_dbp"],
                 "val_mae_mean": test_metrics["mae_mean"],
+                "val_me_sbp": test_metrics["me_sbp"],
+                "val_sd_sbp": test_metrics["sd_sbp"],
+                "val_me_dbp": test_metrics["me_dbp"],
+                "val_sd_dbp": test_metrics["sd_dbp"],
             }
         )
