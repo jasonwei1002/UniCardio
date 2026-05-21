@@ -12,7 +12,7 @@ grad_clip_norm: 1.0
 
 lr_scheduler:
   name: cosine
-  min_lr: 1.0e-6
+  min_lr: 1.0e-5
   # 1.0 = single cosine (CosineAnnealingLR). <1.0 = warm restart
   # (CosineAnnealingWarmRestarts); each restart returns to peak lr
   # (torch has no peak decay).

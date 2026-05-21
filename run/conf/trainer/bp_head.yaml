@@ -11,7 +11,7 @@ grad_clip_norm: 1.0
 
 lr_scheduler:
   name: cosine
-  min_lr: 1.0e-6
+  min_lr: 1.0e-5
   first_cycle_pct: 1.0
   cycle_mult: 1
 
