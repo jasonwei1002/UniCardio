@@ -33,7 +33,7 @@ python run/pipeline/train_bp_head.py \
     trainer.stage=finetune \
     trainer.init_from="$CHECKPOINT" \
     trainer.lr=1.0e-4 \
-    trainer.epochs=50 \
+    trainer.epochs=100 \
     device=cuda \
     data.batch_size=512 \
     data.num_workers=8 \

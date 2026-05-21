@@ -7,15 +7,15 @@
 #     mask): 2-layer MLP → demo_emb
 #   - Fusion head: concat(wave_emb, demo_emb) → 2-layer MLP → (SBP, DBP)
 #
-# Default ~460 k params; <2% of the 30 M RF backbone.
-# Output is raw mmHg; loss = MSE in mmHg² space.
+# Default ~950 k params (was ~460 k @ dim=128); still <4% of the 30 M RF
+# backbone. Output is raw mmHg; loss = MSE in mmHg² space.
 
 in_channels: 2          # ECG (slot 0) + PPG (slot 1)
 slot_length: ${data.slot_length}
 patch_len: 50           # 50 samples = 0.4 s @ 125 Hz; 1250/50 = 25 patches
-dim: 128                # token / channel dim
+dim: 192                # token / channel dim (was 128)
 depth: 6                # PatchTSMixer blocks
 mlp_ratio: 2            # MLP hidden expansion factor
 demo_in: 6              # 5 numeric demographics + 1 missingness mask
 demo_hidden: 64
-fusion_hidden: 128
+fusion_hidden: 192      # was 128

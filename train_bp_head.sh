@@ -25,7 +25,7 @@ echo "Extra overrides: $*" | tee -a "$LOG_FILE"
 python run/pipeline/train_bp_head.py \
     trainer.stage=pretrain \
     trainer.lr=1.0e-3 \
-    trainer.epochs=50 \
+    trainer.epochs=100 \
     device=cuda \
     data.batch_size=512 \
     data.num_workers=12 \
