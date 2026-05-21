@@ -18,8 +18,8 @@ lr_scheduler:
 amp:
   enabled: true
 
-# BPHead 只有 ~100k 参数，max-autotune 的 autotune 成本相对训练时长不划算；
-# default 模式（仍走 inductor，但不做 CUDA Graphs / autotune）即可。
+# BPHead v2 (~460k 参数 + PatchTSMixer)，max-autotune 仍然不值得。
+# default 模式（走 inductor，但不做 CUDA Graphs / autotune）足够。
 compile:
   enabled: true
   mode: default

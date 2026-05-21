@@ -93,6 +93,9 @@ def _predict_one_task(
     dbp_chunks: list[np.ndarray] = []
     for batch in test_loader:
         signal = batch[0].to(device, non_blocking=True)
+        demographics = (
+            batch[2].to(device, non_blocking=True) if len(batch) >= 3 else None
+        )
         with torch.autocast(
             device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled
         ):
@@ -107,11 +110,11 @@ def _predict_one_task(
             sbp_chunks.append(wave_mmHg.amax(dim=-1).detach().cpu().numpy())
             dbp_chunks.append(wave_mmHg.amin(dim=-1).detach().cpu().numpy())
             continue
-        # Path A: BP head on raw ECG + PPG → (SBP, DBP) in mmHg directly.
+        # Path A: BP head on raw ECG + PPG (+ demographics) → (SBP, DBP) mmHg.
         with torch.autocast(
             device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled
         ):
-            bp_pred = bp_head(signal[:, :2, :]).float()
+            bp_pred = bp_head(signal[:, :2, :], demographics).float()
         sbp_chunks.append(bp_pred[:, 0].detach().cpu().numpy())
         dbp_chunks.append(bp_pred[:, 1].detach().cpu().numpy())
     return np.concatenate(sbp_chunks), np.concatenate(dbp_chunks)

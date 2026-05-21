@@ -5,12 +5,13 @@ checkpoint / scheduler / AMP / SwanLab plumbing — but solves a single
 regression objective ``MSE(pred_mmHg, target_mmHg)``. There is no task
 sampling, no time embedding, no attention mask, and no Euler sampler.
 
-Batch contract (after Path A data swap): each batch is
-``(signal: (B, 3, L), sbp_dbp: (B, 2))`` where ``sbp_dbp[:, 0]`` is SBP and
-``sbp_dbp[:, 1]`` is DBP, both in mmHg. The trainer slices ECG+PPG
-(``signal[:, :2, :]``) as input and ignores the ABP slot — keeping the
-regressor strictly causal with respect to the source modalities, like
-MD-ViSCo's refinement model.
+Batch contract (Path A 3-tuple): each batch is
+``(signal: (B, 3, L), sbp_dbp: (B, 2), demographics: (B, 6))``. The
+trainer slices ECG+PPG (``signal[:, :2, :]``) as input and forwards
+``demographics`` to BPHead v2; the ABP slot is unused (BP head is strictly
+causal w.r.t. the source modalities, like MD-ViSCo's refinement model).
+SBP/DBP come from PulseDB's CSV (per-cycle mean labeling), not from
+per-segment min/max — see ``src/data_module/cardiac_dataset.py``.
 """
 
 from __future__ import annotations
@@ -86,21 +87,25 @@ def _build_scheduler(
 
 def _unpack_batch(
     batch: Any, device: torch.device
-) -> tuple[Tensor, Tensor]:
-    """Unpack ``(signal, sbp_dbp)`` 2-tuple emitted by the Path A dataset.
+) -> tuple[Tensor, Tensor, Tensor | None]:
+    """Unpack ``(signal, sbp_dbp [, demographics])`` from the Path A dataset.
 
-    Falls back with a helpful error if the dataset still returns the old
-    1-tuple (i.e. Phase 2a data-contract swap has not been done yet).
+    Returns a 3-tuple ``(signal, sbp_dbp, demographics)`` where
+    ``demographics`` is ``None`` if the loader emits a legacy 2-tuple
+    (BP head will then run waveform-only, no demographic branch).
     """
     if len(batch) < 2:
         raise RuntimeError(
-            "BP head training requires (signal, sbp_dbp) batches; got a "
-            f"{len(batch)}-tuple. Run Phase 2a (cardiac_dataset rewrite) "
-            "before training the BP head."
+            "BP head training requires (signal, sbp_dbp, demographics) "
+            f"batches; got a {len(batch)}-tuple. Run the Path A dataset "
+            "rewrite before training the BP head."
         )
     signal = batch[0].to(device, non_blocking=True)
     sbp_dbp = batch[1].to(device, non_blocking=True)
-    return signal, sbp_dbp
+    demographics: Tensor | None = None
+    if len(batch) >= 3:
+        demographics = batch[2].to(device, non_blocking=True)
+    return signal, sbp_dbp, demographics
 
 
 @torch.no_grad()
@@ -119,11 +124,11 @@ def _evaluate(
     mae_dbp_sum = 0.0
     n_samples = 0
     for batch_idx, batch in enumerate(val_loader):
-        signal, target = _unpack_batch(batch, device)
+        signal, target, demographics = _unpack_batch(batch, device)
         with torch.autocast(
             device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled
         ):
-            pred = model(signal[:, :2, :])
+            pred = model(signal[:, :2, :], demographics)
         diff = pred.float() - target.float()
         loss_sum += float((diff**2).mean(dim=-1).sum().item())
         mae_sbp_sum += float(diff[:, 0].abs().sum().item())
@@ -230,14 +235,14 @@ def train(
             desc=f"bp_head ep {epoch}/{epochs - 1}",
         )
         for batch in it:
-            signal, target = _unpack_batch(batch, device)
+            signal, target, demographics = _unpack_batch(batch, device)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.bfloat16,
                 enabled=amp_enabled,
             ):
-                pred = model(signal[:, :2, :])
+                pred = model(signal[:, :2, :], demographics)
                 loss = ((pred - target) ** 2).mean()
             loss.backward()
             if grad_clip_norm > 0:

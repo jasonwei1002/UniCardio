@@ -82,11 +82,12 @@ def _eval_task(
     for batch_idx, batch in enumerate(pbar):
         signal = batch[0].to(device)
         sbp_dbp_true = batch[1].to(device) if len(batch) > 1 else None
+        demographics = batch[2].to(device) if len(batch) > 2 else None
         target = signal[:, int(task.target_slot):int(task.target_slot) + 1, :]
         pred = euler_sample(rf_model, signal, task, n_steps=n_steps, device=device)
 
         if is_abp and bp_head is not None and sbp_dbp_true is not None:
-            bp_pred = bp_head(signal[:, :2, :]).float()
+            bp_pred = bp_head(signal[:, :2, :], demographics).float()
             sbp_p, dbp_p = bp_pred[:, 0], bp_pred[:, 1]
             sbp_t, dbp_t = sbp_dbp_true[:, 0], sbp_dbp_true[:, 1]
             pred = reconstruct_mmHg(pred.squeeze(1), sbp_p, dbp_p).unsqueeze(1)
