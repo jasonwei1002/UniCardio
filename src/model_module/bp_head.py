@@ -1,57 +1,53 @@
-"""Path A refinement model — PatchTSMixer waveform encoder + demographics MLP.
+"""Path A refinement model — per-vital HF PatchTSMixer + demographics MLP.
 
-Mirrors MD-ViSCo's refinement model (IEEE JBHI 2026, Sec III.D):
+Faithful reproduction of MD-ViSCo's refinement model (IEEE JBHI 2026,
+Sec III.D / §6.2.2): each source vital (ECG slot 0, PPG slot 1) is encoded by
+its own HuggingFace ``PatchTSMixerModel``; the GAP-pooled patch embedding is
+fused with a single shared demographics embedding and mapped to ``(SBP, DBP)``
+by a per-vital head. Per-vital predictions are averaged over the active vitals.
 
-    Source x^(i): (B, in_channels=2, L)
-        |
-        v  PatchTSMixer encoder (patch + token-mix + channel-mix × depth)
-        |
-    wave_emb: (B, dim)
-                     +
-    Demographics: (B, demo_in=6) = [age_z, gender, height_z, weight_z, bmi_z, mask]
-        |
-        v  Demographic encoder (Linear-GELU-Linear)
-        |
-    demo_emb: (B, demo_hidden)
-                     concat
-                     |
-                     v  Fusion MLP (Linear-GELU-Linear)
-                     |
-                 (B, 2) = (SBP_mmHg, DBP_mmHg)
+Intentional differences vs MD-ViSCo:
+- demographics via a numeric MLP (PulseDB has a fixed 5-feature schema), not
+  DistilBERT (which exists for cross-dataset schema agnosticism we do not need);
+- GAP pooling over patches instead of flatten + ProjectionHead (keeps the head
+  at ~22M instead of ~40M+);
+- no WCL (weighted contrastive loss) — MD-ViSCo's ablation shows architecture >
+  WCL; revisit only if this head still falls short of AAMI.
 
-Key differences vs MD-ViSCo:
-- We do NOT use DistilBERT for demographics — PulseDB demographics are 5
-  numeric features with a fixed schema, so a plain Linear-MLP is the right
-  tool. DistilBERT in MD-ViSCo is for cross-dataset schema agnosticism,
-  which we do not need.
-- We do NOT include the WCL (weighted contrastive loss) pretraining. The
-  ablation in the paper shows architecture > WCL in contribution; WCL is a
-  follow-up option if BPHead v2 alone falls short of AAMI.
-- ``mask`` (6th demographic dim) is 1.0 when anthropometric values
-  (height/weight/bmi) are present in PulseDB and 0.0 otherwise. ~48% of
-  PulseDB samples (MIMIC-III subset) lack these and are imputed to z=0.
+``demographics`` is ``(B, 6) = [age_z, gender, height_z, weight_z, bmi_z, mask]``
+(see :mod:`src.data_module.cardiac_dataset`). Pass ``None`` for waveform-only
+paths; the demographic branch is then bypassed (``demo_emb = 0``).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 import torch
 from torch import Tensor, nn
+from transformers import PatchTSMixerConfig, PatchTSMixerModel
+
+# Model slot order is ECG=0, PPG=1 (see src/model_module/tasks.py). The BP head
+# receives ``signal[:, :2, :]`` so these indices line up directly.
+_VITAL_CHANNEL: dict[str, int] = {"ecg": 0, "ppg": 1}
 
 
 @dataclass(frozen=True)
 class BPHeadConfig:
-    """Immutable config for :class:`BPHead`."""
+    """Immutable config for :class:`BPHead` (HF PatchTSMixer hyperparameters
+    follow MD-ViSCo §6.2.2)."""
 
-    in_channels: int = 2          # ECG + PPG
-    slot_length: int = 1250       # 10 s @ 125 Hz
-    patch_len: int = 50           # 50 samples = 0.4 s per patch; 25 patches
-    dim: int = 128                # token / channel dim
-    depth: int = 6                # number of PatchTSMixer blocks
-    mlp_ratio: int = 2            # hidden expansion factor in MLPs
-    demo_in: int = 6              # 5 features + 1 missingness mask
+    slot_length: int = 1250
+    vitals: tuple[str, ...] = ("ecg", "ppg")
+    # HF PatchTSMixer encoder hyperparameters.
+    patch_len: int = 5            # MD-ViSCo uses 4 @ L=1280; 5 divides 1250 → 250 patches
+    patch_stride: int = 5
+    d_model: int = 64
+    num_layers: int = 15
+    expansion_factor: int = 5
+    # Demographics + fusion head.
+    demo_in: int = 6              # 5 numeric features + 1 missingness mask
     demo_hidden: int = 64
     fusion_hidden: int = 128
 
@@ -59,156 +55,121 @@ class BPHeadConfig:
     def from_mapping(cls, cfg: Mapping[str, Any] | "BPHeadConfig") -> "BPHeadConfig":
         if isinstance(cfg, cls):
             return cfg
-        defaults = cls()
+        d = cls()
+        vitals = cfg.get("vitals", d.vitals)
         return cls(
-            in_channels=int(cfg.get("in_channels", defaults.in_channels)),
-            slot_length=int(cfg.get("slot_length", defaults.slot_length)),
-            patch_len=int(cfg.get("patch_len", defaults.patch_len)),
-            dim=int(cfg.get("dim", defaults.dim)),
-            depth=int(cfg.get("depth", defaults.depth)),
-            mlp_ratio=int(cfg.get("mlp_ratio", defaults.mlp_ratio)),
-            demo_in=int(cfg.get("demo_in", defaults.demo_in)),
-            demo_hidden=int(cfg.get("demo_hidden", defaults.demo_hidden)),
-            fusion_hidden=int(cfg.get("fusion_hidden", defaults.fusion_hidden)),
+            slot_length=int(cfg.get("slot_length", d.slot_length)),
+            vitals=tuple(str(v).lower() for v in vitals),
+            patch_len=int(cfg.get("patch_len", d.patch_len)),
+            patch_stride=int(cfg.get("patch_stride", d.patch_stride)),
+            d_model=int(cfg.get("d_model", d.d_model)),
+            num_layers=int(cfg.get("num_layers", d.num_layers)),
+            expansion_factor=int(cfg.get("expansion_factor", d.expansion_factor)),
+            demo_in=int(cfg.get("demo_in", d.demo_in)),
+            demo_hidden=int(cfg.get("demo_hidden", d.demo_hidden)),
+            fusion_hidden=int(cfg.get("fusion_hidden", d.fusion_hidden)),
         )
 
-    @property
-    def n_patches(self) -> int:
-        if self.slot_length % self.patch_len != 0:
-            raise ValueError(
-                f"slot_length ({self.slot_length}) must be divisible by "
-                f"patch_len ({self.patch_len})."
-            )
-        return self.slot_length // self.patch_len
 
-
-class _PatchTSMixerBlock(nn.Module):
-    """Single PatchTSMixer block: token-mixing MLP + channel-mixing MLP.
-
-    Mirrors Ekambaram et al. 2023 ("PatchTSMixer", KDD). Token mixing
-    operates along the patch axis (cross-time interaction); channel
-    mixing operates along the feature axis (cross-feature interaction).
-    Both are MLPs with residual + LayerNorm.
-    """
-
-    def __init__(self, n_patches: int, dim: int, mlp_ratio: int) -> None:
-        super().__init__()
-        token_hidden = max(n_patches * mlp_ratio, 4)
-        channel_hidden = dim * mlp_ratio
-        self.norm_token = nn.LayerNorm(dim)
-        self.token_mlp = nn.Sequential(
-            nn.Linear(n_patches, token_hidden),
-            nn.GELU(),
-            nn.Linear(token_hidden, n_patches),
+def _build_encoder(cfg: BPHeadConfig) -> PatchTSMixerModel:
+    """One single-channel HF PatchTSMixer encoder per vital."""
+    return PatchTSMixerModel(
+        PatchTSMixerConfig(
+            context_length=cfg.slot_length,
+            num_input_channels=1,
+            d_model=cfg.d_model,
+            num_layers=cfg.num_layers,
+            expansion_factor=cfg.expansion_factor,
+            patch_length=cfg.patch_len,
+            patch_stride=cfg.patch_stride,
         )
-        self.norm_channel = nn.LayerNorm(dim)
-        self.channel_mlp = nn.Sequential(
-            nn.Linear(dim, channel_hidden),
-            nn.GELU(),
-            nn.Linear(channel_hidden, dim),
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        # x: (B, n_patches, dim)
-        h = self.norm_token(x)
-        h = h.transpose(1, 2)        # (B, dim, n_patches)
-        h = self.token_mlp(h)
-        h = h.transpose(1, 2)        # (B, n_patches, dim)
-        x = x + h
-        h = self.norm_channel(x)
-        h = self.channel_mlp(h)
-        return x + h
+    )
 
 
 class BPHead(nn.Module):
-    """(ECG+PPG, demographics) -> (SBP, DBP) mmHg regressor."""
+    """(ECG, PPG, demographics) -> (SBP, DBP) mmHg regressor (per-vital averaged)."""
 
     def __init__(self, config: BPHeadConfig | Mapping[str, Any]) -> None:
         super().__init__()
         self.config = BPHeadConfig.from_mapping(config)
         cfg = self.config
-        n_patches = cfg.n_patches
+        for v in cfg.vitals:
+            if v not in _VITAL_CHANNEL:
+                raise ValueError(
+                    f"unknown vital '{v}'; BP head supports {sorted(_VITAL_CHANNEL)}"
+                )
 
-        # Patch embedding: each patch is (in_channels * patch_len) flattened,
-        # then projected to `dim`. + learnable positional embedding.
-        self.patch_proj = nn.Linear(cfg.in_channels * cfg.patch_len, cfg.dim)
-        self.pos_emb = nn.Parameter(torch.zeros(1, n_patches, cfg.dim))
-        nn.init.trunc_normal_(self.pos_emb, std=0.02)
+        self.encoders = nn.ModuleDict({v: _build_encoder(cfg) for v in cfg.vitals})
 
-        self.blocks = nn.ModuleList(
-            [
-                _PatchTSMixerBlock(n_patches, cfg.dim, cfg.mlp_ratio)
-                for _ in range(cfg.depth)
-            ]
-        )
-        self.final_norm = nn.LayerNorm(cfg.dim)
-
-        # Demographic encoder. Operates on a 6-dim vector:
-        #   [age_z, gender, height_z, weight_z, bmi_z, has_anthropometrics]
-        # All z-scored (except gender ∈ {0, 1}) at the dataset boundary.
         self.demo_encoder = nn.Sequential(
             nn.Linear(cfg.demo_in, cfg.demo_hidden),
             nn.GELU(),
             nn.Linear(cfg.demo_hidden, cfg.demo_hidden),
         )
 
-        # Fusion + regression head.
-        self.head = nn.Sequential(
-            nn.Linear(cfg.dim + cfg.demo_hidden, cfg.fusion_hidden),
-            nn.GELU(),
-            nn.Linear(cfg.fusion_hidden, 2),
+        self.heads = nn.ModuleDict(
+            {
+                v: nn.Sequential(
+                    nn.Linear(cfg.d_model + cfg.demo_hidden, cfg.fusion_hidden),
+                    nn.GELU(),
+                    nn.Linear(cfg.fusion_hidden, 2),
+                )
+                for v in cfg.vitals
+            }
         )
 
-    def _patchify(self, ecg_ppg: Tensor) -> Tensor:
-        """``(B, C, L)`` -> ``(B, n_patches, C * patch_len)``."""
-        B, C, L = ecg_ppg.shape
-        cfg = self.config
-        if L != cfg.slot_length or C != cfg.in_channels:
-            raise ValueError(
-                f"BPHead expects (B, {cfg.in_channels}, {cfg.slot_length}); "
-                f"got (B, {C}, {L})."
-            )
-        # unfold returns (B, C, n_patches, patch_len)
-        patches = ecg_ppg.unfold(-1, cfg.patch_len, cfg.patch_len)
-        # -> (B, n_patches, C, patch_len) -> flatten last two dims
-        patches = patches.permute(0, 2, 1, 3).contiguous()
-        return patches.reshape(B, cfg.n_patches, cfg.in_channels * cfg.patch_len)
+    def _encode(self, vital: str, slot: Tensor) -> Tensor:
+        """``(B, 1, L)`` raw waveform -> ``(B, d_model)`` GAP patch embedding."""
+        # HF PatchTSMixer expects (B, seq_len, channels); we hold (B, 1, L).
+        hidden = self.encoders[vital](slot.transpose(1, 2)).last_hidden_state
+        # last_hidden_state: (B, channels=1, num_patches, d_model). GAP over
+        # the patch axis, drop the singleton channel axis -> (B, d_model).
+        return hidden.mean(dim=2).squeeze(1)
 
     def forward(
         self,
         ecg_ppg: Tensor,
         demographics: Optional[Tensor] = None,
+        active_vitals: Optional[Iterable[str]] = None,
     ) -> Tensor:
-        """Predict ``(SBP, DBP)`` in mmHg.
+        """Predict ``(SBP, DBP)`` mmHg, averaged over the active vitals.
 
         Args:
-            ecg_ppg: ``(B, in_channels, slot_length)`` raw ECG + PPG.
-            demographics: ``(B, demo_in)`` z-scored demographic vector with
-                missingness mask in the last column (see
-                :mod:`src.data_module.cardiac_dataset`). Pass ``None`` only
-                for waveform-only inference paths (e.g. unit tests, legacy
-                loaders without CSV) — in that case the demographic branch
-                is bypassed (``demo_emb = 0``), which is **NOT** the same
-                as feeding a real per-row "anthropometrics missing" vector
-                ``[age_z, gender, 0, 0, 0, 0]`` (which still produces a
-                non-zero demo embedding through the encoder).
+            ecg_ppg: ``(B, 2, slot_length)`` raw ECG (ch 0) + PPG (ch 1).
+            demographics: ``(B, demo_in)`` z-scored demographics with missingness
+                mask in the last column; ``None`` bypasses the demo branch.
+            active_vitals: vital names to average over; ``None`` = all configured
+                vitals (training uses this default — call site unchanged).
 
         Returns:
             ``(B, 2)`` with column 0 = SBP, column 1 = DBP, both in mmHg.
         """
-        h = self._patchify(ecg_ppg)
-        h = self.patch_proj(h) + self.pos_emb
-        for block in self.blocks:
-            h = block(h)
-        h = self.final_norm(h)
-        wave_emb = h.mean(dim=1)            # global average pool over patches
+        cfg = self.config
+        b, c, length = ecg_ppg.shape
+        if length != cfg.slot_length or c < 2:
+            raise ValueError(
+                f"BPHead expects (B, >=2, {cfg.slot_length}); got (B, {c}, {length})."
+            )
+
+        vitals = (
+            tuple(str(v).lower() for v in active_vitals)
+            if active_vitals is not None
+            else cfg.vitals
+        )
+        if not vitals:
+            raise ValueError("active_vitals resolved to an empty set.")
 
         if demographics is None:
-            demo_emb = wave_emb.new_zeros(wave_emb.shape[0], self.config.demo_hidden)
+            demo_emb = ecg_ppg.new_zeros(b, cfg.demo_hidden)
         else:
-            demo_emb = self.demo_encoder(demographics.to(wave_emb.dtype))
+            demo_emb = self.demo_encoder(demographics)
 
-        return self.head(torch.cat([wave_emb, demo_emb], dim=-1))
+        preds = []
+        for v in vitals:
+            ch = _VITAL_CHANNEL[v]
+            wave_emb = self._encode(v, ecg_ppg[:, ch : ch + 1, :])
+            preds.append(self.heads[v](torch.cat([wave_emb, demo_emb.to(wave_emb.dtype)], dim=-1)))
+        return torch.stack(preds, dim=0).mean(dim=0)
 
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())

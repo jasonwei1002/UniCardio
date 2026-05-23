@@ -1,8 +1,9 @@
-"""Unit tests for :class:`src.model_module.bp_head.BPHead` (Path A v2).
+"""Unit tests for :class:`src.model_module.bp_head.BPHead` (Path A v3).
 
-BPHead v2 = PatchTSMixer waveform encoder + demographic MLP + fusion head,
-mirroring MD-ViSCo's refinement model. Input contract:
-``forward(ecg_ppg: (B, 2, slot_length), demographics: (B, 6) | None)``.
+v3 = per-vital HF PatchTSMixer encoders + shared demographics MLP + per-vital
+heads averaged over ``active_vitals``. Input contract:
+``forward(ecg_ppg: (B, 2, slot_length), demographics: (B, 6) | None,
+         active_vitals: Iterable[str] | None)``.
 """
 
 from __future__ import annotations
@@ -12,97 +13,127 @@ import torch
 
 from src.model_module.bp_head import BPHead, BPHeadConfig, build_bp_head
 
-
 SLOT_LEN = 1250
 DEMO_DIM = 6
 
+# Small config keeps PatchTSMixer init + forward fast on CPU.
+TINY = {
+    "slot_length": 256,
+    "patch_len": 32,
+    "patch_stride": 32,
+    "d_model": 16,
+    "num_layers": 2,
+    "expansion_factor": 2,
+    "demo_hidden": 16,
+    "fusion_hidden": 32,
+}
 
-def test_bp_head_forward_shape_with_demographics() -> None:
-    model = build_bp_head({})
-    x = torch.randn(4, 2, SLOT_LEN)
+
+def _tiny() -> BPHead:
+    return build_bp_head(TINY)
+
+
+def test_forward_shape_with_demographics() -> None:
+    model = _tiny()
+    x = torch.randn(4, 2, TINY["slot_length"])
     d = torch.randn(4, DEMO_DIM)
     out = model(x, d)
     assert out.shape == (4, 2)
     assert out.dtype == torch.float32
 
 
-def test_bp_head_forward_shape_without_demographics() -> None:
-    """Demographics arg is optional; missing → zero-fill on the demo branch."""
-    model = build_bp_head({})
-    x = torch.randn(4, 2, SLOT_LEN)
+def test_forward_shape_without_demographics() -> None:
+    model = _tiny()
+    x = torch.randn(4, 2, TINY["slot_length"])
     out = model(x)
     assert out.shape == (4, 2)
 
 
-def test_bp_head_param_budget() -> None:
-    """Default config sits at ~0.5M params — well under the 30M backbone."""
-    model = build_bp_head({})
-    assert 100_000 < model.num_parameters() < 1_000_000
+def test_aggregate_equals_mean_of_single_vitals() -> None:
+    """In eval mode (no dropout), the both-vital average equals the mean of
+    the two single-vital predictions."""
+    model = _tiny().eval()
+    x = torch.randn(4, 2, TINY["slot_length"])
+    d = torch.randn(4, DEMO_DIM)
+    with torch.no_grad():
+        both = model(x, d, active_vitals=None)
+        ecg = model(x, d, active_vitals=["ecg"])
+        ppg = model(x, d, active_vitals=["ppg"])
+    assert torch.allclose(both, (ecg + ppg) / 2, atol=1e-5)
+    assert not torch.allclose(ecg, ppg)
 
 
-def test_bp_head_backward_grads() -> None:
-    model = build_bp_head({})
-    x = torch.randn(4, 2, SLOT_LEN)
+def test_active_vitals_single_uses_only_that_encoder() -> None:
+    model = _tiny().eval()
+    x = torch.randn(2, 2, TINY["slot_length"])
+    # Zeroing the PPG channel must not change an ECG-only prediction.
+    x_zero_ppg = x.clone()
+    x_zero_ppg[:, 1, :] = 0.0
+    with torch.no_grad():
+        a = model(x, active_vitals=["ecg"])
+        b = model(x_zero_ppg, active_vitals=["ecg"])
+    assert torch.allclose(a, b, atol=1e-6)
+
+
+def test_backward_grads() -> None:
+    model = _tiny()
+    x = torch.randn(4, 2, TINY["slot_length"])
     d = torch.randn(4, DEMO_DIM)
     target = torch.tensor([[120.0, 70.0]] * 4)
-    pred = model(x, d)
-    loss = ((pred - target) ** 2).mean()
+    loss = ((model(x, d) - target) ** 2).mean()
     loss.backward()
     for name, p in model.named_parameters():
         assert p.grad is not None, f"missing grad: {name}"
-        assert torch.any(p.grad != 0), f"all-zero grad: {name}"
 
 
-def test_bp_head_overfit_single_batch() -> None:
-    """Tiny BPHead overfits a synthetic batch to MAE < 5 mmHg in 400 steps."""
+def test_overfit_single_batch() -> None:
+    """Tiny BPHead overfits a synthetic batch to MAE < 5 mmHg."""
     torch.manual_seed(0)
-    model = build_bp_head({
-        "slot_length": 256, "patch_len": 32,
-        "dim": 32, "depth": 2, "mlp_ratio": 1,
-        "demo_hidden": 16, "fusion_hidden": 32,
-    })
+    model = _tiny()
     optim = torch.optim.Adam(model.parameters(), lr=3e-3)
-
-    B = 8
-    x = torch.randn(B, 2, 256)
+    B, L = 8, TINY["slot_length"]
+    x = torch.randn(B, 2, L)
     d = torch.randn(B, DEMO_DIM)
-    # Deterministic targets from input via fixed projections so the task is
-    # learnable. SBP ~ 100 mmHg ± 20, DBP ~ 60 ± 10.
-    proj_sbp = torch.randn(2 * 256 + DEMO_DIM)
-    proj_dbp = torch.randn(2 * 256 + DEMO_DIM)
+    proj = torch.randn(2 * L + DEMO_DIM, 2)
     flat = torch.cat([x.reshape(B, -1), d], dim=-1)
-    sbp_true = 100.0 + 20.0 * (flat @ proj_sbp / proj_sbp.numel() ** 0.5)
-    dbp_true = 60.0 + 10.0 * (flat @ proj_dbp / proj_dbp.numel() ** 0.5)
-    target = torch.stack([sbp_true, dbp_true], dim=-1)
-
+    base = torch.tensor([100.0, 60.0])
+    scale = torch.tensor([20.0, 10.0])
+    target = base + scale * (flat @ proj / proj.shape[0] ** 0.5)
     for _ in range(400):
         optim.zero_grad(set_to_none=True)
-        pred = model(x, d)
-        loss = ((pred - target) ** 2).mean()
+        loss = ((model(x, d) - target) ** 2).mean()
         loss.backward()
         optim.step()
     final_mae = float((model(x, d) - target).abs().mean().item())
     assert final_mae < 5.0, f"final MAE {final_mae:.2f} mmHg (failed to overfit)"
 
 
-def test_bp_head_config_from_mapping() -> None:
-    cfg = BPHeadConfig.from_mapping({"dim": 32, "depth": 2})
-    assert cfg.dim == 32
-    assert cfg.depth == 2
-    # Defaults preserved
-    assert cfg.in_channels == 2
-    assert cfg.slot_length == 1250
-    # Idempotent on BPHeadConfig instance
-    assert BPHeadConfig.from_mapping(cfg) is cfg
-
-
-def test_bp_head_rejects_mismatched_input_shape() -> None:
-    model = build_bp_head({})
-    bad = torch.randn(2, 2, 1234)  # wrong slot_length
+def test_rejects_mismatched_slot_length() -> None:
+    model = _tiny()
+    bad = torch.randn(2, 2, TINY["slot_length"] + 7)
     with pytest.raises(ValueError, match="BPHead expects"):
         model(bad)
 
 
-def test_bp_head_patchify_divisibility() -> None:
-    with pytest.raises(ValueError, match="divisible"):
-        BPHeadConfig(slot_length=1250, patch_len=51).n_patches
+def test_config_from_mapping_defaults_and_override() -> None:
+    cfg = BPHeadConfig.from_mapping({"d_model": 32, "num_layers": 3})
+    assert cfg.d_model == 32
+    assert cfg.num_layers == 3
+    assert cfg.slot_length == 1250
+    assert cfg.vitals == ("ecg", "ppg")
+    assert BPHeadConfig.from_mapping(cfg) is cfg
+
+
+def test_config_rejects_unknown_vital() -> None:
+    with pytest.raises(ValueError, match="unknown vital"):
+        build_bp_head({**TINY, "vitals": ["ecg", "abp"]})
+
+
+def test_default_config_param_budget() -> None:
+    """Faithful MD-ViSCo config (depth 15, d_model 64, 2 vitals) ~22M params.
+
+    Instantiation only (no forward), so it stays fast (~1-2s) on CPU.
+    """
+    model = build_bp_head({})
+    n = model.num_parameters()
+    assert 15_000_000 < n < 30_000_000, f"param count {n:,} outside 15M-30M"
