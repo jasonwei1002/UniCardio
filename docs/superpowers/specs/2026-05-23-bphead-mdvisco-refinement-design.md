@@ -62,43 +62,58 @@ A+B may be unnecessary.
 
 ## Design
 
-### Module 1 — Path A: PatchTSMixer hyperparameters → MD-ViSCo
+### Module 1 — Path A: replace custom block with HF `PatchTSMixerModel`
 
-Adopt MD-ViSCo §6.2.2 refinement encoder hyperparameters exactly:
+**Decision (revised after empirical check):** drop the hand-rolled
+`_PatchTSMixerBlock` / `_patchify` and use HuggingFace
+`transformers.PatchTSMixerModel` directly, exactly as MD-ViSCo does
+([mdvisco.py `WaveformEncoder`](../../../paper%20reference/MD-ViSCo/src/model/mdvisco.py)).
+This is the faithful reproduction and avoids re-deriving patch/mixer math.
 
-| Hyperparam | Current | New (MD-ViSCo) |
-|---|---|---|
-| `patch_len`   | 50 | **5** |
-| `patch_stride`| (= patch_len) | **5** (new field) |
-| `dim` (d_model) | 192 | **64** |
-| `depth`       | 6  | **15** |
-| `mlp_ratio` (expansion_factor) | 2 | **5** |
+Encoder config (per vital, MD-ViSCo §6.2.2 hyperparameters):
 
-MD-ViSCo §6.2.2 uses `patch_length=4` at L=1280; we use **patch_len=5** which
-divides L=1250 evenly → **250 patches** (no dropped remainder), the closest clean
-analogue. Patch count via the general floor formula: `n_patches =
-floor((L - patch_len)/patch_stride) + 1 = 250`.
+```python
+PatchTSMixerConfig(
+    context_length=slot_length,   # 1250
+    num_input_channels=1,         # one vital per encoder
+    d_model=64,
+    num_layers=15,
+    expansion_factor=5,
+    patch_length=5,               # MD-ViSCo uses 4 @ L=1280; 5 divides 1250 evenly → 250 patches
+    patch_stride=5,
+)
+```
 
-Required code change (small): in [bp_head.py](../../../src/model/bp_head.py)
-- add `patch_stride: int = 5` to `BPHeadConfig` (and `from_mapping`);
-- change `n_patches` property from the divisibility check to the floor formula
-  (general; also handles non-dividing patch/stride if swept later);
-- `_patchify` already uses `unfold(-1, patch_len, patch_len)` which drops any
-  remainder consistently — generalize the `step` to `patch_stride`.
+**Measured cost (verified on transformers 5.9.0, CPU):** one such encoder =
+**11.0M params**; `last_hidden_state` shape `(B, 1, num_patches=250, d_model=64)`.
+Two per-vital encoders ⇒ **~22M** for the head. This is inherent to depth-15 /
+patch-5 (the custom block was ~the same); it is **23× the current ~0.95M head**,
+accepted as the cost of faithful reproduction. Fits H800 80GB; training
+compute/memory rises accordingly.
 
-`pos_emb` shape `(1, n_patches, dim)` and the token-mix MLP (`Linear(n_patches, n_patches*mlp_ratio)`) scale with the new `n_patches=250`; verify memory/throughput on CPU smoke + server.
+**New dependency:** `transformers` is **not** currently in
+[requirements.txt](../../../requirements.txt) — it must be added.
+
+Pooling: GAP over the patch axis of `last_hidden_state` → `(B, d_model=64)`
+`wave_emb`. We deliberately do **not** replicate MD-ViSCo's flatten+`ProjectionHead`
+(16000→512 ≈ 8.5M extra per vital); GAP keeps the head at ~22M instead of ~40M+.
 
 ### Module 2 — Path B: per-vital encoders + averaging
 
 Refactor `BPHead` from one 2-channel encoder to per-vital single-channel encoders,
 mirroring MD-ViSCo's `BPModel` + `VitalEncoder`.
 
-- `BPHeadConfig` gains `vitals: tuple[str, ...] = ("ecg", "ppg")`.
-- Build `self.encoders = nn.ModuleDict({vital: <PatchTSMixer stack>})`, each with
-  `in_channels=1`, sharing the Module-1 hyperparameters.
+- `BPHeadConfig` gains `vitals: tuple[str, ...] = ("ecg", "ppg")` and HF-aligned
+  fields (`d_model`, `num_layers`, `expansion_factor`, `patch_len`, `patch_stride`);
+  the old `dim` / `depth` / `mlp_ratio` fields are renamed accordingly.
+- Build `self.encoders = nn.ModuleDict({vital: PatchTSMixerModel(...)})`, each
+  single-channel, sharing the Module-1 config.
+- Per-vital forward: slice `(B,1,L)` → transpose to `(B,L,1)` → encoder →
+  `last_hidden_state (B,1,250,64)` → **GAP over patch axis** → `wave_emb (B,64)`.
 - **Demographics encoded once** (single shared `demo_encoder`), fused into each
   per-vital head (decision: shared, not per-vital re-encode — fewer params).
-- Per-vital head: `concat(wave_emb_v, demo_emb) → MLP → (sbp_v, dbp_v)`.
+- Per-vital head (one per vital in a `ModuleDict`):
+  `concat(wave_emb_v, demo_emb) → Linear → GELU → Linear → (sbp_v, dbp_v)`.
 - Aggregate by **mean over the selected vitals**: `(SBP, DBP) = mean_{v∈active} (sbp_v, dbp_v)`.
 
 Channel→vital mapping uses model slot order ECG=0, PPG=1 (matches `signal[:, :2, :]`).
@@ -116,14 +131,22 @@ prediction. No per-vital dict / multi-output contract is introduced.
 ### Module 3 — per-task vital selection in the cascade
 
 `TaskSpec.cond_slots` already encodes the source modalities (ECG=0, PPG=1;
-[tasks.py:40-41](../../../src/model_module/tasks.py)). In
-[evaluate.py](../../../run/pipeline/evaluate.py), map the task's `cond_slots` to
-vital names and pass them as `active_vitals` so:
+[tasks.py:40-41](../../../src/model_module/tasks.py)). A shared helper maps
+`cond_slots` → vital names and is passed as `active_vitals` so:
 - `ppg2abp` → averages only the PPG head (no ECG leakage — current bug fixed);
 - `ecg2abp` → only ECG head;
 - `ecgppg2abp` → mean of both.
 
 Slot.ABP (target) is never a vital input.
+
+**Two call sites must both be updated** (both currently hard-code
+`bp_head(signal[:, :2, :], demographics)` for every task):
+- [evaluate.py:96](../../../run/pipeline/evaluate.py) (`_eval_task`);
+- [bp_metrics.py:117](../../../src/trainer_module/bp_metrics.py) (`_predict_one_task`,
+  used by the stage-2 finetune auto-eval).
+
+The trainer's own training call ([bp_head_trainer.py](../../../src/trainer_module/bp_head_trainer.py))
+stays as-is (`active_vitals=None` → both vitals).
 
 ### Module 4 — training / metrics / verification
 
@@ -131,35 +154,41 @@ Slot.ABP (target) is never a vital input.
   input remains `signal[:, :2, :]` + demographics, loss remains MSE in normalized
   space. Training always uses both vitals (`active_vitals=None`); per-task selection
   is an eval-time concern. AAMI ME/SD logging unchanged.
-- **Config** [bp_head.yaml](../../../run/conf/model/bp_head.yaml): set new defaults
-  (Module 1) and add `vitals`, `patch_stride`.
-- **Checkpoint compatibility**: param names change (ModuleDict of encoders); old
+- **Config** [bp_head.yaml](../../../run/conf/model/bp_head.yaml): set new HF-aligned
+  defaults and add `vitals`, `patch_stride`, `d_model`, `num_layers`, `expansion_factor`.
+- **Dependency**: add `transformers` to [requirements.txt](../../../requirements.txt).
+- **Checkpoint compatibility**: param names change (ModuleDict of HF encoders); old
   bp_head ckpts will NOT load. Retrain stage-1 pretrain + stage-2 finetune. Acceptable.
 - **Verification**:
-  - CPU: extend/run an overfit-one-batch check on the new `BPHead.forward`
-    (loss drops; output shape `(B,2)`).
+  - CPU: overfit-one-batch check on the new `BPHead.forward` with a **small** config
+    (few layers / small d_model) so it stays fast (loss drops; output shape `(B,2)`).
   - Unit tests under [tests/](../../../tests/): `forward(active_vitals=None)` equals
     the mean of `forward(active_vitals=["ecg"])` and `forward(active_vitals=["ppg"])`
-    (averaging correctness); single-vital calls differ from each other; `n_patches`
-    floor formula; patchify shape for patch_len=5/stride=5, L=1250 → 250 patches.
+    (averaging correctness); single-vital calls differ; default-config param budget
+    in the **15M–30M** band (≈22M); HF encoder output pooled to `(B,64)`.
   - Server: retrain, compare calibration-based test ME/SD vs the SD≫8 baseline.
 
 ## Components & interfaces
 
-- `BPHeadConfig` (frozen dataclass): `+ patch_stride: int`, `+ vitals: tuple[str,...]`;
-  `n_patches` → floor formula.
+- `BPHeadConfig` (frozen dataclass): HF-aligned fields `d_model`, `num_layers`,
+  `expansion_factor`, `patch_len`, `patch_stride`, `vitals`, `demo_in`, `demo_hidden`,
+  `fusion_hidden`.
 - `BPHead.forward(ecg_ppg, demographics=None, active_vitals=None) -> Tensor (B,2)`:
   returns the aggregate averaged over `active_vitals` (default = all vitals). Single
   Tensor return; no dict / multi-output contract.
 - `build_bp_head` factory unchanged in signature.
-- Cascade ([evaluate.py](../../../run/pipeline/evaluate.py)): compute `active_vitals`
+- `cond_slots_to_vitals(task) -> list[str]` helper (new): maps `task.cond_slots`
+  (ECG/PPG, skipping ABP) to vital names; used by both eval call sites.
+- Cascade ([evaluate.py](../../../run/pipeline/evaluate.py),
+  [bp_metrics.py](../../../src/trainer_module/bp_metrics.py)): compute `active_vitals`
   from `task.cond_slots`, pass to `bp_head(...)`, use the returned `(B,2)` directly.
 
 ## Risks
 
-- **Finer patching cost**: 250 patches × depth 15 raises compute/memory vs current
-  25 patches × depth 6. Two per-vital encoders ≈ 2× encoder params. Still small vs
-  the 30M RF backbone; verify it fits and `compile.mode=default` still trains.
+- **Head size ~22M**: depth-15 / patch-5 HF PatchTSMixer × 2 vitals. ~23× the current
+  head; fits H800 80GB but raises training compute/memory. Verify `compile` and AMP
+  still train within budget on the server.
+- **New `transformers` dependency** pulled into the project for this head.
 - **Retrain required** — both stages; expect a server iteration before any accuracy read.
 - **Expected gain uncertain**: A (morphology capture) and B (ensemble variance
   reduction) are the strongest available levers for SD, but if Step-0 reveals a label
