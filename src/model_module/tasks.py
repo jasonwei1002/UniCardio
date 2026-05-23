@@ -106,3 +106,18 @@ def active_task_pairs(
     if not pairs:
         raise ValueError("All task weights are zero.")
     return pairs
+
+
+# Slot → BP-head vital name. Only ECG/PPG are valid BP-head inputs; ABP is the
+# target waveform and is never fed to the scalar head.
+_SLOT_TO_VITAL: dict[Slot, str] = {Slot.ECG: "ecg", Slot.PPG: "ppg"}
+
+
+def cond_slots_to_vitals(task: TaskSpec) -> list[str]:
+    """Map a task's condition slots to BP-head vital names (ECG/PPG only).
+
+    Used by the evaluation cascade so the BP head averages only over the
+    modalities the task actually conditions on (e.g. ``ppg2abp`` -> ``["ppg"]``,
+    no ECG leakage). Order follows ``task.cond_slots``.
+    """
+    return [_SLOT_TO_VITAL[s] for s in task.cond_slots if s in _SLOT_TO_VITAL]
