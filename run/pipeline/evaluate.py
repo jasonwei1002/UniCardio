@@ -136,7 +136,12 @@ def main(cfg: DictConfig) -> None:
     device = _resolve_device(str(cfg.device))
     logger.info("Using device: %s", device)
 
-    _, _, test_loader = build_loaders(cfg.data)
+    eval_split = str(cfg.get("eval", {}).get("split", "test"))
+    if eval_split not in ("val", "test"):
+        raise ValueError(f"eval.split must be 'val' or 'test'; got {eval_split!r}")
+    _, val_loader, test_loader = build_loaders(cfg.data)
+    eval_loader = val_loader if eval_split == "val" else test_loader
+    logger.info("Evaluating on '%s' split (%d batches).", eval_split, len(eval_loader))
 
     rf_model = UniCardioRF(cfg.model)
     load_checkpoint(cfg.checkpoint, model=rf_model, map_location=device)
@@ -172,7 +177,7 @@ def main(cfg: DictConfig) -> None:
         for task in active_tasks:
             logger.info("Evaluating task %s", task.name)
             metrics = _eval_task(
-                rf_model, bp_head, test_loader, task,
+                rf_model, bp_head, eval_loader, task,
                 device=device, n_steps=n_steps, limit_batches=limit_batches,
                 bp_norm=bp_norm,
             )
