@@ -20,6 +20,8 @@ pandas>=1.5,<3.0
 scikit-learn>=1.2,<2.0
 tqdm>=4.65
 swanlab>=0.7,<1.0
+# src/model_module/bp_head.py 用 HF PatchTSMixer 作为 refinement 波形编码器
+transformers>=4.40
 
 # script/plot_first_sample.py 用到；不画图可不装
 matplotlib>=3.7
