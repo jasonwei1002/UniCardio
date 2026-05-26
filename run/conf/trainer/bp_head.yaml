@@ -1,6 +1,7 @@
-# BP head 训练器配置（Path A Stream 2）
+# BP head 训练器配置
 #
-# 单一回归目标 MSE(pred_mmHg, target_mmHg)，无 RF / mask / sampler 复杂度。
+# L1 回归目标（归一化 BP 标签空间），每 batch 随机采 task 选 vital 子集，
+# 无 RF / mask / sampler 复杂度。
 # 默认 stage='pretrain' 走 Train_Subset 80/20 划分；用 finetune_bp_head.sh
 # 切到 stage='finetune' 用 CalFree 80/10/10 calibration-based 微调。
 
@@ -31,3 +32,16 @@ log_every_n_steps: 50
 
 stage: pretrain
 init_from: null
+
+# Per-batch weighted task sampling (mirrors the RF trainer). Each batch draws
+# one ABP-target task; cond_slots_to_vitals(task) restricts the BP head's
+# active_vitals so each vital subset (ECG-only / PPG-only / both) is supervised
+# directly, matching how bp_metrics feeds the eval cascade. Only ABP-target
+# tasks whose vitals exist on the head are kept; the two ECG↔PPG directions are
+# 0 (not BP tasks). Set a task's weight to 0 to drop it from sampling.
+task_weights:
+  ecg2ppg: 0.0
+  ppg2ecg: 0.0
+  ecg2abp: 1.0
+  ppg2abp: 1.0
+  ecgppg2abp: 1.0

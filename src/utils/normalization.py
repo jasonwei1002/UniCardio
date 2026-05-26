@@ -1,12 +1,12 @@
 """ABP signal normalization.
 
-Path A (approximation + refinement decomposition) uses **per-sample min-max
+The approximation + refinement decomposition uses **per-sample min-max
 normalization**: each ABP segment is mapped to ``[0, 1]`` so the RF model
 learns shape only. Absolute SBP/DBP values are predicted by a separate
 ``BPHead`` and recombined at inference via :func:`reconstruct_mmHg`.
 
 The legacy global ``(x - 100) / 50`` path is retained for backwards
-compatibility with pre-Path-A checkpoints but should not be used by new
+compatibility with legacy checkpoints but should not be used by new
 training runs.
 """
 
@@ -30,9 +30,9 @@ Array = Union[np.ndarray, torch.Tensor]
 
 
 def bp_normalize(x: Array) -> Array:
-    """Legacy: ``(x - 100) / 50``. Deprecated since Path A."""
+    """Legacy: ``(x - 100) / 50``. Deprecated since the min-max refactor."""
     warnings.warn(
-        "bp_normalize is deprecated; use per-sample minmax_normalize (Path A).",
+        "bp_normalize is deprecated; use per-sample minmax_normalize.",
         DeprecationWarning,
         stacklevel=2,
     )
@@ -40,9 +40,9 @@ def bp_normalize(x: Array) -> Array:
 
 
 def bp_denormalize(x: Array) -> Array:
-    """Inverse of :func:`bp_normalize`. Deprecated since Path A."""
+    """Inverse of :func:`bp_normalize`. Deprecated since the min-max refactor."""
     warnings.warn(
-        "bp_denormalize is deprecated; use reconstruct_mmHg (Path A).",
+        "bp_denormalize is deprecated; use reconstruct_mmHg.",
         DeprecationWarning,
         stacklevel=2,
     )

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Path A Stream 2 — BP head 阶段二（CalFree calibration-based finetune）。
+# BP head 阶段二（CalFree calibration-based finetune）。
 #
 # 行为：
 #   - 加载阶段一 ckpt（仅模型权重，optimizer/scheduler/epoch 全新）。

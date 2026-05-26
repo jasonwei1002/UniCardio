@@ -1,4 +1,4 @@
-"""Path A per-sample min-max normalization helpers."""
+"""Per-sample min-max normalization helpers."""
 
 from __future__ import annotations
 

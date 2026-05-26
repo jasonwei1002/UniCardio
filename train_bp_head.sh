@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Path A Stream 2 — BP head 阶段一（pretrain）一键启动脚本。
+# BP head 阶段一（pretrain）一键启动脚本。
 #
 # 行为：
 #   - 数据集走 mode='pretrain'：Train_Subset.npy 80/20 train/val；

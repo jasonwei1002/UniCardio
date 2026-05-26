@@ -1,4 +1,4 @@
-"""Path A: ``np.memmap``-backed dataset returning shape-only ABP + scalars + demographics.
+"""``np.memmap``-backed dataset returning shape-only ABP + scalars + demographics.
 
 Channel order: 下游所有代码（模型、mask、采样器、指标）按
 **模型** slot 顺序 ``ECG=0, PPG=1, ABP=2`` 工作。``CardiacDataset``
@@ -81,7 +81,7 @@ def _build_csv_tables(
     if not csv_path.exists():
         logger.warning(
             "No CSV sibling at %s; sbp_dbp + demographics fall back to zero "
-            "tensors. Path A BP head training requires the CSV.",
+            "tensors. BP head training requires the CSV.",
             csv_path,
         )
         return bp_labels, demographics

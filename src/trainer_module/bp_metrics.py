@@ -1,23 +1,15 @@
-"""Path A signal-domain BP metrics: SBP/DBP ME and SD on the test split.
+"""Signal-domain BP metrics: SBP/DBP ME and SD on the test split.
 
-Under Path A the RF model produces a per-sample **shape-only** ABP in
-``[0, 1]``; the absolute SBP/DBP are predicted by a separate
-:class:`BPHead`. AAMI metric is therefore the BP head's prediction vs the
-CSV ground truth — the RF sampler does **not** affect the BP numbers
-directly. The Euler reconstruction is still combined with the predicted
-``(SBP, DBP)`` via :func:`reconstruct_mmHg` so callers that need the full
-mmHg waveform (e.g. visualization or waveform-fidelity metric) get it.
+The absolute SBP/DBP are predicted by a trained :class:`BPHead` directly
+from the raw ECG/PPG of each task's condition modalities (matching
+MD-ViSCo's scalar refinement metric — no waveform reconstruction, no RF
+sampler). A BP-head ckpt is **required**; the legacy sampler max/min
+fallback on the inverse-``(x-100)/50`` waveform has been removed.
 
 CSV alignment invariant: with ``shuffle=False`` the loader consumes the
 dataset in index order, so ``dataset.indices[k]`` is the row of sample
 ``k`` in both the ``.npy`` and the sibling ``.csv``. SD uses ``ddof=1``
 per BHS / AAMI convention.
-
-Backwards-compatible fallback: if ``bp_head`` is ``None``, the previous
-legacy path (sampler max/min of the inverse-normalized waveform) is used
-with a one-time WARNING. This lets RF-only training runs still produce a
-BP number while the BP head ckpt is not yet trained, but the numbers are
-not comparable to the Path A targets.
 """
 
 from __future__ import annotations
@@ -29,14 +21,12 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 import torch
-from torch import Tensor, nn
 from torch.utils.data import DataLoader
 
 from ..model_module.bp_head import BPHead, build_bp_head
-from ..model_module.tasks import TaskSpec
+from ..model_module.tasks import TaskSpec, cond_slots_to_vitals
 from ..utils.checkpoint import load_checkpoint
-from ..utils.normalization import bp_denormalize, reconstruct_mmHg
-from .sampler import euler_sample
+from ..utils.normalization import BPLabelNorm
 
 logger = logging.getLogger(__name__)
 
@@ -69,25 +59,23 @@ def load_bp_head_ckpt(
 
 @torch.no_grad()
 def _predict_one_task(
-    rf_model: nn.Module,
-    bp_head: BPHead | None,
+    bp_head: BPHead,
     test_loader: DataLoader,
     task: TaskSpec,
     *,
-    n_steps: int,
     device: torch.device,
     amp_enabled: bool,
+    bp_norm: BPLabelNorm | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return ``(sbp_pred, dbp_pred)`` per sample in loader order, mmHg.
 
-    Path A pathway (``bp_head is not None``): SBP/DBP come straight from
-    the BP head's regression on ECG+PPG. The RF Euler reconstruction is
-    still computed to keep the wave_mmHg buffer warm for any downstream
-    waveform-quality metric, but it does not feed into AAMI numbers.
-
-    Legacy fallback (``bp_head is None``): SBP/DBP = amax/amin of the
-    inverse-``(x-100)/50`` waveform — only meaningful for ckpts trained
-    under the legacy normalization.
+    SBP/DBP come straight from the BP head's regression on the task's
+    condition modalities (``active_vitals=cond_slots_to_vitals(task)``, so
+    e.g. ppg2abp does not leak the ECG channel). When ``bp_norm`` is set the
+    head output is in the globally min-max normalized ``[0, 1]`` label space
+    it was trained in and is denormalized back to mmHg before comparison
+    against the raw-mmHg CSV labels; ``bp_norm`` must match the head's
+    training ``data.bp_label_norm``.
     """
     sbp_chunks: list[np.ndarray] = []
     dbp_chunks: list[np.ndarray] = []
@@ -99,59 +87,51 @@ def _predict_one_task(
         with torch.autocast(
             device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled
         ):
-            # Always invoke the sampler so the per-task RF forward graph is
-            # exercised; useful for OOM / shape sanity checks and for any
-            # caller-side waveform metric that reuses the same loader.
-            out = euler_sample(
-                rf_model, signal, task, n_steps=n_steps, device=device
-            )
-        if bp_head is None:
-            wave_mmHg = bp_denormalize(out.squeeze(1).float())
-            sbp_chunks.append(wave_mmHg.amax(dim=-1).detach().cpu().numpy())
-            dbp_chunks.append(wave_mmHg.amin(dim=-1).detach().cpu().numpy())
-            continue
-        # Path A: BP head on raw ECG + PPG (+ demographics) → (SBP, DBP) mmHg.
-        with torch.autocast(
-            device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled
-        ):
-            bp_pred = bp_head(signal[:, :2, :], demographics).float()
+            bp_pred = bp_head(
+                signal[:, :2, :],
+                demographics,
+                active_vitals=cond_slots_to_vitals(task),
+            ).float()
+        if bp_norm is not None:
+            # Head was trained on min-max normalized [0, 1] labels; recover mmHg.
+            bp_pred = bp_norm.denormalize(bp_pred)
         sbp_chunks.append(bp_pred[:, 0].detach().cpu().numpy())
         dbp_chunks.append(bp_pred[:, 1].detach().cpu().numpy())
     return np.concatenate(sbp_chunks), np.concatenate(dbp_chunks)
 
 
 def evaluate_bp_test(
-    model: nn.Module,
     test_loader: DataLoader,
     *,
     tasks: Sequence[TaskSpec],
     csv_path: str | Path,
-    n_steps: int,
     device: torch.device,
+    bp_head_ckpt: str | Path,
     amp_enabled: bool = False,
-    bp_head_ckpt: str | Path | None = None,
+    bp_norm: BPLabelNorm | None = None,
 ) -> dict[str, dict[str, float]]:
     """Per-task SBP/DBP ME ± SD on the test split.
 
     Args:
-        model: RF model (:class:`UniCardioRF` or compiled wrapper).
         test_loader: must be ``shuffle=False``; ``dataset`` must expose
             ``.indices`` (CSV row indices).
         tasks: only ``target_slot == 2`` (ABP) tasks contribute; others
             are skipped with INFO.
         csv_path: ``.csv`` co-located with the test ``.npy``; must contain
             ``sbp`` and ``dbp`` columns aligned row-by-row with the ``.npy``.
-        n_steps: Euler ODE step count.
         device: torch device.
+        bp_head_ckpt: path to a trained :class:`BPHead` ckpt (required).
         amp_enabled: enable bf16 autocast.
-        bp_head_ckpt: path to a trained :class:`BPHead` ckpt. If ``None``,
-            falls back to legacy sampler-max/min on inverse ``(x-100)/50``
-            normalization (with a WARNING).
+        bp_norm: SBP/DBP label normalization the BP head was trained under.
+            When set, the head's ``[0, 1]`` output is denormalized back to
+            mmHg before comparison. ``None`` assumes the head emits raw mmHg.
 
     Returns:
         ``{task_name: {sbp_me, sbp_sd, dbp_me, dbp_sd, n}}``. ``error =
         pred - true``; ``SD`` is sample stddev (``ddof=1``).
     """
+    if not bp_head_ckpt:
+        raise ValueError("evaluate_bp_test requires a trained bp_head_ckpt.")
     csv_path = Path(csv_path)
     if not csv_path.exists():
         raise FileNotFoundError(f"BP labels CSV not found: {csv_path}")
@@ -172,16 +152,8 @@ def evaluate_bp_test(
     sbp_true = sbp_label_all[indices]
     dbp_true = dbp_label_all[indices]
 
-    bp_head: BPHead | None = None
-    if bp_head_ckpt is not None:
-        bp_head = load_bp_head_ckpt(bp_head_ckpt, device)
-        logger.info("BP head loaded from %s for Path A inference.", bp_head_ckpt)
-    else:
-        logger.warning(
-            "No bp_head_ckpt provided; falling back to legacy sampler "
-            "max/min path. BP numbers will only be meaningful for ckpts "
-            "trained under the deprecated (x-100)/50 normalization."
-        )
+    bp_head = load_bp_head_ckpt(bp_head_ckpt, device)
+    logger.info("BP head loaded from %s for BP inference.", bp_head_ckpt)
 
     results: dict[str, dict[str, float]] = {}
     for task in tasks:
@@ -190,8 +162,9 @@ def evaluate_bp_test(
             continue
 
         sbp_pred, dbp_pred = _predict_one_task(
-            model, bp_head, test_loader, task,
-            n_steps=n_steps, device=device, amp_enabled=amp_enabled,
+            bp_head, test_loader, task,
+            device=device, amp_enabled=amp_enabled,
+            bp_norm=bp_norm,
         )
         if sbp_pred.size != n:
             raise RuntimeError(

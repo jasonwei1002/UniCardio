@@ -1,4 +1,4 @@
-"""Path A: BP head training entry point.
+"""BP head training entry point.
 
 Mirrors :mod:`run.pipeline.train` but instantiates :class:`BPHead` instead of
 :class:`UniCardioRF` and dispatches to :func:`bp_head_trainer.train`.

@@ -1,4 +1,4 @@
-# Path A: BP head 训练主配置（Stream 2）
+# BP head 训练主配置
 #
 # Hydra 把本文件与 data/default、model/bp_head、trainer/bp_head 组合起来。
 # CLI 覆盖示例:

@@ -1,21 +1,36 @@
-# BPHead v2 (Path A refinement) 模型配置
+# BPHead v4 (BP refinement) — 忠实 MD-ViSCo VitalEncoder (pi=true) §6.2.2。
 #
-# Architecture (mirrors MD-ViSCo Sec III.D):
-#   - PatchTSMixer waveform encoder on ECG+PPG: patch → token-mix MLP +
-#     channel-mix MLP × depth → GAP over patches → wave_emb
-#   - Demographic encoder on (age_z, gender, height_z, weight_z, bmi_z,
-#     mask): 2-layer MLP → demo_emb
-#   - Fusion head: concat(wave_emb, demo_emb) → 2-layer MLP → (SBP, DBP)
+# 每 vital (ECG slot 0, PPG slot 1):
+#   waveform_encoder HF PatchTSMixer → flatten → ProjectionHead(→projection_dim)
+#   → 与 demo embedding 拼成 2 通道 → 第二级 PatchTSMixer → flatten
+#   → MlpBP(sbp/dbp 双头) → (SBP, DBP)；per-vital 平均。
 #
-# Default ~950 k params (was ~460 k @ dim=128); still <4% of the 30 M RF
-# backbone. Output is raw mmHg; loss = MSE in mmHg² space.
+# 有意偏离 MD-ViSCo PulseDB 忠实配置（用户推迟）：
+#   - demographics 用数值 MLP(6→projection_dim) 替代 DistilBERT，作 PI 第二通道；
+#   - 不上 WCL（loss 用 L1，在 normalized BP-label 空间，见 data.bp_label_norm；
+#     MD-ViSCo 是 L1 + multi-WCL，这里保留 L1、推迟 WCL）。
+#
+# ~385M params（每 vital ~192M，MlpBP 对 2 通道展平输出 13056 维接 Linear 是参数沉重点）。
+# 旧 ckpt 不兼容，需重训 stage-1 + stage-2。
+# 输出空间 = 训练标签空间：默认开启 data.bp_label_norm(vmin=40,vmax=180) → head
+# 输出归一化 [0,1]；评估时 evaluate_bp_test 用同一 BPLabelNorm.denormalize 还原
+# mmHg。data.bp_label_norm 为空时才退化为 raw mmHg（legacy）。
 
-in_channels: 2          # ECG (slot 0) + PPG (slot 1)
 slot_length: ${data.slot_length}
-patch_len: 50           # 50 samples = 0.4 s @ 125 Hz; 1250/50 = 25 patches
-dim: 192                # token / channel dim (was 128)
-depth: 6                # PatchTSMixer blocks
-mlp_ratio: 2            # MLP hidden expansion factor
-demo_in: 6              # 5 numeric demographics + 1 missingness mask
+vitals: [ecg, ppg]          # 模型 slot 0, 1
+
+# HF PatchTSMixer 超参（两级 encoder 共用，MD-ViSCo §6.2.2）。
+patch_len: 5                # 5 整除 1250 → 250 patches（MD-ViSCo 在 1280 用 4）
+patch_stride: 5
+d_model: 64
+num_layers: 15
+expansion_factor: 5
+
+# ProjectionHead + 第二级融合 encoder。
+projection_dim: 512
+proj_dropout: 0.1
+mlp_dropout: 0.2            # MlpBP dropout（MD-ViSCo 用 0.2）
+
+# Demographics MLP（替代 DistilBERT，投到 projection_dim 作 PI 第二通道）。
+demo_in: 6                  # 5 numeric demographics + 1 missingness mask
 demo_hidden: 64
-fusion_hidden: 192      # was 128

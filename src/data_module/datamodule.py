@@ -159,7 +159,7 @@ def build_loaders(
         test_spec[1].size,
     )
 
-    # Path A: CSV-derived (sbp/dbp + demographics) tables are computed once
+    # CSV-derived (sbp/dbp + demographics) tables are computed once
     # per unique .npy and shared across train/val/test datasets that source
     # from the same file. The first CardiacDataset built per path populates
     # the tables; subsequent ones reuse them (avoids re-parsing 902k-row CSV

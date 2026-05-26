@@ -71,7 +71,7 @@ finetune:
   # 0 表示仅微调 output_heads；>=5 等价于只冻结 input stem + time embedding。
   n_unfrozen_blocks: 2
 
-# Path A: stage-2 末尾 BP 指标评估时使用的 BPHead ckpt 路径。
+# stage-2 末尾 BP 指标评估时使用的 BPHead ckpt 路径。
 # null 时退化到 legacy sampler max/min 路径（仅对旧 (x-100)/50 ckpt 有意义）。
 # 训练 BP head 请用 train_bp_head.sh / finetune_bp_head.sh。
 bp_head_ckpt: null

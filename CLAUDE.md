@@ -27,7 +27,7 @@ Direct point of comparison: **MD-ViSCo** (Meyer et al., KAIST; `paper reference/
 | Axis | MD-ViSCo | UniCardio |
 |------|----------|-----------|
 | Conversion direction | any-to-any across {ECG, PPG, ABP} | 5 task pairs (3 ABP-target active by default) |
-| Modeling paradigm | Deterministic 1D U-Net + Swin Transformer encoder/decoder + AdaIN style injection (target type as style indicator); two-stage approximation + refinement (refinement = PatchTSMixer SBP/DBP regression + linear rescale to mmHg) | **Rectified Flow** velocity prediction with Lipman/SD3 logit-normal `t` sampling; single backbone, no explicit refinement head; ABP recovered from normalized output by inverse of `(x-100)/50` |
+| Modeling paradigm | Deterministic 1D U-Net + Swin Transformer encoder/decoder + AdaIN style injection (target type as style indicator); two-stage approximation + refinement (refinement = PatchTSMixer SBP/DBP regression + linear rescale to mmHg) | Two components, **trained separately but cascaded at inference**. **RF backbone**: Rectified Flow velocity prediction with Lipman/SD3 logit-normal `t` sampling; recovers the ABP waveform from normalized output by inverse of `(x-100)/50`. **BP head**: a MD-ViSCo-faithful `VitalEncoder` refinement head (`src/model_module/bp_head.py`) regressing scalar SBP/DBP — see "BP refinement head" below. The RF backbone is **pretrain-only**; only the BP head runs the two stages (pretrain → CalFree finetune). The eval cascade runs both on the same batch (waveform from RF, mmHg from the head) |
 | Slot/channel scheme | Single-channel input + one-hot target-domain selector `d^{(j)}` fed through AdaIN `(γ, β)` | 3-slot concatenated `(ECG, PPG, ABP)` input + per-task attention mask + indexed per-slot output head |
 | Datasets | PulseDB (VitalDB + MIMIC-III, ~5.2 M segments, 5 361 patients, 125 Hz, 1 280-pt segments) + UCI (MIMIC-II) | PulseDB only — `data/pulsedb/Train_Subset.npy` (2 506 subjects, 902 160 samples) + `data/pulsedb/CalFree_Test_Subset.npy` (279 subjects, 111 600 samples). **Zero subject overlap between Train_Subset and CalFree.** Slot length L=1 250 (10 s @ 125 Hz). |
 | Pretrain protocol | **Patient-level (subject-disjoint) split** — "ensuring that the train and test sets contain no overlapping patients to assess whether the model generalizes to entirely unseen patients" | Stage-1 `mode='pretrain'`: `Train_Subset.npy` 80/20 train/val, `CalFree_Test_Subset.npy` as held-out test. Equivalent to MD-ViSCo's calibration-free pretrain. |
@@ -65,7 +65,7 @@ Python 3.10+, PyTorch ≥2.5 (FlexAttention 用 BlockMask + flex_attention，CPU
 Run from the **repo root** — Hydra finds configs in `run/conf`:
 
 ```bash
-# Unit tests (masks, RF step, sampler — 43 cases, ~1-2 s on CPU).
+# Unit tests (masks, RF step, sampler, BP head, tasks — 65 cases, ~1-3 s on CPU).
 python -m pytest tests/
 python -m pytest tests/test_masks.py::test_self_only_for_active_slots   # single test
 
@@ -79,15 +79,24 @@ python run/pipeline/train.py
 python run/pipeline/train.py device=cpu trainer.epochs=2 data.num_workers=0
 python run/pipeline/train.py trainer.compile.enabled=false   # skip Dynamo when iterating
 
-# Stage-2 (CalFree finetune): load stage-1 weights, freeze backbone,
-# only last N residual blocks + output heads trainable. Auto-runs RF + BP
-# metric eval on CalFree test split at the end.
+# Stage-2 RF CalFree finetune (OPTIONAL/legacy — current default is RF
+# pretrain-only; calibration-based finetune is done by the BP head instead).
+# Loads stage-1 weights, freezes backbone, only last N residual blocks +
+# output heads trainable. Auto-runs RF + BP metric eval at the end.
 bash finetune.sh run/outputs/<stage1>/checkpoints/best.pt
 bash finetune.sh <ckpt> trainer.finetune.n_unfrozen_blocks=1 trainer.lr=5e-5
 
 # Evaluation with a checkpoint. On the GPU server prefer `bash test.sh [ckpt]`,
 # which auto-picks the latest `run/outputs/*/checkpoints/best.pt` if no path is given.
 python run/pipeline/evaluate.py +checkpoint=run/outputs/<run>/checkpoints/best.pt
+# Eval ABP-target tasks in mmHg via a trained BP head:
+python run/pipeline/evaluate.py +checkpoint=<rf_ckpt> +bp_head_checkpoint=<bp_head_ckpt>
+
+# BP refinement head — trained separately from the RF backbone, cascaded at eval.
+# Pretrain on Train_Subset (calibration-free), then CalFree finetune.
+bash train_bp_head.sh                                          # stage-1
+bash finetune_bp_head.sh run/outputs/<bp_pretrain>/checkpoints/best.pt   # stage-2 + auto BP-MAE eval
+python run/pipeline/train_bp_head.py device=cpu trainer.epochs=2 data.num_workers=0  # CPU debug
 ```
 
 Default `data.name: pulsedb` reads from `data/pulsedb/{Train_Subset,CalFree_Test_Subset}.npy`. Legacy single-file mode (`data.name=combined`) honors `${oc.env:UNICARDIO_DATA, data/Final_sig_combined.npy}` — set `UNICARDIO_DATA=/abs/path/to.npy` to point at a different dataset without editing the config.
@@ -114,6 +123,13 @@ Two datasets are wired through `data.name`:
 
 Both paths apply the BP normalization `(x - 100) / 50` on model slot 2 inside `CardiacDataset.__getitem__`. Everything downstream speaks exclusively in model slot indices. `split_seed: 42` for reproducibility.
 
+**Dataset returns a 3-tuple** `(signal, sbp_dbp, demographics)` (see `src/data_module/cardiac_dataset.py`):
+- `signal`: `(3, L_slot)` model-slot waveform (as above).
+- `sbp_dbp`: `(2,)` scalar SBP/DBP labels read from a **sibling `.csv`** (same dir + stem as the `.npy`, per-cycle mean labeling — *not* per-segment min/max). Missing CSV/columns → zero-filled with a WARNING.
+- `demographics`: `(6,) = [age_z, gender, height_z, weight_z, bmi_z, mask]` (z-scored, last column = anthropometric-present mask), also from the CSV.
+
+The **RF backbone trainer only consumes `signal`** (`batch[0]`); `sbp_dbp`/`demographics` are for the BP head. When `data.bp_label_norm` is set (default `{vmin: 40, vmax: 180}`), `sbp_dbp` is additionally min-max normalized to `[0, 1]` (MD-ViSCo Sec III.D); `BPLabelNorm.from_cfg(cfg.data).denormalize(...)` recovers mmHg at eval. Set it empty for raw-mmHg labels (legacy).
+
 ## Architecture
 
 ### Code Layout
@@ -129,29 +145,34 @@ src/
 │   ├── embeddings.py     # SignalEncoder (multi-scale Conv1d) + FlowTimeEmbedding
 │   ├── residual_block.py # _FlexAttentionFFN (BlockMask→flex, Tensor→SDPA) + gated FFN block
 │   ├── backbone.py       # UniCardioBackbone: 3-slot encode → 5× residual → per-slot head
+│   ├── bp_head.py        # MD-ViSCo VitalEncoder SBP/DBP regressor (cascaded w/ RF at eval)
 │   └── unicardio_rf.py   # UniCardioRF wrapper + freeze_for_finetune
 ├── trainer_module/
 │   ├── rectified_flow.py # sample_t_logit_normal, build_rf_inputs, rf_train_step
 │   ├── sampler.py        # euler_sample (N-step ODE under Lipman convention)
-│   ├── trainer.py        # train loop: task sampling, AMP, compile, scheduler, ckpt
-│   ├── bp_metrics.py     # evaluate_bp_test: SBP/DBP ME+SD per ABP-target task
+│   ├── trainer.py        # RF train loop: task sampling, AMP, compile, scheduler, ckpt
+│   ├── bp_head_trainer.py# BP-head train loop (L1 regression, per-batch task/vital-subset sampling, no RF)
+│   ├── bp_metrics.py     # evaluate_bp_test: SBP/DBP ME+SD via trained BP head (ckpt required)
 │   └── csv_logger.py     # Append-only CSV logger
 └── utils/                # seed, checkpoint (unwraps DP/DDP/OptimizedModule), normalization
 
 run/
 ├── conf/                 # Hydra configs: data / model / trainer / sampler / root
 ├── pipeline/
-│   ├── train.py          # Hydra entrypoint; dispatches stage='pretrain'|'finetune'
+│   ├── train.py          # RF Hydra entrypoint; dispatches stage='pretrain'|'finetune'
+│   ├── train_bp_head.py  # BP-head Hydra entrypoint (config_bp_head.yaml)
 │   ├── evaluate.py       # 5-task RMSE / MAE / KS on the test split
 │   └── smoke_test.py     # Per-task overfit-one-batch sanity test
 └── outputs/              # Hydra run directories (gitignored)
 
-tests/                    # pytest unit tests (masks, rf_step, sampler) — 43 cases
+tests/                    # pytest unit tests (masks, rf_step, sampler, bp_head, tasks) — 65 cases
 script/                   # Reusable utilities (data conversion, swanlog pull, sample plot)
 data/pulsedb/             # Active dataset (gitignored): Train_Subset.npy + CalFree_Test_Subset.npy
-train.sh                  # Stage-1 pretrain one-shot (GPU server)
-finetune.sh <ckpt>        # Stage-2 CalFree finetune (loads ckpt, freezes backbone)
+train.sh                  # RF Stage-1 pretrain one-shot (GPU server)
+finetune.sh <ckpt>        # RF Stage-2 CalFree finetune (loads ckpt, freezes backbone)
 test.sh [ckpt]            # 评估入口（默认挑最新 best.pt，可传入 ckpt 路径）
+train_bp_head.sh          # BP-head Stage-1 pretrain
+finetune_bp_head.sh <ckpt># BP-head Stage-2 CalFree finetune + BP-MAE eval
 ```
 
 Convention: any reusable helper script lives in `script/` at the repo root — do not scatter them under `data/` or feature subdirs (see `convert_h5_to_npy_csv.py`, `convert_mimicbp_to_npy_csv.py`, `fetch_swanlog.py`).
@@ -207,8 +228,19 @@ DataLoader uses `persistent_workers=True` + `prefetch_factor=4`; `train`/`val` s
 
 ### Two-stage training (`trainer.stage`)
 
+> **Current default: the RF backbone is pretrain-only.** The calibration-based finetune is now delegated to the BP head (see "BP refinement head"). The RF `finetune` path below (`finetune.sh`, `freeze_for_finetune`) still works and is kept as an optional/legacy route, but is not part of the active two-stage plan.
+
 - **`pretrain`** (default, `bash train.sh`) = MD-ViSCo's **calibration-free** stage: full training on `Train_Subset.npy` 80/20 split. Stage-1 test = `CalFree_Test_Subset.npy` (subject-disjoint from Train_Subset, so this is a true generalization-to-unseen-patient evaluation).
 - **`finetune`** (`bash finetune.sh <stage1 ckpt>`) = MD-ViSCo's **calibration-based** stage: loads `trainer.init_from` model weights → `UniCardioRF.freeze_for_finetune(n)` freezes the stem (`SignalEncoder` + LayerNorm + FlowTimeEmbedding) and unfreezes the last `trainer.finetune.n_unfrozen_blocks` `ResidualBlock`s plus all `output_heads` → fused Adam is built **after** the freeze, so `param_groups` only see trainable tensors. Data switches to `mode='finetune'` (CalFree 80/10/10 **sample-level**, so subjects are intentionally shared across train/val/test — this is the per-patient calibration model, not a leakage bug). After the last epoch, `best.pt` is reloaded and `bp_metrics.evaluate_bp_test` runs an 8-step Euler sampler on the stage-2 test split, logging per-task SBP/DBP ME+SD (mmHg) to SwanLab + `logs/finetune_bp_metrics.csv`. Set `trainer.finetune.n_unfrozen_blocks=5` to fully unfreeze the transformer (closest to MD-ViSCo's reported full-model finetune); stem stays frozen because it captures modality physics that does not need per-subject adaptation.
+
+### BP refinement head
+
+A **separate training pipeline** from the RF backbone (own model, configs, scripts), but the two are **combined into one evaluation cascade** — see "Feeding RF eval" below. Faithful to MD-ViSCo's `VitalEncoder`/`BPModel` (IEEE JBHI 2026 §6.2.2), it regresses scalar SBP/DBP directly from raw ECG+PPG (+ demographics) — it does **not** touch the RF velocity field, masks, or sampler during its own training.
+
+- **Model** (`src/model_module/bp_head.py`, `BPHead`, ~385M params): per source vital (ECG slot 0, PPG slot 1) an independent stack — HF `PatchTSMixerModel` waveform encoder → `ProjectionHead` → fuse with a demographics embedding as a 2nd channel → second `PatchTSMixerModel` → `MlpBP` SBP/DBP dual head. Per-vital `(SBP, DBP)` are **averaged over the active vitals**. Two intentional deviations from MD-ViSCo's pi=true config (both deferred by the user, not simplifications): demographics come from a numeric MLP instead of DistilBERT, and loss is plain L1 (MD-ViSCo uses L1 + multi-WCL; WCL deferred). Config: `run/conf/model/bp_head.yaml` → `BPHeadConfig`.
+- **Output space = training label space**: with `data.bp_label_norm` set (default), the head emits normalized `[0,1]`; `BPLabelNorm.denormalize` recovers mmHg downstream.
+- **Training** (`run/pipeline/train_bp_head.py` → `src/trainer_module/bp_head_trainer.py`, config root `run/conf/config_bp_head.yaml` + `run/conf/trainer/bp_head.yaml`): `L1(pred, target)` objective, no time embedding / mask / Euler. **Per-batch weighted task sampling** (`trainer.task_weights`, mirrors the RF trainer): each batch draws one ABP-target task and `cond_slots_to_vitals(task)` sets the head's `active_vitals`, so each vital subset (ECG-only `ecg2abp` / PPG-only `ppg2abp` / both `ecgppg2abp`) is supervised directly — matching how `bp_metrics` feeds the eval cascade. Same two-stage split as the RF backbone (`stage=pretrain` Train_Subset 80/20; `stage=finetune` CalFree 80/10/10). Eval is **per-task**: val/test report ME±SD in mmHg for each task; `best.pt` selected by the **minimum mean per-task validation L1 loss** (label space, `val_loss_mean`) — mirroring MD-ViSCo's "min val loss" criterion (MD-ViSCo monitors L1 + multi-WCL; WCL deferred here). Scripts: `train_bp_head.sh`, `finetune_bp_head.sh`.
+- **Feeding RF eval**: `evaluate_bp_test` (`src/trainer_module/bp_metrics.py`) **requires** a trained BP head — `trainer.bp_head_ckpt` (RF finetune) or `+bp_head_checkpoint=` (evaluate.py) — denormalizing via `bp_norm`; SBP/DBP come straight from the head's scalar regression (no RF sampler, matching MD-ViSCo's scalar refinement metric). The old sampler-amax/amin fallback on inverse `(x-100)/50` has been **removed**; RF finetune skips BP eval with a WARNING when no head ckpt is configured. `cond_slots_to_vitals(task)` (`src/model_module/tasks.py`) restricts the head's vital averaging to the task's condition slots (e.g. `ppg2abp → ["ppg"]`, no ECG leakage).
 
 ### Inference API
 

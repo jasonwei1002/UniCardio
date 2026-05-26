@@ -24,6 +24,7 @@ from tqdm import tqdm
 
 from ..model_module.tasks import TASK_LIST, TaskSpec, active_task_pairs
 from ..utils.checkpoint import load_checkpoint, save_checkpoint, unwrap_model
+from ..utils.normalization import BPLabelNorm
 from .bp_metrics import evaluate_bp_test
 from .csv_logger import SimpleCSVLogger
 from .rectified_flow import rf_train_step
@@ -174,16 +175,16 @@ def train(
     output_dir: str | Path,
     test_loader: DataLoader | None = None,
     bp_test_csv: str | Path | None = None,
-    sampler_n_steps: int = 8,
+    bp_label_norm: BPLabelNorm | None = None,
 ) -> None:
     """执行完整的 Rectified Flow 训练循环。
 
     Args:
         model: :class:`UniCardioRF`（或由 :class:`nn.DataParallel` 等包裹过的版本）。
         cfg: 训练器配置（OmegaConf DictConfig 或普通 dict 均可）。
-        train_loader: 产出 ``(signal, sbp_dbp)`` 的 DataLoader（Path A 契约）。
+        train_loader: 产出 ``(signal, sbp_dbp)`` 的 DataLoader（数据契约）。
             signal 形状 ``(B, 3, L)``，ABP slot 已 per-sample minmax 到 [0,1]。
-            RF 训练只用 signal，忽略 sbp_dbp（后者属于 Stream 2 BP head）。
+            RF 训练只用 signal，忽略 sbp_dbp（后者属于 BP head）。
         val_loader: 可选的验证 loader，需满足相同的输出契约。
         device: PyTorch device。
         output_dir: 本次运行的输出目录（由 Hydra 创建）。
@@ -193,7 +194,10 @@ def train(
             ``.csv``（含 ``sbp``、``dbp`` 列）。提供时会在 RF loss 之外，
             额外用 :func:`evaluate_bp_test` 计算每个 ABP-target task 的
             SBP/DBP ME 与 SD（mmHg）。
-        sampler_n_steps: BP 评估用的 Euler ODE 步数。
+        bp_label_norm: BP head 训练时所用的 SBP/DBP 标签归一化。非 None 时，
+            :func:`evaluate_bp_test` 会把 head 的 ``[0, 1]`` 输出反归一化回
+            mmHg 再与 CSV 标签比较（必须与训练 head 的 ``data.bp_label_norm``
+            一致）。None 表示 head 直接输出 mmHg。
     """
     if isinstance(cfg, DictConfig):
         cfg_dict = OmegaConf.to_container(cfg, resolve=True)
@@ -464,16 +468,22 @@ def train(
             }
         )
 
-        if bp_test_csv is not None:
-            bp_head_ckpt = cfg_dict.get("bp_head_ckpt")
+        bp_head_ckpt = cfg_dict.get("bp_head_ckpt")
+        if bp_test_csv is not None and bp_head_ckpt is None:
+            logger.warning(
+                "bp_test_csv given but trainer.bp_head_ckpt is unset; skipping "
+                "BP metric eval. Train a BP head and pass its ckpt to get "
+                "mmHg SBP/DBP numbers (the legacy sampler max/min path is gone)."
+            )
+        if bp_test_csv is not None and bp_head_ckpt is not None:
             bp_results = evaluate_bp_test(
-                model, test_loader,
+                test_loader,
                 tasks=active_tasks,
                 csv_path=bp_test_csv,
-                n_steps=sampler_n_steps,
                 device=device,
                 amp_enabled=amp_enabled,
                 bp_head_ckpt=bp_head_ckpt,
+                bp_norm=bp_label_norm,
             )
             bp_swan: dict[str, float] = {}
             for task_name, m in bp_results.items():

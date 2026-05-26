@@ -1,4 +1,4 @@
-"""Path A 评估入口：加载 RF ckpt（+ 可选 BPHead ckpt）并对所有任务打分。
+"""评估入口：加载 RF ckpt（+ 可选 BPHead ckpt）并对所有任务打分。
 
 例：
     # ABP-target 任务在 mmHg 量纲下报指标（推荐）：
@@ -31,7 +31,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from src.data_module.datamodule import build_loaders
-from src.model_module.tasks import Slot, active_task_pairs
+from src.model_module.tasks import Slot, active_task_pairs, cond_slots_to_vitals
 from src.model_module.unicardio_rf import UniCardioRF
 from src.trainer_module.bp_metrics import load_bp_head_ckpt
 from src.trainer_module.sampler import euler_sample
@@ -63,7 +63,7 @@ def _eval_task(
 ) -> dict[str, float]:
     """Per-task waveform metrics.
 
-    For ABP-target tasks under Path A: if ``bp_head`` is provided, both
+    For ABP-target tasks: if ``bp_head`` is provided, both
     pred and target waveforms are reconstructed to mmHg via the predicted
     ``(SBP, DBP)`` (pred) and the ground-truth ``(SBP, DBP)`` (target).
     Otherwise both stay in shape-only ``[0, 1]`` and only Pearson is
@@ -93,7 +93,13 @@ def _eval_task(
         pred = euler_sample(rf_model, signal, task, n_steps=n_steps, device=device)
 
         if is_abp and bp_head is not None and sbp_dbp_true is not None:
-            bp_pred = bp_head(signal[:, :2, :], demographics).float()
+            # Average only over the task's condition modalities (no ECG leakage
+            # for ppg2abp, no PPG leakage for ecg2abp).
+            bp_pred = bp_head(
+                signal[:, :2, :],
+                demographics,
+                active_vitals=cond_slots_to_vitals(task),
+            ).float()
             # reconstruct_mmHg expects SBP/DBP in mmHg; inverse if labels are
             # in normalized space.
             if bp_norm is not None:

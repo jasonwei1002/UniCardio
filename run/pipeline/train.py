@@ -25,6 +25,7 @@ if str(_REPO_ROOT) not in sys.path:
 from src.data_module.datamodule import build_loaders
 from src.model_module.unicardio_rf import UniCardioRF
 from src.trainer_module.trainer import train
+from src.utils.normalization import BPLabelNorm
 from src.utils.seed import set_seed
 
 logger = logging.getLogger(__name__)
@@ -98,9 +99,12 @@ def main(cfg: DictConfig) -> None:
 
     # finetune 模式下，从数据 .npy 同源的 .csv 读 sbp/dbp 标签做信号域 BP 评估。
     bp_test_csv = None
-    sampler_n_steps = int(cfg.sampler.get("n_steps", 8)) if "sampler" in cfg else 8
+    bp_label_norm = None
     if stage == "finetune" and str(cfg.data.get("name")) == "pulsedb":
         bp_test_csv = str(cfg.data.pulsedb.test_path).replace(".npy", ".csv")
+        # BP head output lives in the same normalized label space the data
+        # module applies; pass it so evaluate_bp_test recovers mmHg.
+        bp_label_norm = BPLabelNorm.from_cfg(cfg.data)
 
     _init_swanlab(cfg)
     try:
@@ -113,7 +117,7 @@ def main(cfg: DictConfig) -> None:
             output_dir=cfg.output_dir,
             test_loader=test_loader if stage == "finetune" else None,
             bp_test_csv=bp_test_csv,
-            sampler_n_steps=sampler_n_steps,
+            bp_label_norm=bp_label_norm,
         )
     finally:
         swanlab.finish()
