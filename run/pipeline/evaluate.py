@@ -63,16 +63,25 @@ def _eval_task(
 ) -> dict[str, float]:
     """Per-task waveform metrics.
 
-    For ABP-target tasks: if ``bp_head`` is provided, both
-    pred and target waveforms are reconstructed to mmHg via the predicted
-    ``(SBP, DBP)`` (pred) and the ground-truth ``(SBP, DBP)`` (target).
-    Otherwise both stay in shape-only ``[0, 1]`` and only Pearson is
-    physically meaningful.
+    For ABP-target tasks with a ``bp_head``:
+
+    * **target** = the *raw* ABP waveform in mmHg, recovered by exactly
+      inverting the dataset's per-sample min-max with the segment extrema
+      ``abp_minmax = (dbp_seg, sbp_seg)`` (the 4th batch element). This is the
+      true on-disk waveform, not a label-reconstructed proxy.
+    * **pred** = RF shape × the BP head's predicted ``(SBP, DBP)``.
+
+    The two amplitude anchors differ by construction: the target uses
+    per-segment extrema, while the BP head regresses PulseDB per-cycle-mean
+    SBP/DBP. That gap is a genuine (small) part of the end-to-end mmHg error,
+    consistent with MD-ViSCo measuring against the original waveform.
+
+    Without a ``bp_head`` both stay in shape-only ``[0, 1]`` and only Pearson
+    is physically meaningful.
 
     When ``bp_norm`` is provided (MD-ViSCo refinement-style globally min-max
-    normalized BP labels), both the BP head output and the ground-truth
-    ``sbp_dbp`` from the loader are in [0, 1] space; this function inverts
-    them to mmHg before feeding into ``reconstruct_mmHg``.
+    normalized BP labels), the BP head output is in [0, 1] space; this
+    function inverts it to mmHg before feeding into ``reconstruct_mmHg``.
     """
     preds: list[np.ndarray] = []
     targets: list[np.ndarray] = []
@@ -87,12 +96,12 @@ def _eval_task(
     is_abp = int(task.target_slot) == int(Slot.ABP)
     for batch_idx, batch in enumerate(pbar):
         signal = batch[0].to(device)
-        sbp_dbp_true = batch[1].to(device) if len(batch) > 1 else None
         demographics = batch[2].to(device) if len(batch) > 2 else None
+        abp_minmax = batch[3].to(device) if len(batch) > 3 else None
         target = signal[:, int(task.target_slot):int(task.target_slot) + 1, :]
         pred = euler_sample(rf_model, signal, task, n_steps=n_steps, device=device)
 
-        if is_abp and bp_head is not None and sbp_dbp_true is not None:
+        if is_abp and bp_head is not None and abp_minmax is not None:
             # Average only over the task's condition modalities (no ECG leakage
             # for ppg2abp, no PPG leakage for ecg2abp).
             bp_pred = bp_head(
@@ -104,11 +113,13 @@ def _eval_task(
             # in normalized space.
             if bp_norm is not None:
                 bp_pred = bp_norm.denormalize(bp_pred)
-                sbp_dbp_true = bp_norm.denormalize(sbp_dbp_true)
+            # pred: RF shape × BP-head-predicted (SBP, DBP).
             sbp_p, dbp_p = bp_pred[:, 0], bp_pred[:, 1]
-            sbp_t, dbp_t = sbp_dbp_true[:, 0], sbp_dbp_true[:, 1]
             pred = reconstruct_mmHg(pred.squeeze(1), sbp_p, dbp_p).unsqueeze(1)
-            target = reconstruct_mmHg(target.squeeze(1), sbp_t, dbp_t).unsqueeze(1)
+            # target: exact raw ABP via the dataset's per-segment min-max
+            # extrema (dbp_seg, sbp_seg) — the true on-disk waveform in mmHg.
+            dbp_seg, sbp_seg = abp_minmax[:, 0], abp_minmax[:, 1]
+            target = reconstruct_mmHg(target.squeeze(1), sbp_seg, dbp_seg).unsqueeze(1)
         preds.append(pred.cpu().numpy())
         targets.append(target.cpu().numpy())
         if limit_batches is not None and (batch_idx + 1) >= limit_batches:

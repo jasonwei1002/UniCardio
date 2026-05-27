@@ -6,18 +6,23 @@ Channel order: 下游所有代码（模型、mask、采样器、指标）按
 slot 2（ABP）做 **per-sample min-max** 归一化到 ``[0, 1]``。
 ECG / PPG 保持 raw scale。
 
-每次 ``__getitem__`` 返回 3-tuple：
+每次 ``__getitem__`` 返回 4-tuple：
 
 * ``signal``: ``(3, L)`` float32，ABP slot ∈ [0, 1]，其它 slot 为原始尺度。
 * ``sbp_dbp``: ``(2,)`` float32 = ``(sbp_mmHg, dbp_mmHg)`` 从 CSV 读取
   （PulseDB 的 ground-truth per-cycle mean，不是 segment max/min）。
 * ``demographics``: ``(6,)`` float32 = ``[age_z, gender, height_z, weight_z, bmi_z, mask]``
+* ``abp_minmax``: ``(2,)`` float32 = ``(dbp_seg, sbp_seg)`` —— 本段 ABP 做 min-max
+  归一化时用的逐段原始极值（``abp.min()`` / ``abp.max()``，mmHg）。eval 用它精确
+  反归一化、还原 **raw ABP** 作为指标 target；RF / BP head 训练忽略这一项。
+  注意它是 segment 极值，与 ``sbp_dbp`` 的 per-cycle-mean 定义不同。
   - ``age_z`` / ``height_z`` / ``weight_z`` / ``bmi_z``: z-score 归一化（数据集
     整体统计），缺失值 -> 0。
   - ``gender`` ∈ {0, 1}：原始 categorical，不归一化。
   - ``mask`` ∈ {0, 1}：anthropometric (height/weight/bmi) 存在与否的指示位。
     PulseDB 约 48% 样本（MIMIC-III 子集）缺三者，mask=0；剩下的 VitalDB
     子集 mask=1。BP head 用这一位区分 "已知中位值" 和 "真实缺失"。
+- ``abp_minmax``: ``(2,)`` = ``(dbp_seg, sbp_seg)``，逐段 ABP 原始极值（mmHg）。
 
 CSV path 默认从 ``data_path`` 推断（同目录、同 stem，扩展名换 ``.csv``）；
 若 CSV 不存在或缺关键列，``sbp_dbp`` / ``demographics`` 会用零张量代替并
@@ -214,7 +219,7 @@ class CardiacDataset(Dataset):
     def __len__(self) -> int:
         return int(self._indices.shape[0])
 
-    def __getitem__(self, idx: int) -> tuple[Tensor, Tensor, Tensor]:
+    def __getitem__(self, idx: int) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         # Advanced indexing returns an owned, writable, C-contiguous ndarray
         # (safe for from_numpy + pin_memory). astype(copy=False) is a no-op on
         # float32 sources, else casts to avoid conv1d dtype mismatch.
@@ -226,6 +231,11 @@ class CardiacDataset(Dataset):
         denom = max(sbp_seg - dbp_seg, MINMAX_EPS)
         x[2] = (abp - dbp_seg) / denom  # per-sample min-max → [0, 1]
         signal = torch.from_numpy(x)
+        # Per-segment raw mmHg extrema used for the min-max above. Returned so
+        # eval can exactly invert the normalization and recover the *raw* ABP
+        # waveform as the metric target (reconstruct_mmHg(shape, sbp, dbp) is
+        # the exact inverse). RF / BP-head trainers ignore this 4th element.
+        abp_minmax = torch.tensor([dbp_seg, sbp_seg], dtype=torch.float32)
         # SBP/DBP come from CSV (PulseDB per-cycle-mean labeling), not from
         # the per-segment min/max we just computed for normalization.
         # `_bp_labels` / `_demographics` are C-contiguous owned arrays; advanced
@@ -236,4 +246,4 @@ class CardiacDataset(Dataset):
         # ~902k × n_epochs × n_workers times).
         sbp_dbp = torch.from_numpy(self._bp_labels[row])
         demographics = torch.from_numpy(self._demographics[row])
-        return signal, sbp_dbp, demographics
+        return signal, sbp_dbp, demographics, abp_minmax

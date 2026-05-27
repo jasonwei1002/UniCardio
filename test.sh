@@ -1,32 +1,32 @@
 #!/usr/bin/env bash
-# UniCardio 评估一键启动脚本
+# UniCardio 评估一键启动脚本（仅波形模型 / RF backbone）
 #
-# 评估「完整 mmHg 幅值」：RF backbone 出归一化波形形状，BP head 出标量 SBP/DBP，
-# 二者经 reconstruct_mmHg 组合成完整 ABP 波形后再算 RMSE/MAE/Pearson/KS。
-# 两个 checkpoint 路径都必须显式传入（不自动挑选）。
+# 只评估 RF backbone 出的归一化波形：ABP 输出留在 shape-only [0, 1] 空间，
+# 报 RMSE / MAE / Pearson / KS（其中 Pearson 物理可比，RMSE/MAE 为无量纲量）。
+# 不加载 BP head，不做 mmHg 幅值还原。
 #
 # 用法：
-#   bash test.sh <rf_ckpt> <bp_head_ckpt>
+#   bash test.sh [rf_ckpt]
+#     rf_ckpt 省略时自动挑选最新的 run/outputs/*/checkpoints/best.pt
 set -euo pipefail
 
 cd "$(dirname "$0")"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
-if [ "$#" -ne 2 ]; then
-    echo "Usage: bash test.sh <rf_ckpt> <bp_head_ckpt>" >&2
-    echo "  rf_ckpt:      RF backbone checkpoint (run/outputs/<rf_run>/checkpoints/best.pt)" >&2
-    echo "  bp_head_ckpt: BP head checkpoint (run/outputs/<bp_head_run>/checkpoints/best.pt)" >&2
-    exit 1
+if [ "$#" -ge 1 ]; then
+    CHECKPOINT="$1"
+else
+    CHECKPOINT="$(ls -t run/outputs/*/checkpoints/best.pt 2>/dev/null | head -n 1 || true)"
+    if [ -z "$CHECKPOINT" ]; then
+        echo "Error: no checkpoint given and no run/outputs/*/checkpoints/best.pt found." >&2
+        echo "Usage: bash test.sh [rf_ckpt]" >&2
+        exit 1
+    fi
+    echo "No checkpoint given; using latest: $CHECKPOINT"
 fi
 
-CHECKPOINT="$1"
-BP_HEAD_CKPT="$2"
 if [ ! -f "$CHECKPOINT" ]; then
     echo "Error: RF checkpoint not found: $CHECKPOINT" >&2
-    exit 1
-fi
-if [ ! -f "$BP_HEAD_CKPT" ]; then
-    echo "Error: BP head checkpoint not found: $BP_HEAD_CKPT" >&2
     exit 1
 fi
 
@@ -35,13 +35,11 @@ RUN_DIR="$(dirname "$(dirname "$CHECKPOINT")")"
 OUT_DIR="$RUN_DIR/eval"
 mkdir -p "$OUT_DIR"
 LOG_FILE="$OUT_DIR/eval_$(date +%Y%m%d_%H%M%S).log"
-echo "RF checkpoint:      $CHECKPOINT" | tee "$LOG_FILE"
-echo "BP head checkpoint: $BP_HEAD_CKPT" | tee -a "$LOG_FILE"
+echo "RF checkpoint:        $CHECKPOINT" | tee "$LOG_FILE"
 echo "Writing artifacts to: $OUT_DIR" | tee -a "$LOG_FILE"
 
 python run/pipeline/evaluate.py \
     +checkpoint="$CHECKPOINT" \
-    +bp_head_checkpoint="$BP_HEAD_CKPT" \
     hydra.run.dir="$OUT_DIR" \
     device=cuda \
     data.batch_size=512 \
