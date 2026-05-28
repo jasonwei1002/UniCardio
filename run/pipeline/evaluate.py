@@ -164,6 +164,23 @@ def main(cfg: DictConfig) -> None:
     load_checkpoint(cfg.checkpoint, model=rf_model, map_location=device)
     rf_model.to(device).eval()
 
+    # flex_attention only uses its memory-efficient block-sparse kernel under
+    # torch.compile; in eager mode it materializes the full (B, H, L, L) score
+    # tensor (~241 GiB at B=512, L=3750) and OOMs. Compile with the default
+    # mode — it fuses the sparse kernel (the actual memory fix) with a far
+    # lighter warmup than training's max-autotune, and eval needs no CUDA-graph
+    # throughput tuning. Compile after loading so state_dict keys stay unwrapped.
+    compile_cfg = (cfg.trainer.get("compile") or {}) if "compile" in cfg.trainer else {}
+    if bool(compile_cfg.get("enabled", False)) and device.type == "cuda":
+        logger.info("torch.compile enabled for eval (mode=default, fullgraph=False)")
+        rf_model = torch.compile(rf_model, fullgraph=False)
+    elif device.type == "cuda":
+        logger.warning(
+            "torch.compile disabled but device=cuda: flex_attention runs eager "
+            "and will OOM at large batch/L (full B*H*L*L scores). Lower "
+            "data.batch_size or enable trainer.compile."
+        )
+
     bp_head_ckpt = cfg.get("bp_head_checkpoint", None)
     bp_head = None
     if bp_head_ckpt is not None:

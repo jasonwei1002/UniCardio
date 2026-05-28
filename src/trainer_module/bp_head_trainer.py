@@ -1,23 +1,19 @@
 """Training loop for the scalar BP regression head.
 
 Mirrors :mod:`src.trainer_module.trainer` (RF trainer) in structure — same
-checkpoint / scheduler / AMP / SwanLab plumbing, and the **same per-batch
-weighted task sampling**. Each batch draws one ABP-target task from
-``trainer.task_weights``; the task's condition modalities (via
-:func:`cond_slots_to_vitals`) become the BP head's ``active_vitals`` for that
-step, so each vital subset is supervised directly:
+checkpoint / scheduler / AMP / SwanLab plumbing — but, unlike the RF trainer,
+**does not randomly sample a task per batch**. The BP head trains on a single
+fixed ABP-target task (``trainer.bp_task``, default ``ecgppg2abp``), so every
+step supervises the same vital subset:
 
-    ecg2abp     -> active_vitals=["ecg"]        (ECG-only stack)
-    ppg2abp     -> active_vitals=["ppg"]        (PPG-only stack)
-    ecgppg2abp  -> active_vitals=["ecg","ppg"]  (both, averaged)
+    ecgppg2abp  -> active_vitals=["ecg","ppg"]  (both vitals, averaged)
 
-This matches how the evaluation cascade feeds the head (see
-:mod:`src.trainer_module.bp_metrics`) and removes the train/eval gap that
-existed when training always averaged over both vitals. The objective is
-``L1(pred, target)`` (MD-ViSCo §6.2.2 uses L1 + multi-WCL; the WCL term is
-deferred); there is still no time embedding, attention mask, or Euler sampler
-— task sampling here only selects the vital subset, not a different target
-(every sample has one SBP/DBP label).
+The task's condition modalities (via :func:`cond_slots_to_vitals`) become the
+BP head's ``active_vitals`` for every step. This matches how the evaluation
+cascade feeds the head for the multimodal BP task (see
+:mod:`src.trainer_module.bp_metrics`). The objective is ``L1(pred, target)``
+(MD-ViSCo §6.2.2 uses L1 + multi-WCL; the WCL term is deferred); there is no
+time embedding, attention mask, or Euler sampler.
 
 Batch contract (3-tuple): each batch is
 ``(signal: (B, 3, L), sbp_dbp: (B, 2), demographics: (B, 6))``. The trainer
@@ -31,7 +27,6 @@ modalities, like MD-ViSCo's refinement model). SBP/DBP come from PulseDB's CSV
 from __future__ import annotations
 
 import logging
-import random
 import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -52,8 +47,8 @@ from tqdm import tqdm
 from ..model_module.tasks import (
     Slot,
     TaskSpec,
-    active_task_pairs,
     cond_slots_to_vitals,
+    get_task,
 )
 from ..utils.checkpoint import load_checkpoint, save_checkpoint, unwrap_model
 from ..utils.normalization import BPLabelNorm
@@ -107,44 +102,27 @@ def _build_scheduler(
     )
 
 
-def _sample_task(pairs: Sequence[tuple[TaskSpec, float]]) -> TaskSpec:
-    """Weighted single-task draw (mirrors the RF trainer's ``_sample_task``)."""
-    tasks = [t for t, _ in pairs]
-    weights = [w for _, w in pairs]
-    return random.choices(tasks, weights=weights, k=1)[0]
+def _resolve_bp_task(model: nn.Module, task_name: str) -> TaskSpec:
+    """Resolve the single ABP-target task the BP head trains on.
 
-
-def _resolve_bp_tasks(
-    model: nn.Module,
-    task_weights: Mapping[str, float] | None,
-) -> list[tuple[TaskSpec, float]]:
-    """ABP-target tasks the BP head can actually serve, with their weights.
-
-    Reuses the global ``task_weights`` convention but keeps only tasks whose
-    target is ABP and whose condition vitals (ECG/PPG) are all configured
-    encoders on this head. Non-ABP tasks (e.g. ecg2ppg) and tasks needing a
-    missing vital are dropped with a WARNING.
+    Unlike the RF trainer, the BP head does not sample a task per batch — it
+    trains on one fixed task (``trainer.bp_task``, default ``ecgppg2abp``). The
+    task must target ABP and condition only on vitals the head has encoders for.
     """
-    model_vitals = set(unwrap_model(model).config.vitals)
-    pairs: list[tuple[TaskSpec, float]] = []
-    for spec, w in active_task_pairs(task_weights):
-        if int(spec.target_slot) != int(Slot.ABP):
-            continue
-        vitals = cond_slots_to_vitals(spec)
-        if vitals and set(vitals) <= model_vitals:
-            pairs.append((spec, w))
-        else:
-            logger.warning(
-                "Skipping task '%s' for BP head: needs vitals %s but head has %s.",
-                spec.name, vitals, sorted(model_vitals),
-            )
-    if not pairs:
+    spec = get_task(task_name)
+    if int(spec.target_slot) != int(Slot.ABP):
         raise ValueError(
-            "No trainable BP-head tasks: need ABP-target tasks whose vitals are "
-            f"a subset of the head's vitals {sorted(model_vitals)}. Check "
-            "trainer.task_weights and model.vitals."
+            f"BP head task '{task_name}' must target ABP (slot {int(Slot.ABP)}); "
+            f"got target_slot={int(spec.target_slot)}."
         )
-    return pairs
+    model_vitals = set(unwrap_model(model).config.vitals)
+    vitals = cond_slots_to_vitals(spec)
+    if not vitals or not set(vitals) <= model_vitals:
+        raise ValueError(
+            f"BP head task '{task_name}' needs vitals {vitals} but the head has "
+            f"{sorted(model_vitals)}. Check trainer.bp_task and model.vitals."
+        )
+    return spec
 
 
 def _empty_acc() -> dict[str, float]:
@@ -286,12 +264,13 @@ def train(
     test_loader: DataLoader | None = None,
     bp_norm: BPLabelNorm | None = None,
 ) -> None:
-    """Train the BP head with per-batch weighted task (vital-subset) sampling.
+    """Train the BP head on a single fixed ABP-target task (no task sampling).
 
     Args:
         model: :class:`BPHead` (optionally wrapped by ``torch.compile``).
-        cfg: trainer config (Hydra DictConfig or plain dict); ``task_weights``
-            selects which ABP-target tasks are sampled (defaults to all three).
+        cfg: trainer config (Hydra DictConfig or plain dict); ``bp_task``
+            selects the single ABP-target task to train on (default
+            ``ecgppg2abp``).
         train_loader / val_loader / test_loader: DataLoaders returning
             ``(signal, sbp_dbp, demographics)`` tuples (the dataset 3-tuple contract).
         device: torch device.
@@ -335,11 +314,11 @@ def train(
         load_checkpoint(init_from, model=model, map_location=device)
         logger.info("BP head pretrain: warm-started from %s", init_from)
 
-    task_pairs = _resolve_bp_tasks(model, cfg_dict.get("task_weights"))
-    tasks = [spec for spec, _ in task_pairs]
+    task = _resolve_bp_task(model, str(cfg_dict.get("bp_task", "ecgppg2abp")))
+    tasks = [task]
+    active_vitals = cond_slots_to_vitals(task)
     logger.info(
-        "BP head tasks (weight): %s",
-        {t.name: w for t, w in task_pairs},
+        "BP head fixed task: %s (active_vitals=%s)", task.name, active_vitals
     )
 
     optimizer = _build_optimizer(model, cfg_dict)
@@ -386,8 +365,6 @@ def train(
         )
         for batch in it:
             signal, target, demographics = _unpack_batch(batch, device)
-            task = _sample_task(task_pairs)
-            active_vitals = cond_slots_to_vitals(task)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(
                 device_type=device.type,
