@@ -21,9 +21,11 @@ by the user, not architectural simplifications):
   fuses a DistilBERT text embedding as the 2nd channel of the second encoder;
   we keep that exact fusion point but source the embedding from a numeric MLP
   over PulseDB's fixed 5-feature schema (+ missingness mask).
-- **no WCL (weighted contrastive loss).** Loss is L1 in the normalized BP
-  label space (trainer concern; MD-ViSCo uses L1 + multi-WCL — we keep L1,
-  defer WCL).
+- **demographics still numeric, but WCL is now implemented.** WCL (the multi-WCL
+  contrastive objective) lives in the trainer (:mod:`src.trainer_module.wcl` +
+  ``bp_head_trainer``); this module exposes the embeddings it needs via
+  ``forward(return_embeddings=True)`` and :meth:`BPHead.encode_embeddings`. Only
+  the DistilBERT demographics encoder remains deferred (numeric MLP instead).
 
 ``demographics`` is ``(B, 6) = [age_z, gender, height_z, weight_z, bmi_z, mask]``
 (see :mod:`src.data_module.cardiac_dataset`). Pass ``None`` for waveform-only
@@ -202,26 +204,85 @@ class BPHead(nn.Module):
             nn.Linear(cfg.demo_hidden, cfg.projection_dim),
         )
 
-    def _encode_vital(self, vital: str, slot: Tensor, demo_emb: Tensor) -> Tensor:
-        """``(B, 1, L)`` raw waveform + ``(B, proj)`` demo embedding -> ``(B, 2)`` (SBP, DBP)."""
+    def _wav_embed(self, vital: str, slot: Tensor) -> Tensor:
+        """``(B, 1, L)`` raw waveform -> ``(B, proj)`` ProjectionHead embedding.
+
+        This is MD-ViSCo's waveform embedding ``e_W^(i)`` — the WCL waveform
+        terms contrast on it, and it is the only part the contrastive
+        pretraining stage needs (fusion + MlpBP heads are skipped).
+        """
         b = slot.shape[0]
         # HF PatchTSMixer expects (B, seq_len, channels); we hold (B, 1, L).
         feat = self.waveform_encoders[vital](slot.transpose(1, 2)).last_hidden_state
-        wav_emb = self.projections[vital](feat.reshape(b, -1))          # (B, proj)
+        return self.projections[vital](feat.reshape(b, -1))            # (B, proj)
+
+    def _encode_vital(
+        self, vital: str, slot: Tensor, demo_emb: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """``(B, 1, L)`` raw waveform + ``(B, proj)`` demo embedding.
+
+        Returns ``(pred, wav_emb)`` where ``pred`` is ``(B, 2)`` (SBP, DBP) and
+        ``wav_emb`` is the ``(B, proj)`` ProjectionHead output — the waveform
+        embedding ``e_W^(i)`` that MD-ViSCo's WCL waveform terms contrast on.
+        """
+        b = slot.shape[0]
+        wav_emb = self._wav_embed(vital, slot)                         # (B, proj)
         # Fuse demo as the 2nd channel: (B, 2, proj) -> (B, proj, 2) for the encoder.
         combined = torch.stack([wav_emb, demo_emb.to(wav_emb.dtype)], dim=1)  # (B, 2, proj)
         fused = self.fusion_encoders[vital](combined.transpose(1, 2)).last_hidden_state
         final = fused.reshape(b, -1)                                    # (B, 2*np2*d)
         sbp = self.sbp_heads[vital](final)
         dbp = self.dbp_heads[vital](final)
-        return torch.cat([sbp, dbp], dim=-1)                            # (B, 2)
+        return torch.cat([sbp, dbp], dim=-1), wav_emb                   # (B, 2), (B, proj)
+
+    def _resolve_vitals(self, active_vitals: Optional[Iterable[str]]) -> tuple[str, ...]:
+        vitals = (
+            tuple(str(v).lower() for v in active_vitals)
+            if active_vitals is not None
+            else self.config.vitals
+        )
+        if not vitals:
+            raise ValueError("active_vitals resolved to an empty set.")
+        return vitals
+
+    def encode_embeddings(
+        self,
+        ecg_ppg: Tensor,
+        demographics: Optional[Tensor] = None,
+        active_vitals: Optional[Iterable[str]] = None,
+    ) -> dict[str, Tensor]:
+        """Per-vital waveform embeddings + demo embedding, WITHOUT fusion/heads.
+
+        Returns ``{"{vital}_embeddings": (B, proj), ["text_embeddings": (B, proj)]}``
+        — exactly the tensors MD-ViSCo's multi-WCL contrasts on. Used by the
+        contrastive *pretraining* stage, which trains only the waveform encoders
+        + projection heads (and the demographics MLP), so it skips the
+        parameter-heavy fusion encoders and MlpBP heads entirely.
+        """
+        cfg = self.config
+        b, c, length = ecg_ppg.shape
+        if length != cfg.slot_length or c < 2:
+            raise ValueError(
+                f"BPHead expects (B, >=2, {cfg.slot_length}); got (B, {c}, {length})."
+            )
+        vitals = self._resolve_vitals(active_vitals)
+        embeddings: dict[str, Tensor] = {
+            f"{v}_embeddings": self._wav_embed(
+                v, ecg_ppg[:, _VITAL_CHANNEL[v] : _VITAL_CHANNEL[v] + 1, :]
+            )
+            for v in vitals
+        }
+        if demographics is not None:
+            embeddings["text_embeddings"] = self.demo_encoder(demographics)
+        return embeddings
 
     def forward(
         self,
         ecg_ppg: Tensor,
         demographics: Optional[Tensor] = None,
         active_vitals: Optional[Iterable[str]] = None,
-    ) -> Tensor:
+        return_embeddings: bool = False,
+    ) -> Tensor | tuple[Tensor, dict[str, Tensor]]:
         """Predict ``(SBP, DBP)`` mmHg, averaged over the active vitals.
 
         Args:
@@ -230,12 +291,18 @@ class BPHead(nn.Module):
                 mask in the last column; ``None`` zero-fills the demo channel.
             active_vitals: vital names to average over; ``None`` = all configured
                 vitals (training uses this default — call site unchanged).
+            return_embeddings: if ``True``, also return the per-vital waveform
+                embeddings (keyed ``"{vital}_embeddings"``) and, when
+                demographics are present, the demographic embedding (keyed
+                ``"text_embeddings"``) — the inputs MD-ViSCo's multi-WCL
+                contrasts on. The keys match ``src.trainer_module.wcl`` term
+                ``embedding_key``s.
 
         Returns:
-            ``(B, 2)`` with column 0 = SBP, column 1 = DBP, in the label
-            space the head was trained on — normalized ``[0, 1]`` when
-            ``data.bp_label_norm`` is set (default), else raw mmHg. Callers
-            denormalize via the matching :class:`BPLabelNorm` before reporting.
+            ``(B, 2)`` (SBP, DBP) in the head's training label space (normalized
+            ``[0, 1]`` when ``data.bp_label_norm`` is set, else raw mmHg). When
+            ``return_embeddings`` is ``True``, returns ``(preds, embeddings)``
+            where ``embeddings`` is a ``{key: (B, proj)}`` dict.
         """
         cfg = self.config
         b, c, length = ecg_ppg.shape
@@ -244,24 +311,28 @@ class BPHead(nn.Module):
                 f"BPHead expects (B, >=2, {cfg.slot_length}); got (B, {c}, {length})."
             )
 
-        vitals = (
-            tuple(str(v).lower() for v in active_vitals)
-            if active_vitals is not None
-            else cfg.vitals
-        )
-        if not vitals:
-            raise ValueError("active_vitals resolved to an empty set.")
+        vitals = self._resolve_vitals(active_vitals)
 
         if demographics is None:
             demo_emb = ecg_ppg.new_zeros(b, cfg.projection_dim)
         else:
             demo_emb = self.demo_encoder(demographics)
 
-        preds = [
-            self._encode_vital(v, ecg_ppg[:, _VITAL_CHANNEL[v] : _VITAL_CHANNEL[v] + 1, :], demo_emb)
-            for v in vitals
-        ]
-        return torch.stack(preds, dim=0).mean(dim=0)
+        preds: list[Tensor] = []
+        embeddings: dict[str, Tensor] = {}
+        for v in vitals:
+            slot = ecg_ppg[:, _VITAL_CHANNEL[v] : _VITAL_CHANNEL[v] + 1, :]
+            pred, wav_emb = self._encode_vital(v, slot, demo_emb)
+            preds.append(pred)
+            if return_embeddings:
+                embeddings[f"{v}_embeddings"] = wav_emb
+
+        out = torch.stack(preds, dim=0).mean(dim=0)
+        if not return_embeddings:
+            return out
+        if demographics is not None:
+            embeddings["text_embeddings"] = demo_emb
+        return out, embeddings
 
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())

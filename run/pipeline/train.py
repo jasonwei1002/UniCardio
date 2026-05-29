@@ -118,6 +118,7 @@ def main(cfg: DictConfig) -> None:
             test_loader=test_loader if stage == "finetune" else None,
             bp_test_csv=bp_test_csv,
             bp_label_norm=bp_label_norm,
+            bp_label_source=str(cfg.data.get("bp_label_source", "per_cycle_mean")),
         )
     finally:
         swanlab.finish()

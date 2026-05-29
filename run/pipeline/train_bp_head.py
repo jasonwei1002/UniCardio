@@ -93,6 +93,7 @@ def main(cfg: DictConfig) -> None:
 
     _init_swanlab(cfg)
     bp_norm = BPLabelNorm.from_cfg(cfg.data)
+    bp_label_source = str(cfg.data.get("bp_label_source", "per_cycle_mean"))
     try:
         train(
             model,
@@ -103,6 +104,7 @@ def main(cfg: DictConfig) -> None:
             output_dir=cfg.output_dir,
             test_loader=test_loader if stage == "finetune" else None,
             bp_norm=bp_norm,
+            bp_label_source=bp_label_source,
         )
     finally:
         swanlab.finish()

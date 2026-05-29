@@ -164,7 +164,7 @@ def build_loaders(
     # from the same file. The first CardiacDataset built per path populates
     # the tables; subsequent ones reuse them (avoids re-parsing 902k-row CSV
     # twice for pulsedb-pretrain train+val splits).
-    _shared_tables: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    _shared_tables: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
 
     # Optional MD-ViSCo-style global min-max normalization for SBP/DBP labels.
     # Resolved from `data.bp_label_norm` (top-level shortcut auto-aliased to
@@ -181,13 +181,16 @@ def build_loaders(
         cached = _shared_tables.get(path)
         if cached is None:
             ds = CardiacDataset(path, indices, perm, bp_label_norm=bp_norm)
-            _shared_tables[path] = (ds.bp_labels_table, ds.demographics_table)
+            _shared_tables[path] = (
+                ds.bp_labels_table, ds.demographics_table, ds.age_raw_table,
+            )
             return ds
-        bp_tbl, demo_tbl = cached
+        bp_tbl, demo_tbl, age_tbl = cached
         return CardiacDataset(
             path, indices, perm,
             bp_labels_table=bp_tbl,
             demographics_table=demo_tbl,
+            age_raw_table=age_tbl,
             bp_label_norm=bp_norm,
         )
 

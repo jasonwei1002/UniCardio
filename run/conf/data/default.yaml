@@ -47,6 +47,13 @@ pulsedb:
 
 split_seed: 42
 
+# BP head 回归目标的 SBP/DBP 来源（仅 BP head 训练/评估读取）：
+#   segment_minmax  —— 用本段 ABP 的 max/min（= abp_minmax），对齐 MD-ViSCo
+#                      "SBP/DBP = max/min of ABP" 的定义，使 ME/SD 与其 Table III
+#                      测同一量（默认）。
+#   per_cycle_mean  —— 用 CSV 的 PulseDB 官方 per-cycle-mean 标签（legacy）。
+bp_label_source: segment_minmax
+
 batch_size: 512
 num_workers: 8
 pin_memory: true

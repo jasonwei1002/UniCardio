@@ -6,16 +6,23 @@ Channel order: 下游所有代码（模型、mask、采样器、指标）按
 slot 2（ABP）做 **per-sample min-max** 归一化到 ``[0, 1]``。
 ECG / PPG 保持 raw scale。
 
-每次 ``__getitem__`` 返回 4-tuple：
+每次 ``__getitem__`` 返回 5-tuple：
 
 * ``signal``: ``(3, L)`` float32，ABP slot ∈ [0, 1]，其它 slot 为原始尺度。
 * ``sbp_dbp``: ``(2,)`` float32 = ``(sbp_mmHg, dbp_mmHg)`` 从 CSV 读取
-  （PulseDB 的 ground-truth per-cycle mean，不是 segment max/min）。
+  （PulseDB 的 ground-truth per-cycle mean，不是 segment max/min）。当
+  ``data.bp_label_source='segment_minmax'`` 时，BP-head trainer / bp_metrics
+  改从 ``abp_minmax`` 派生 (SBP, DBP)=(sbp_seg, dbp_seg) 作目标（与 MD-ViSCo
+  "SBP/DBP = max/min of ABP" 对齐），本字段则不参与训练。
 * ``demographics``: ``(6,)`` float32 = ``[age_z, gender, height_z, weight_z, bmi_z, mask]``
 * ``abp_minmax``: ``(2,)`` float32 = ``(dbp_seg, sbp_seg)`` —— 本段 ABP 做 min-max
   归一化时用的逐段原始极值（``abp.min()`` / ``abp.max()``，mmHg）。eval 用它精确
-  反归一化、还原 **raw ABP** 作为指标 target；RF / BP head 训练忽略这一项。
-  注意它是 segment 极值，与 ``sbp_dbp`` 的 per-cycle-mean 定义不同。
+  反归一化、还原 **raw ABP** 作为指标 target；也作为 ``segment_minmax`` 目标 +
+  WCL 波形项的 raw SBP/DBP 权重来源。注意它是 segment 极值，与 ``sbp_dbp``
+  的 per-cycle-mean 定义不同。
+* ``age_raw``: ``(1,)`` float32 —— raw 年龄（岁，缺失→均值），供 MD-ViSCo
+  WCL ``text_age_wcl`` 项（阈值 0.0235@temp_w=4 ⇔ "年龄差 ≤ ~15 岁"，须 raw
+  单位）。非 WCL 消费方忽略这一项。
   - ``age_z`` / ``height_z`` / ``weight_z`` / ``bmi_z``: z-score 归一化（数据集
     整体统计），缺失值 -> 0。
   - ``gender`` ∈ {0, 1}：原始 categorical，不归一化。
@@ -68,8 +75,8 @@ def _build_csv_tables(
     data_path: Path,
     csv_path: Path | None,
     n_rows: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Single-pass CSV → ``(bp_labels (N, 2), demographics (N, 6))``.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Single-pass CSV → ``(bp_labels (N, 2), demographics (N, 6), age_raw (N, 1))``.
 
     Demographics layout (6 columns):
         ``[age_z, gender, height_z, weight_z, bmi_z, mask]``
@@ -77,10 +84,19 @@ def _build_csv_tables(
     were present in this row, ``0`` otherwise. Z-scores use the full
     CSV's non-NaN stats; NaN → 0 after z-scoring.
 
-    Returns zero-filled tables (with a WARNING) when the CSV is missing.
+    ``age_raw`` is the **raw age in years** (NaN → population mean), needed
+    by MD-ViSCo's WCL ``text_age_wcl`` term whose threshold (0.0235 at
+    ``temperature_weight=4``) encodes "age difference ≤ ~15 years" and is
+    only meaningful in raw-year units (z-scored age would break the
+    threshold semantics). Missing ages sit at the mean so they contribute
+    benignly to the contrastive weighting.
+
+    Returns zero-filled tables (age_raw → 0) with a WARNING when the CSV is
+    missing.
     """
     bp_labels = np.zeros((n_rows, 2), dtype=np.float32)
     demographics = np.zeros((n_rows, 6), dtype=np.float32)
+    age_raw = np.zeros((n_rows, 1), dtype=np.float32)
     if csv_path is None:
         csv_path = data_path.with_suffix(".csv")
     if not csv_path.exists():
@@ -89,7 +105,7 @@ def _build_csv_tables(
             "tensors. BP head training requires the CSV.",
             csv_path,
         )
-        return bp_labels, demographics
+        return bp_labels, demographics, age_raw
 
     df = pd.read_csv(csv_path)
     if len(df) != n_rows:
@@ -105,11 +121,13 @@ def _build_csv_tables(
         else:
             logger.warning("CSV missing column '%s'; %s left at 0.", col, col)
 
-    # Age (column 0) — z-score, NaN→0.
+    # Age (column 0) — z-score, NaN→0; raw age (years) kept separately for WCL,
+    # NaN→population mean so missing ages weight benignly in the contrastive term.
     if "age" in df.columns:
         age = df["age"].to_numpy(dtype=np.float64)
         mu, sd = _zscore_stats(age)
         demographics[:n, 0] = np.nan_to_num((age - mu) / sd, nan=0.0).astype(np.float32)[:n]
+        age_raw[:n, 0] = np.nan_to_num(age, nan=mu).astype(np.float32)[:n]
     # Gender (column 1) — raw {0, 1}, NaN→0.
     if _GENDER_COLUMN in df.columns:
         gender = df[_GENDER_COLUMN].to_numpy(dtype=np.float32)
@@ -130,7 +148,7 @@ def _build_csv_tables(
             (values - mu) / sd, nan=0.0
         ).astype(np.float32)
     demographics[:n, 5] = has_anthro.astype(np.float32)
-    return bp_labels, demographics
+    return bp_labels, demographics, age_raw
 
 
 class CardiacDataset(Dataset):
@@ -154,6 +172,7 @@ class CardiacDataset(Dataset):
         *,
         bp_labels_table: np.ndarray | None = None,
         demographics_table: np.ndarray | None = None,
+        age_raw_table: np.ndarray | None = None,
         csv_path: str | Path | None = None,
         bp_label_norm: "BPLabelNorm | None" = None,
     ) -> None:
@@ -172,13 +191,19 @@ class CardiacDataset(Dataset):
 
         n_total = int(self._mm.shape[0])
         built_from_csv = bp_labels_table is None
-        if bp_labels_table is None or demographics_table is None:
+        if (
+            bp_labels_table is None
+            or demographics_table is None
+            or age_raw_table is None
+        ):
             csv = Path(csv_path) if csv_path is not None else None
-            bp_built, demo_built = _build_csv_tables(path, csv, n_total)
+            bp_built, demo_built, age_built = _build_csv_tables(path, csv, n_total)
             if bp_labels_table is None:
                 bp_labels_table = bp_built
             if demographics_table is None:
                 demographics_table = demo_built
+            if age_raw_table is None:
+                age_raw_table = age_built
         if bp_labels_table.shape != (n_total, 2):
             raise ValueError(
                 f"bp_labels_table shape must be ({n_total}, 2), got {bp_labels_table.shape}"
@@ -187,6 +212,10 @@ class CardiacDataset(Dataset):
             raise ValueError(
                 f"demographics_table shape must be ({n_total}, 6), got "
                 f"{demographics_table.shape}"
+            )
+        if age_raw_table.shape != (n_total, 1):
+            raise ValueError(
+                f"age_raw_table shape must be ({n_total}, 1), got {age_raw_table.shape}"
             )
 
         # When ``bp_label_norm`` is set, pre-normalize once at construction
@@ -199,6 +228,7 @@ class CardiacDataset(Dataset):
 
         self._bp_labels = np.ascontiguousarray(bp_labels_table, dtype=np.float32)
         self._demographics = np.ascontiguousarray(demographics_table, dtype=np.float32)
+        self._age_raw = np.ascontiguousarray(age_raw_table, dtype=np.float32)
         self._bp_norm = bp_label_norm
 
     @property
@@ -216,10 +246,15 @@ class CardiacDataset(Dataset):
         """Full ``(N_total, 6)`` demographics table — used by build_loaders to share."""
         return self._demographics
 
+    @property
+    def age_raw_table(self) -> np.ndarray:
+        """Full ``(N_total, 1)`` raw-age (years) table — shared like the others."""
+        return self._age_raw
+
     def __len__(self) -> int:
         return int(self._indices.shape[0])
 
-    def __getitem__(self, idx: int) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    def __getitem__(self, idx: int) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         # Advanced indexing returns an owned, writable, C-contiguous ndarray
         # (safe for from_numpy + pin_memory). astype(copy=False) is a no-op on
         # float32 sources, else casts to avoid conv1d dtype mismatch.
@@ -246,4 +281,8 @@ class CardiacDataset(Dataset):
         # ~902k × n_epochs × n_workers times).
         sbp_dbp = torch.from_numpy(self._bp_labels[row])
         demographics = torch.from_numpy(self._demographics[row])
-        return signal, sbp_dbp, demographics, abp_minmax
+        # Raw age (years) for the WCL age term (see _build_csv_tables); kept
+        # separate from the z-scored demographics so the threshold semantics
+        # stay in raw units. Non-WCL consumers ignore this 5th element.
+        age_raw = torch.from_numpy(self._age_raw[row])
+        return signal, sbp_dbp, demographics, abp_minmax, age_raw

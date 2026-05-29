@@ -156,3 +156,15 @@ def reconstruct_mmHg(shape: Array, sbp: Array, dbp: Array) -> Array:
     sbp_b = sbp[..., None] if isinstance(sbp, (np.ndarray, torch.Tensor)) else sbp
     dbp_b = dbp[..., None] if isinstance(dbp, (np.ndarray, torch.Tensor)) else dbp
     return shape * (sbp_b - dbp_b) + dbp_b
+
+
+def split_abp_minmax(abp_minmax: Array) -> tuple[Array, Array]:
+    """Decode the ``abp_minmax`` column convention to ``(sbp_seg, dbp_seg)``.
+
+    The dataset stores per-segment extrema as ``(dbp_seg, sbp_seg) = (min, max)``
+    in the last dim (see ``CardiacDataset.__getitem__``). This is the single
+    place that owns that ``(min, max)`` ordering, so the SBP=max / DBP=min decode
+    is not re-derived at every call site (BP-head target, ``bp_metrics`` eval).
+    Works for both torch tensors and numpy arrays, any leading batch shape.
+    """
+    return abp_minmax[..., 1], abp_minmax[..., 0]

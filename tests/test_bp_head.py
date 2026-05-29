@@ -150,3 +150,84 @@ def test_default_config_param_budget() -> None:
     model = build_bp_head({})
     n = model.num_parameters()
     assert 350_000_000 < n < 420_000_000, f"param count {n:,} outside 350M-420M"
+
+
+def test_return_embeddings_keys_and_shapes() -> None:
+    """return_embeddings exposes per-vital waveform embeddings + text embedding
+    for WCL, keyed to match src.trainer_module.wcl term embedding_keys."""
+    model = _tiny().eval()
+    x = torch.randn(4, 2, TINY["slot_length"])
+    d = torch.randn(4, DEMO_DIM)
+    with torch.no_grad():
+        out, emb = model(x, d, return_embeddings=True)
+    assert out.shape == (4, 2)
+    assert set(emb) == {"ecg_embeddings", "ppg_embeddings", "text_embeddings"}
+    for v in emb.values():
+        assert v.shape == (4, TINY["projection_dim"])
+
+
+def test_return_embeddings_matches_plain_forward() -> None:
+    """Predictions are identical whether or not embeddings are returned."""
+    model = _tiny().eval()
+    x = torch.randn(3, 2, TINY["slot_length"])
+    d = torch.randn(3, DEMO_DIM)
+    with torch.no_grad():
+        plain = model(x, d)
+        out, _ = model(x, d, return_embeddings=True)
+    assert torch.allclose(plain, out, atol=1e-6)
+
+
+def test_return_embeddings_omits_text_without_demographics() -> None:
+    model = _tiny().eval()
+    x = torch.randn(2, 2, TINY["slot_length"])
+    with torch.no_grad():
+        _, emb = model(x, None, return_embeddings=True)
+    assert "text_embeddings" not in emb  # no demographics → no PI embedding
+    assert set(emb) == {"ecg_embeddings", "ppg_embeddings"}
+
+
+def test_return_embeddings_single_active_vital() -> None:
+    model = _tiny().eval()
+    x = torch.randn(2, 2, TINY["slot_length"])
+    d = torch.randn(2, DEMO_DIM)
+    with torch.no_grad():
+        _, emb = model(x, d, active_vitals=["ppg"], return_embeddings=True)
+    assert "ppg_embeddings" in emb and "ecg_embeddings" not in emb
+
+
+def test_encode_embeddings_matches_forward_embeddings() -> None:
+    """encode_embeddings (no fusion/heads) yields the same waveform/text
+    embeddings as forward(return_embeddings=True)."""
+    model = _tiny().eval()
+    x = torch.randn(3, 2, TINY["slot_length"])
+    d = torch.randn(3, DEMO_DIM)
+    with torch.no_grad():
+        _, emb_full = model(x, d, return_embeddings=True)
+        emb_only = model.encode_embeddings(x, d)
+    assert set(emb_only) == set(emb_full)
+    for k in emb_full:
+        assert torch.allclose(emb_only[k], emb_full[k], atol=1e-6)
+
+
+def test_encode_embeddings_omits_text_without_demographics() -> None:
+    model = _tiny().eval()
+    x = torch.randn(2, 2, TINY["slot_length"])
+    with torch.no_grad():
+        emb = model.encode_embeddings(x, None)
+    assert set(emb) == {"ecg_embeddings", "ppg_embeddings"}
+
+
+def test_encode_embeddings_grad_reaches_encoder_not_heads() -> None:
+    """Contrastive pretraining trains the encoders/projection (+ demo MLP) but
+    NOT the fusion encoders or MlpBP heads."""
+    model = _tiny()
+    x = torch.randn(4, 2, TINY["slot_length"])
+    d = torch.randn(4, DEMO_DIM)
+    emb = model.encode_embeddings(x, d)
+    loss = sum(e.pow(2).mean() for e in emb.values())
+    loss.backward()
+    # Encoder + projection + demo MLP receive gradient.
+    assert model.projections["ecg"].projection.weight.grad is not None
+    assert model.demo_encoder[0].weight.grad is not None
+    # MlpBP heads + fusion encoders are untouched (not in the embedding path).
+    assert model.sbp_heads["ecg"].fc1.weight.grad is None

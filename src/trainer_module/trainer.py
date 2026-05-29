@@ -176,6 +176,7 @@ def train(
     test_loader: DataLoader | None = None,
     bp_test_csv: str | Path | None = None,
     bp_label_norm: BPLabelNorm | None = None,
+    bp_label_source: str = "per_cycle_mean",
 ) -> None:
     """执行完整的 Rectified Flow 训练循环。
 
@@ -484,6 +485,7 @@ def train(
                 amp_enabled=amp_enabled,
                 bp_head_ckpt=bp_head_ckpt,
                 bp_norm=bp_label_norm,
+                bp_label_source=bp_label_source,
             )
             bp_swan: dict[str, float] = {}
             for task_name, m in bp_results.items():

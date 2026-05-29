@@ -2,10 +2,13 @@
 # BP head 阶段二（CalFree calibration-based finetune）。
 #
 # 行为：
-#   - 加载阶段一 ckpt（仅模型权重，optimizer/scheduler/epoch 全新）。
+#   - 加载阶段一对比预训练 ckpt（仅模型权重，optimizer/scheduler/epoch 全新）。
 #   - 数据集走 mode='finetune'：CalFree_Test_Subset.npy 内部 80/10/10
 #     sample-level 划分（subject 共享 = MD-ViSCo calibration-based 协议）。
-#   - 训练完成后自动在 10% test split 上跑一次 BP MAE 评估。
+#   - loss_mode=l1+wcl（stage=finetune 默认）：L_ref = L_MAE + multi-WCL
+#     （MD-ViSCo §6.2.2）。best.pt 按 val mean-L1 选。
+#   - 训练完成后自动在 10% test split 上跑一次 BP MAE 评估
+#     （目标按 data.bp_label_source，默认 segment_minmax = 对齐 MD-ViSCo）。
 #
 # 用法：
 #   bash finetune_bp_head.sh <pretrain_ckpt>

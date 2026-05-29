@@ -11,17 +11,25 @@ step supervises the same vital subset:
 The task's condition modalities (via :func:`cond_slots_to_vitals`) become the
 BP head's ``active_vitals`` for every step. This matches how the evaluation
 cascade feeds the head for the multimodal BP task (see
-:mod:`src.trainer_module.bp_metrics`). The objective is ``L1(pred, target)``
-(MD-ViSCo §6.2.2 uses L1 + multi-WCL; the WCL term is deferred); there is no
-time embedding, attention mask, or Euler sampler.
+:mod:`src.trainer_module.bp_metrics`). There is no time embedding, attention
+mask, or Euler sampler.
 
-Batch contract (3-tuple): each batch is
-``(signal: (B, 3, L), sbp_dbp: (B, 2), demographics: (B, 6))``. The trainer
-slices ECG+PPG (``signal[:, :2, :]``) as input and forwards ``demographics``;
-the ABP slot is unused (the head is strictly causal w.r.t. the source
-modalities, like MD-ViSCo's refinement model). SBP/DBP come from PulseDB's CSV
-(per-cycle mean labeling), not per-segment min/max — see
-``src/data_module/cardiac_dataset.py``.
+Loss mode (MD-ViSCo §6.2.2, ``L_ref = L_MAE + L_WCL``), resolved from
+``(trainer.wcl, stage)`` by :func:`_resolve_loss_mode`:
+- ``l1`` — pure L1 in label space (``wcl.enabled=false``; legacy).
+- ``wcl_only`` — self-supervised contrastive pretraining (stage-1): only the
+  multi-WCL terms, training the encoders/projection + demo MLP (skips the
+  fusion encoders + MlpBP heads). Selected by min val WCL loss.
+- ``l1+wcl`` — L1 + multi-WCL (stage-2 finetune). Selected by min val L1.
+
+Batch contract (5-tuple): each batch is ``(signal: (B, 3, L), sbp_dbp: (B, 2),
+demographics: (B, 6), abp_minmax: (B, 2), age_raw: (B, 1))``. The trainer slices
+ECG+PPG (``signal[:, :2, :]``) as input and forwards ``demographics``; the ABP
+slot is unused. The regression target is selected by ``bp_label_source``:
+``segment_minmax`` (per-segment ABP max/min from ``abp_minmax``, default —
+matches MD-ViSCo "SBP/DBP = max/min of ABP") or ``per_cycle_mean`` (CSV labels,
+legacy). ``abp_minmax`` also supplies the WCL waveform-term raw SBP/DBP weights;
+``age_raw`` the WCL age term. See ``src/data_module/cardiac_dataset.py``.
 """
 
 from __future__ import annotations
@@ -51,10 +59,94 @@ from ..model_module.tasks import (
     get_task,
 )
 from ..utils.checkpoint import load_checkpoint, save_checkpoint, unwrap_model
-from ..utils.normalization import BPLabelNorm
+from ..utils.normalization import BPLabelNorm, split_abp_minmax
 from .csv_logger import SimpleCSVLogger
+from .wcl import DEFAULT_WCL_TERMS, WCLTerm, multi_wcl
 
 logger = logging.getLogger(__name__)
+
+# Loss modes (set by stage + trainer.wcl config):
+#   "l1"       — pure L1 in label space (legacy / WCL disabled).
+#   "wcl_only" — self-supervised contrastive pretraining (MD-ViSCo stage-1):
+#                only the WCL terms, training the encoders/projection + demo MLP.
+#   "l1+wcl"   — L_ref = L_MAE + L_WCL (MD-ViSCo refinement finetune, stage-2).
+_LOSS_MODES = ("l1", "wcl_only", "l1+wcl")
+
+
+def _resolve_loss_mode(cfg: Mapping[str, Any], stage: str) -> str:
+    """Map ``(trainer.wcl, stage)`` to a loss mode (see ``_LOSS_MODES``)."""
+    wcl_cfg = cfg.get("wcl", {}) or {}
+    if not bool(wcl_cfg.get("enabled", False)):
+        return "l1"
+    if stage == "pretrain" and bool(wcl_cfg.get("pretrain_contrastive_only", True)):
+        return "wcl_only"
+    return "l1+wcl"
+
+
+def _wcl_terms(cfg: Mapping[str, Any]) -> tuple[WCLTerm, ...]:
+    """WCL term configs — defaults to MD-ViSCo's six-term multi-WCL.
+
+    Optional ``trainer.wcl.terms`` (list of dicts) overrides per-term
+    hyperparameters; absent fields fall back to the dataclass defaults.
+    """
+    raw = (cfg.get("wcl", {}) or {}).get("terms")
+    if not raw:
+        return DEFAULT_WCL_TERMS
+    return tuple(WCLTerm(**dict(t)) for t in raw)
+
+
+def _segment_minmax_target(abp_minmax: Tensor, bp_norm: BPLabelNorm | None) -> Tensor:
+    """``abp_minmax = (dbp_seg, sbp_seg)`` -> ``(SBP, DBP)`` target in label space.
+
+    MD-ViSCo regresses SBP/DBP = the per-segment ABP max/min; the target is
+    ``(sbp_seg, dbp_seg)`` normalized by ``bp_norm`` (identity if ``None``).
+    """
+    sbp_seg, dbp_seg = split_abp_minmax(abp_minmax)
+    sbp_dbp_raw = torch.stack([sbp_seg, dbp_seg], dim=-1)
+    return bp_norm.normalize(sbp_dbp_raw) if bp_norm is not None else sbp_dbp_raw
+
+
+def _resolve_target(
+    sbp_dbp: Tensor,
+    abp_minmax: Tensor | None,
+    bp_norm: BPLabelNorm | None,
+    bp_label_source: str,
+) -> Tensor:
+    """Pick the BP regression target for one batch.
+
+    ``segment_minmax`` derives it from ``abp_minmax`` (per-segment max/min);
+    ``per_cycle_mean`` uses the dataset's ``sbp_dbp`` (CSV labels) directly.
+    """
+    if bp_label_source == "segment_minmax":
+        if abp_minmax is None:
+            raise RuntimeError(
+                "bp_label_source='segment_minmax' needs abp_minmax (batch[3])."
+            )
+        return _segment_minmax_target(abp_minmax, bp_norm)
+    return sbp_dbp
+
+
+def _wcl_weights(
+    abp_minmax: Tensor,
+    demographics: Tensor | None,
+    age_raw: Tensor | None,
+) -> dict[str, Tensor]:
+    """Build the raw-label weight dict for :func:`multi_wcl`.
+
+    Waveform terms weight by raw mmHg SBP/DBP (= per-segment extrema in
+    ``abp_minmax``); PI terms by raw gender (``demographics[:, 1]``) and raw
+    age (years). Missing inputs simply omit their keys, so ``multi_wcl`` skips
+    the corresponding terms.
+    """
+    weights: dict[str, Tensor] = {
+        "y_sbp_raw": abp_minmax[:, 1],
+        "y_dbp_raw": abp_minmax[:, 0],
+    }
+    if demographics is not None:
+        weights["gender_raw"] = demographics[:, 1]
+    if age_raw is not None:
+        weights["age_raw"] = age_raw.reshape(-1)
+    return weights
 
 
 def _amp_enabled(cfg: Mapping[str, Any], device: torch.device) -> bool:
@@ -142,8 +234,13 @@ def _finalize_acc(a: Mapping[str, float]) -> dict[str, float]:
     n = max(a["n"], 1.0)
     me_sbp = a["me_sbp"] / n
     me_dbp = a["me_dbp"] / n
-    var_sbp = max(a["sq_sbp"] / n - me_sbp**2, 0.0)
-    var_dbp = max(a["sq_dbp"] / n - me_dbp**2, 0.0)
+    # Sample SD (ddof=1) per AAMI/BHS convention, matching
+    # :mod:`src.trainer_module.bp_metrics` (which uses np.std(ddof=1)). The
+    # accumulator-based population variance ``sq/n - me^2`` is rescaled by
+    # ``n/(n-1)``; needs n > 1 (true for any real val/test split).
+    bessel = n / (n - 1.0) if n > 1.0 else 1.0
+    var_sbp = max((a["sq_sbp"] / n - me_sbp**2) * bessel, 0.0)
+    var_dbp = max((a["sq_dbp"] / n - me_dbp**2) * bessel, 0.0)
     return {
         "loss": a["loss"] / n,
         "mae_sbp": a["mae_sbp"] / n,
@@ -158,25 +255,27 @@ def _finalize_acc(a: Mapping[str, float]) -> dict[str, float]:
 
 def _unpack_batch(
     batch: Any, device: torch.device
-) -> tuple[Tensor, Tensor, Tensor | None]:
-    """Unpack ``(signal, sbp_dbp [, demographics])`` from the dataset.
+) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None, Tensor | None]:
+    """Unpack the dataset tuple to ``(signal, sbp_dbp, demographics, abp_minmax,
+    age_raw)`` on ``device``.
 
-    Returns a 3-tuple ``(signal, sbp_dbp, demographics)`` where
-    ``demographics`` is ``None`` if the loader emits a legacy 2-tuple
-    (BP head will then run waveform-only, no demographic branch).
+    The dataset emits a 5-tuple ``(signal, sbp_dbp, demographics, abp_minmax,
+    age_raw)``; ``demographics`` / ``abp_minmax`` / ``age_raw`` are ``None`` for
+    shorter legacy tuples (the head then runs waveform-only / per-cycle-mean /
+    no-age-WCL respectively). ``abp_minmax`` feeds both the ``segment_minmax``
+    target and the WCL waveform-term raw weights; ``age_raw`` the WCL age term.
     """
     if len(batch) < 2:
         raise RuntimeError(
-            "BP head training requires (signal, sbp_dbp, demographics) "
-            f"batches; got a {len(batch)}-tuple. Run the dataset "
-            "rewrite before training the BP head."
+            "BP head training requires at least (signal, sbp_dbp) batches; "
+            f"got a {len(batch)}-tuple."
         )
     signal = batch[0].to(device, non_blocking=True)
     sbp_dbp = batch[1].to(device, non_blocking=True)
-    demographics: Tensor | None = None
-    if len(batch) >= 3:
-        demographics = batch[2].to(device, non_blocking=True)
-    return signal, sbp_dbp, demographics
+    demographics = batch[2].to(device, non_blocking=True) if len(batch) >= 3 else None
+    abp_minmax = batch[3].to(device, non_blocking=True) if len(batch) >= 4 else None
+    age_raw = batch[4].to(device, non_blocking=True) if len(batch) >= 5 else None
+    return signal, sbp_dbp, demographics, abp_minmax, age_raw
 
 
 @torch.no_grad()
@@ -189,6 +288,7 @@ def _evaluate(
     amp_enabled: bool,
     max_batches: int | None = None,
     bp_norm: BPLabelNorm | None = None,
+    bp_label_source: str = "per_cycle_mean",
 ) -> dict[str, dict[str, float]]:
     """Per-task L1 loss + per-channel MAE / ME / SD on the val set.
 
@@ -211,7 +311,8 @@ def _evaluate(
     acc = {t.name: _empty_acc() for t in tasks}
 
     for batch_idx, batch in enumerate(val_loader):
-        signal, target, demographics = _unpack_batch(batch, device)
+        signal, sbp_dbp, demographics, abp_minmax, _ = _unpack_batch(batch, device)
+        target = _resolve_target(sbp_dbp, abp_minmax, bp_norm, bp_label_source)
         with torch.autocast(
             device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled
         ):
@@ -243,6 +344,45 @@ def _evaluate(
     return {name: _finalize_acc(a) for name, a in acc.items()}
 
 
+@torch.no_grad()
+def _evaluate_wcl(
+    model: nn.Module,
+    val_loader: DataLoader,
+    device: torch.device,
+    *,
+    active_vitals: Sequence[str],
+    terms: tuple[WCLTerm, ...],
+    amp_enabled: bool,
+    max_batches: int | None = None,
+) -> float:
+    """Mean total multi-WCL loss over the val set.
+
+    Selection metric for the contrastive *pretraining* stage (``wcl_only``),
+    where per-task BP metrics are meaningless (the MlpBP heads are untrained).
+    Runs the encoder-only embedding path (no fusion / heads).
+    """
+    core = unwrap_model(model)
+    core.eval()
+    total, n_batches = 0.0, 0
+    for batch_idx, batch in enumerate(val_loader):
+        signal, _, demographics, abp_minmax, age_raw = _unpack_batch(batch, device)
+        if abp_minmax is None:
+            raise RuntimeError("WCL eval needs abp_minmax (batch[3]) for raw weights.")
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled
+        ):
+            emb = core.encode_embeddings(
+                signal[:, :2, :], demographics, active_vitals=active_vitals
+            )
+        wcl_total, _ = multi_wcl(emb, _wcl_weights(abp_minmax, demographics, age_raw), terms)
+        total += float(wcl_total.item())
+        n_batches += 1
+        if max_batches is not None and (batch_idx + 1) >= max_batches:
+            break
+    core.train()
+    return total / max(n_batches, 1)
+
+
 def _log_eval(prefix: str, per_task: Mapping[str, dict[str, float]]) -> None:
     for name, m in per_task.items():
         logger.info(
@@ -263,21 +403,31 @@ def train(
     output_dir: str | Path,
     test_loader: DataLoader | None = None,
     bp_norm: BPLabelNorm | None = None,
+    bp_label_source: str = "per_cycle_mean",
 ) -> None:
     """Train the BP head on a single fixed ABP-target task (no task sampling).
+
+    Loss mode is resolved from ``(trainer.wcl, stage)`` (see
+    :func:`_resolve_loss_mode`): ``l1`` (legacy / WCL off), ``wcl_only``
+    (MD-ViSCo stage-1 self-supervised contrastive pretraining of the encoders),
+    or ``l1+wcl`` (MD-ViSCo refinement finetune, ``L_ref = L_MAE + L_WCL``).
 
     Args:
         model: :class:`BPHead` (optionally wrapped by ``torch.compile``).
         cfg: trainer config (Hydra DictConfig or plain dict); ``bp_task``
             selects the single ABP-target task to train on (default
-            ``ecgppg2abp``).
-        train_loader / val_loader / test_loader: DataLoaders returning
-            ``(signal, sbp_dbp, demographics)`` tuples (the dataset 3-tuple contract).
+            ``ecgppg2abp``); ``wcl`` enables/configures the multi-WCL terms.
+        train_loader / val_loader / test_loader: DataLoaders returning the
+            dataset 5-tuple ``(signal, sbp_dbp, demographics, abp_minmax, age_raw)``.
         device: torch device.
         output_dir: Hydra-created run directory.
-        bp_norm: when set, dataset labels are in globally min-max normalized
+        bp_norm: when set, SBP/DBP labels live in globally min-max normalized
             [0, 1] (MD-ViSCo Sec III.D); ``_evaluate`` inverses to mmHg for
             AAMI metric reporting. ``None`` = raw-mmHg labels (legacy).
+        bp_label_source: ``"per_cycle_mean"`` (CSV labels, legacy) or
+            ``"segment_minmax"`` (per-segment ABP max/min from ``abp_minmax``,
+            matching MD-ViSCo's "SBP/DBP = max/min of ABP" definition, making
+            the head's ME/SD measure the same quantity as MD-ViSCo Table III).
     """
     if isinstance(cfg, DictConfig):
         cfg_dict = OmegaConf.to_container(cfg, resolve=True)
@@ -321,6 +471,22 @@ def train(
         "BP head fixed task: %s (active_vitals=%s)", task.name, active_vitals
     )
 
+    if bp_label_source not in ("per_cycle_mean", "segment_minmax"):
+        raise ValueError(
+            f"bp_label_source must be 'per_cycle_mean' or 'segment_minmax'; "
+            f"got {bp_label_source!r}"
+        )
+    loss_mode = _resolve_loss_mode(cfg_dict, stage)
+    wcl_terms = _wcl_terms(cfg_dict) if loss_mode != "l1" else ()
+    # WCL forward paths return a dict of embeddings; route them through the
+    # unwrapped module so torch.compile (which dislikes dict outputs) is bypassed
+    # only for those calls. The pure-L1 path keeps the (compiled) ``model``.
+    core = unwrap_model(model)
+    logger.info(
+        "BP head loss_mode=%s | bp_label_source=%s | wcl_terms=%d",
+        loss_mode, bp_label_source, len(wcl_terms),
+    )
+
     optimizer = _build_optimizer(model, cfg_dict)
     steps_per_epoch = len(train_loader)
     scheduler = _build_scheduler(optimizer, cfg_dict, epochs * steps_per_epoch)
@@ -355,6 +521,11 @@ def train(
         window_n = 0
         task_loss_sum = {t.name: torch.zeros((), device=device) for t in tasks}
         task_loss_count = {t.name: 0 for t in tasks}
+        # L1 / WCL component accumulators (on-device; reduced to floats once per
+        # epoch at logging time). Unused in "l1" mode.
+        l1_sum = torch.zeros((), device=device)
+        wcl_sum = torch.zeros((), device=device)
+        wcl_term_sum: dict[str, Tensor] = {}
 
         it = tqdm(
             train_loader,
@@ -364,16 +535,40 @@ def train(
             desc=f"bp_head ep {epoch}/{epochs - 1}",
         )
         for batch in it:
-            signal, target, demographics = _unpack_batch(batch, device)
+            signal, sbp_dbp, demographics, abp_minmax, age_raw = _unpack_batch(
+                batch, device
+            )
+            target = _resolve_target(sbp_dbp, abp_minmax, bp_norm, bp_label_source)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.bfloat16,
                 enabled=amp_enabled,
             ):
-                pred = model(signal[:, :2, :], demographics, active_vitals=active_vitals)
-                # L1 objective (MD-ViSCo §6.2.2 uses L1 + multi-WCL; WCL deferred).
-                loss = (pred - target).abs().mean()
+                l1 = signal.new_zeros(())
+                wcl_total = signal.new_zeros(())
+                wcl_vals: dict[str, float] = {}
+                if loss_mode == "l1":
+                    pred = model(signal[:, :2, :], demographics, active_vitals=active_vitals)
+                    l1 = (pred - target).abs().mean()
+                elif loss_mode == "wcl_only":
+                    # Contrastive pretraining: encoders only, no fusion/heads.
+                    emb = core.encode_embeddings(
+                        signal[:, :2, :], demographics, active_vitals=active_vitals
+                    )
+                    wcl_total, wcl_vals = multi_wcl(
+                        emb, _wcl_weights(abp_minmax, demographics, age_raw), wcl_terms
+                    )
+                else:  # "l1+wcl"
+                    pred, emb = core(
+                        signal[:, :2, :], demographics,
+                        active_vitals=active_vitals, return_embeddings=True,
+                    )
+                    l1 = (pred - target).abs().mean()
+                    wcl_total, wcl_vals = multi_wcl(
+                        emb, _wcl_weights(abp_minmax, demographics, age_raw), wcl_terms
+                    )
+                loss = l1 + wcl_total
             loss.backward()
             if grad_clip_norm > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
@@ -387,6 +582,14 @@ def train(
             window_n += 1
             task_loss_sum[task.name] += loss_d
             task_loss_count[task.name] += 1
+            if loss_mode != "l1":
+                # On-device accumulation only (no per-batch .item() sync); the
+                # L1/WCL split + per-term values are reduced to floats once per
+                # epoch when logged. In "l1" mode these are unused.
+                l1_sum += l1.detach()
+                wcl_sum += wcl_total.detach()
+                for k, v in wcl_vals.items():
+                    wcl_term_sum[k] = wcl_term_sum.get(k, 0.0) + v
             global_step += 1
 
             if window_n >= log_every_n_steps:
@@ -444,34 +647,56 @@ def train(
         }
         for t in tasks:
             epoch_metrics[f"epoch/train_loss_{t.name}"] = per_task_train[t.name]
+        if loss_mode != "l1":
+            denom = max(train_n, 1)
+            epoch_metrics["epoch/l1_loss"] = float((l1_sum / denom).item())
+            epoch_metrics["epoch/wcl_loss"] = float((wcl_sum / denom).item())
+            for k, s in wcl_term_sum.items():
+                epoch_metrics[f"epoch/wcl_{k}"] = float((s / denom).item())
 
         if val_loader is not None and (epoch + 1) % val_every == 0:
-            per_task = _evaluate(
-                model, val_loader, device,
-                tasks=tasks,
-                amp_enabled=amp_enabled,
-                bp_norm=bp_norm,
-            )
-            # MD-ViSCo selects best by the minimum validation loss (L1 + WCL);
-            # with WCL deferred our objective is pure L1, so the selection
-            # scalar is the mean per-task val L1 loss (label space).
-            sel = sum(m["loss"] for m in per_task.values()) / len(per_task)
-            row["val_loss_mean"] = sel
-            for name, m in per_task.items():
-                row[f"val_{name}_loss"] = m["loss"]
-                row[f"val_{name}_mae_mean"] = m["mae_mean"]
-                row[f"val_{name}_me_sbp"] = m["me_sbp"]
-                row[f"val_{name}_sd_sbp"] = m["sd_sbp"]
-                row[f"val_{name}_me_dbp"] = m["me_dbp"]
-                row[f"val_{name}_sd_dbp"] = m["sd_dbp"]
-                epoch_metrics[f"val/{name}/mae_mean"] = m["mae_mean"]
-                epoch_metrics[f"val/{name}/me_sbp"] = m["me_sbp"]
-                epoch_metrics[f"val/{name}/sd_sbp"] = m["sd_sbp"]
-                epoch_metrics[f"val/{name}/me_dbp"] = m["me_dbp"]
-                epoch_metrics[f"val/{name}/sd_dbp"] = m["sd_dbp"]
-            epoch_metrics["val/loss_mean"] = sel
-            logger.info("  val | mean L1 loss over tasks %.4f (selection metric)", sel)
-            _log_eval("val", per_task)
+            if loss_mode == "wcl_only":
+                # Contrastive pretraining: BP metrics are meaningless (heads
+                # untrained), so select best.pt by the min val WCL loss.
+                sel = _evaluate_wcl(
+                    model, val_loader, device,
+                    active_vitals=active_vitals, terms=wcl_terms,
+                    amp_enabled=amp_enabled,
+                )
+                row["val_loss_mean"] = sel
+                epoch_metrics["val/loss_mean"] = sel
+                epoch_metrics["val/wcl_loss"] = sel
+                logger.info(
+                    "  val | mean WCL loss %.5f (contrastive-pretrain selection)", sel
+                )
+            else:
+                per_task = _evaluate(
+                    model, val_loader, device,
+                    tasks=tasks,
+                    amp_enabled=amp_enabled,
+                    bp_norm=bp_norm,
+                    bp_label_source=bp_label_source,
+                )
+                # MD-ViSCo selects best by the minimum validation loss; in
+                # l1+wcl the selection scalar is the mean per-task val L1 (label
+                # space), matching MD-ViSCo's L_MAE monitoring.
+                sel = sum(m["loss"] for m in per_task.values()) / len(per_task)
+                row["val_loss_mean"] = sel
+                for name, m in per_task.items():
+                    row[f"val_{name}_loss"] = m["loss"]
+                    row[f"val_{name}_mae_mean"] = m["mae_mean"]
+                    row[f"val_{name}_me_sbp"] = m["me_sbp"]
+                    row[f"val_{name}_sd_sbp"] = m["sd_sbp"]
+                    row[f"val_{name}_me_dbp"] = m["me_dbp"]
+                    row[f"val_{name}_sd_dbp"] = m["sd_dbp"]
+                    epoch_metrics[f"val/{name}/mae_mean"] = m["mae_mean"]
+                    epoch_metrics[f"val/{name}/me_sbp"] = m["me_sbp"]
+                    epoch_metrics[f"val/{name}/sd_sbp"] = m["sd_sbp"]
+                    epoch_metrics[f"val/{name}/me_dbp"] = m["me_dbp"]
+                    epoch_metrics[f"val/{name}/sd_dbp"] = m["sd_dbp"]
+                epoch_metrics["val/loss_mean"] = sel
+                logger.info("  val | mean L1 loss over tasks %.4f (selection metric)", sel)
+                _log_eval("val", per_task)
 
             if sel < best_val:
                 best_val = sel
@@ -513,6 +738,7 @@ def train(
             tasks=tasks,
             amp_enabled=amp_enabled,
             bp_norm=bp_norm,
+            bp_label_source=bp_label_source,
         )
         sel = sum(m["loss"] for m in per_task.values()) / len(per_task)
         logger.info("bp_head test | mean L1 loss over tasks %.4f", sel)

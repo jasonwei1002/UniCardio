@@ -96,15 +96,46 @@ def _metric_keys() -> list[str]:
             for stat in ("sbp_me", "sbp_sd", "dbp_me", "dbp_sd", "n")
         ],
         # ---- BP head (src/trainer_module/bp_head_trainer.py) ----
-        "epoch/train_loss",
-        "val/loss",
-        "val/mae_sbp", "val/mae_dbp", "val/mae_mean",
-        "val/me_sbp",  "val/me_dbp",
-        "val/sd_sbp",  "val/sd_dbp",
-        "test/loss",
-        "test/mae_sbp", "test/mae_dbp", "test/mae_mean",
-        "test/me_sbp",  "test/me_dbp",
-        "test/sd_sbp",  "test/sd_dbp",
+        # NOTE: BP head eval metrics are logged per-task NESTED as
+        # ``val/<task>/<metric>`` / ``test/<task>/<metric>`` (task in the
+        # middle, slash-separated) — NOT flat ``val/<metric>``. The earlier
+        # flat names here 404'd on every run, so the mmHg SBP/DBP results
+        # never made it into metrics.csv even though they exist on SwanLab.
+        # (This differs from the RF finetune convention above, which is the
+        # underscore-flat ``finetune/bp_<task>_<stat>``.)
+        "epoch/train_loss",  # epoch/lr + epoch/time_s already listed above
+        *[f"epoch/train_loss_{n}" for n in task_names],
+        # WCL components (loss_mode != "l1"): total L1 / WCL split + per-term WCL
+        # + val WCL (contrastive-pretrain selection). Term names = the six
+        # DEFAULT_WCL_TERMS in src/trainer_module/wcl.py.
+        "epoch/l1_loss",
+        "epoch/wcl_loss",
+        "val/wcl_loss",
+        *[
+            f"epoch/wcl_{term}"
+            for term in (
+                "ecg_sbp", "ppg_sbp", "ecg_dbp", "ppg_dbp",
+                "text_gender_wcl", "text_age_wcl",
+            )
+        ],
+        # Validation: 5 nested stats per task + cross-task mean
+        # ``val/loss_mean`` (already listed in the RF section). Per-task L1 /
+        # MAE components are CSV-only, not logged to SwanLab.
+        *[
+            f"val/{n}/{stat}"
+            for n in task_names
+            for stat in ("mae_mean", "me_sbp", "sd_sbp", "me_dbp", "sd_dbp")
+        ],
+        # Test: full ``_finalize_acc`` stat set per task + cross-task mean.
+        "test/loss_mean",
+        *[
+            f"test/{n}/{stat}"
+            for n in task_names
+            for stat in (
+                "loss", "mae_sbp", "mae_dbp", "mae_mean",
+                "me_sbp", "me_dbp", "sd_sbp", "sd_dbp",
+            )
+        ],
     ]
 
 

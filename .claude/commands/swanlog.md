@@ -30,7 +30,7 @@ allowed-tools: Bash, Read
    - 该 run 实际命中的非空 value 列（脚本日志里的 "value cols" 行已列出，可直接复用）
    - 最末一行非空 value 列的数值（用 Pandas 一行读取即可：每个 value 列的 `df[col].dropna().iloc[-1]`，跳过空列）
 
-   不要再固定看 `epoch/avg_loss` / `val/loss_mean` — 这两个只是 RF backbone 才有。BP head run 是 `epoch/train_loss` / `val/mae_mean` / `val/sd_sbp` 等；以脚本输出的 value cols 为准。
+   不要再固定看 `epoch/avg_loss` / `val/loss_mean` — 这两个只是 RF backbone 才有。BP head run 的 eval 指标是**按 task 嵌套**的 `val/<task>/mae_mean` / `test/<task>/mae_sbp` / `test/loss_mean` 等（task 名夹在中间，如 `val/ecgppg2abp/mae_mean`），外加每任务 `epoch/train_loss_<task>`；以脚本输出的 value cols 为准。
 
 5. **如果用户传了 `--extra-keys`**，简短复述追加了哪些 key（脚本日志里有 "appended N extra keys" 行）。
 

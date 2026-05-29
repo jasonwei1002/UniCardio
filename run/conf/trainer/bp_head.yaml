@@ -39,3 +39,19 @@ init_from: null
 # (both vitals, averaged), matching how bp_metrics feeds the multimodal eval
 # cascade. Must be an ABP-target task whose vitals exist on the head.
 bp_task: ecgppg2abp
+
+# Weighted Contrastive Loss (MD-ViSCo §6.2.2, faithful multi-WCL). When
+# enabled, loss_mode is resolved from (wcl, stage):
+#   stage=pretrain + pretrain_contrastive_only=true -> "wcl_only"
+#     (self-supervised contrastive pretraining of the encoders; the
+#      train_bp_head.sh stage-1 path)
+#   stage=finetune (or pretrain_contrastive_only=false) -> "l1+wcl"
+#     (L_ref = L_MAE + multi-WCL; the finetune_bp_head.sh stage-2 path)
+# enabled=false -> pure L1 (legacy). Term hyperparameters default to
+# DEFAULT_WCL_TERMS (src/trainer_module/wcl.py); override via `wcl.terms`
+# (list of {name, embedding_key, weight_key, temperature_embeddings,
+# temperature_weight, threshold, scale_factor}).
+wcl:
+  enabled: true
+  pretrain_contrastive_only: true
+  terms: null
