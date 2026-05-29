@@ -62,11 +62,18 @@ wcl:
   pretrain_contrastive_only: true
   weight: 0.2
   terms: null
-  # Similarity normalization. MD-ViSCo's raw dot product (normalize_embeddings=
-  # false) on the LayerNorm'd 512-d embeddings gives S_ii≈512 → saturated row
-  # softmax → trivial directional collapse (all embeddings align, WCL pins at
-  # log(B); diagnosed in plan/stage1_collapse). normalize_embeddings=true uses
-  # cosine similarity with `temperature` (≈0.1) — locally verified to avoid the
-  # collapse and let the waveform terms descend below the uniform floor.
-  normalize_embeddings: true
+  # Similarity normalization. Default false = MD-ViSCo's raw dot product (the
+  # faithful config). Both active stages are now l1+wcl, where the L1 regression
+  # supervision forces the encoder to keep BP-discriminative (non-collinear)
+  # embeddings — so raw dot product is safe AND faithful, and no normalization
+  # hack is needed.
+  #   normalize_embeddings=true (+ cosine `temperature`≈0.1) is kept ONLY as an
+  #   escape hatch for the legacy wcl_only contrastive-pretraining path: there,
+  #   with no L1 signal, raw dot product on the LayerNorm'd 512-d embeddings
+  #   gives S_ii≈512 → saturated softmax → directional collapse (WCL pins at
+  #   log(B); diagnosed in plan/stage1_collapse). Cosine+temp avoided that
+  #   collapse locally at small batch but did NOT transfer to B=2048 — which is
+  #   why we abandoned wcl_only in favor of l1+wcl. Leave false unless reviving
+  #   wcl_only.
+  normalize_embeddings: false
   temperature: 0.1
