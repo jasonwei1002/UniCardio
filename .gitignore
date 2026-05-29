@@ -13,6 +13,9 @@ run/outputs/
 outputs/
 logs/
 
+# Planning scratch (task_plan.md / notes.md; local working docs)
+/plan/
+
 # Pytest
 .pytest_cache/
 
