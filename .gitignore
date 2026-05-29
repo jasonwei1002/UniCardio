@@ -16,6 +16,9 @@ logs/
 # Planning scratch (task_plan.md / notes.md; local working docs)
 /plan/
 
+# Scratch / disposable intermediates (diagnostics, throwaway scripts)
+/temp/
+
 # Pytest
 .pytest_cache/
 
