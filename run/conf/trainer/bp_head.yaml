@@ -62,3 +62,11 @@ wcl:
   pretrain_contrastive_only: true
   weight: 0.2
   terms: null
+  # Similarity normalization. MD-ViSCo's raw dot product (normalize_embeddings=
+  # false) on the LayerNorm'd 512-d embeddings gives S_ii≈512 → saturated row
+  # softmax → trivial directional collapse (all embeddings align, WCL pins at
+  # log(B); diagnosed in plan/stage1_collapse). normalize_embeddings=true uses
+  # cosine similarity with `temperature` (≈0.1) — locally verified to avoid the
+  # collapse and let the waveform terms descend below the uniform floor.
+  normalize_embeddings: true
+  temperature: 0.1

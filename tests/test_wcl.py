@@ -162,3 +162,39 @@ def test_default_terms_match_mdvisco_spec():
     assert (g.threshold, g.scale_factor, g.temperature_embeddings) == (1.0, 1e-2, 4.0)
     a = by_name["text_age_wcl"]
     assert (a.threshold, a.temperature_weight, a.scale_factor) == (0.0235, 4.0, 1e-2)
+
+
+def test_normalize_embeddings_is_scale_invariant():
+    """With normalize_embeddings=True the similarity is a cosine, so scaling the
+    embeddings by a constant must NOT change the loss (raw dot product does)."""
+    torch.manual_seed(0)
+    emb = torch.randn(12, 16)
+    w = torch.randn(12) * 20 + 120
+
+    raw_1 = weighted_contrastive_loss(emb, w, temperature_embeddings=0.1)
+    raw_5 = weighted_contrastive_loss(emb * 5.0, w, temperature_embeddings=0.1)
+    assert not torch.isclose(raw_1, raw_5, atol=1e-6)  # raw dot product is scale-sensitive
+
+    nrm_1 = weighted_contrastive_loss(
+        emb, w, temperature_embeddings=0.1, normalize_embeddings=True
+    )
+    nrm_5 = weighted_contrastive_loss(
+        emb * 5.0, w, temperature_embeddings=0.1, normalize_embeddings=True
+    )
+    assert torch.isclose(nrm_1, nrm_5, atol=1e-5)  # cosine is scale-invariant
+
+
+def test_multi_wcl_normalize_flag_threads_through():
+    """multi_wcl(normalize_embeddings=True) must equal the per-term normalized loss."""
+    torch.manual_seed(1)
+    emb = {"ecg_embeddings": torch.randn(8, 16) * 3.0}
+    w = {"y_sbp_raw": torch.randn(8) * 20 + 120}
+    terms = tuple(t for t in DEFAULT_WCL_TERMS if t.name == "ecg_sbp")
+    total, per = multi_wcl(emb, w, terms, normalize_embeddings=True)
+    ref = weighted_contrastive_loss(
+        emb["ecg_embeddings"], w["y_sbp_raw"],
+        temperature_embeddings=terms[0].temperature_embeddings,
+        scale_factor=terms[0].scale_factor,
+        normalize_embeddings=True,
+    )
+    assert torch.isclose(total, ref, atol=1e-6)

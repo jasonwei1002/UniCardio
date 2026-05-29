@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -84,16 +85,33 @@ def _resolve_loss_mode(cfg: Mapping[str, Any], stage: str) -> str:
     return "l1+wcl"
 
 
-def _wcl_terms(cfg: Mapping[str, Any]) -> tuple[WCLTerm, ...]:
+def _wcl_norm_cfg(cfg: Mapping[str, Any]) -> tuple[bool, float]:
+    """``(normalize_embeddings, temperature)`` for the WCL similarity.
+
+    ``normalize_embeddings`` switches the WCL from MD-ViSCo's raw dot product to
+    cosine (L2-normalized) similarity — the fix for the directional collapse the
+    raw dot product induces on LayerNorm'd 512-d embeddings (``S_ii≈512`` →
+    saturated softmax; see ``plan/stage1_collapse``). When on, ``temperature``
+    (default 0.1) is the cosine temperature applied uniformly to every term.
+    """
+    wcl = cfg.get("wcl", {}) or {}
+    return bool(wcl.get("normalize_embeddings", False)), float(wcl.get("temperature", 0.1))
+
+
+def _wcl_terms(cfg: Mapping[str, Any], normalize: bool, temperature: float) -> tuple[WCLTerm, ...]:
     """WCL term configs — defaults to MD-ViSCo's six-term multi-WCL.
 
     Optional ``trainer.wcl.terms`` (list of dicts) overrides per-term
-    hyperparameters; absent fields fall back to the dataclass defaults.
+    hyperparameters; absent fields fall back to the dataclass defaults. When
+    ``normalize`` is on, every term's ``temperature_embeddings`` is replaced by
+    the single cosine ``temperature`` (the raw-dot-product per-term temps no
+    longer apply once embeddings are L2-normalized).
     """
     raw = (cfg.get("wcl", {}) or {}).get("terms")
-    if not raw:
-        return DEFAULT_WCL_TERMS
-    return tuple(WCLTerm(**dict(t)) for t in raw)
+    base = DEFAULT_WCL_TERMS if not raw else tuple(WCLTerm(**dict(t)) for t in raw)
+    if normalize:
+        base = tuple(replace(t, temperature_embeddings=temperature) for t in base)
+    return base
 
 
 def _resolve_wcl_weight(cfg: Mapping[str, Any], loss_mode: str) -> float:
@@ -382,6 +400,7 @@ def _evaluate_wcl(
     terms: tuple[WCLTerm, ...],
     amp_enabled: bool,
     bp_norm: BPLabelNorm | None = None,
+    normalize_embeddings: bool = False,
     max_batches: int | None = None,
 ) -> float:
     """Mean total multi-WCL loss over the val set.
@@ -402,7 +421,8 @@ def _evaluate_wcl(
                 signal[:, :2, :], demographics, active_vitals=active_vitals
             )
         wcl_total, _ = multi_wcl(
-            emb, _wcl_weights(sbp_dbp, demographics, age_raw, bp_norm), terms
+            emb, _wcl_weights(sbp_dbp, demographics, age_raw, bp_norm), terms,
+            normalize_embeddings=normalize_embeddings,
         )
         total += float(wcl_total.item())
         n_batches += 1
@@ -506,15 +526,18 @@ def train(
             f"got {bp_label_source!r}"
         )
     loss_mode = _resolve_loss_mode(cfg_dict, stage)
-    wcl_terms = _wcl_terms(cfg_dict) if loss_mode != "l1" else ()
+    wcl_normalize, wcl_temperature = _wcl_norm_cfg(cfg_dict)
+    wcl_terms = _wcl_terms(cfg_dict, wcl_normalize, wcl_temperature) if loss_mode != "l1" else ()
     wcl_weight = _resolve_wcl_weight(cfg_dict, loss_mode)
     # WCL forward paths return a dict of embeddings; route them through the
     # unwrapped module so torch.compile (which dislikes dict outputs) is bypassed
     # only for those calls. The pure-L1 path keeps the (compiled) ``model``.
     core = unwrap_model(model)
     logger.info(
-        "BP head loss_mode=%s | bp_label_source=%s | wcl_terms=%d | wcl_weight=%.3g",
+        "BP head loss_mode=%s | bp_label_source=%s | wcl_terms=%d | wcl_weight=%.3g "
+        "| wcl_normalize=%s | wcl_temp=%.3g",
         loss_mode, bp_label_source, len(wcl_terms), wcl_weight,
+        wcl_normalize, wcl_temperature,
     )
 
     optimizer = _build_optimizer(model, cfg_dict)
@@ -587,7 +610,8 @@ def train(
                         signal[:, :2, :], demographics, active_vitals=active_vitals
                     )
                     wcl_total, wcl_vals = multi_wcl(
-                        emb, _wcl_weights(sbp_dbp, demographics, age_raw, bp_norm), wcl_terms
+                        emb, _wcl_weights(sbp_dbp, demographics, age_raw, bp_norm), wcl_terms,
+                        normalize_embeddings=wcl_normalize,
                     )
                 else:  # "l1+wcl"
                     pred, emb = core(
@@ -596,7 +620,8 @@ def train(
                     )
                     l1 = (pred - target).abs().mean()
                     wcl_total, wcl_vals = multi_wcl(
-                        emb, _wcl_weights(sbp_dbp, demographics, age_raw, bp_norm), wcl_terms
+                        emb, _wcl_weights(sbp_dbp, demographics, age_raw, bp_norm), wcl_terms,
+                        normalize_embeddings=wcl_normalize,
                     )
                 # MD-ViSCo L_ref = L1 + wcl_weight * WCL (wcl_weight=1.0 for the
                 # wcl_only stage; raw wcl_total is still logged for comparability).
@@ -694,6 +719,7 @@ def train(
                     model, val_loader, device,
                     active_vitals=active_vitals, terms=wcl_terms,
                     amp_enabled=amp_enabled, bp_norm=bp_norm,
+                    normalize_embeddings=wcl_normalize,
                 )
                 row["val_loss_mean"] = sel
                 epoch_metrics["val/loss_mean"] = sel

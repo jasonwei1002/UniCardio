@@ -79,17 +79,26 @@ def weighted_contrastive_loss(
     temperature_weight: float = 1.0,
     threshold: float = 0.0,
     scale_factor: float = 1.0,
+    normalize_embeddings: bool = False,
 ) -> Tensor:
     """Single WCL term, mean-reduced scalar (MD-ViSCo ``_compute_loss``).
 
     Args:
-        embeddings: ``(B, d)`` feature embeddings (NOT L2-normalized — faithful
-            to upstream, which uses the raw dot product).
+        embeddings: ``(B, d)`` feature embeddings.
         weights: ``(B,)`` or ``(B, 1)`` raw scalar labels driving the similarity.
-        temperature_embeddings: divides the embedding dot-product similarity.
+        temperature_embeddings: divides the embedding similarity.
         temperature_weight: divides the ``|w_i - w_j|`` weight similarity.
         threshold: weight-similarity entries ``< threshold`` are zeroed.
         scale_factor: multiplies the final loss.
+        normalize_embeddings: when ``False`` (default), use MD-ViSCo's raw dot
+            product ``E @ E.T`` — but on the LayerNorm'd ``projection_dim``-wide
+            embeddings this gives ``S_ii ≈ projection_dim`` (~512), which
+            saturates the row softmax and drives a trivial directional collapse
+            (all embeddings align, similarities equalize, loss pins at
+            ``log(B)``; diagnosed locally — see ``plan/stage1_collapse``). When
+            ``True``, L2-normalize the embeddings so the similarity is a cosine
+            in ``[-1, 1]``; pair with a small ``temperature_embeddings`` (~0.1)
+            for a standard, non-collapsing InfoNCE similarity.
 
     Returns:
         Scalar tensor (mean over the batch).
@@ -112,6 +121,8 @@ def weighted_contrastive_loss(
     # in fp32 regardless of the surrounding autocast dtype.
     weights = weights.float()
     emb = embeddings.float()
+    if normalize_embeddings:
+        emb = F.normalize(emb, dim=-1)
 
     weight_similarity = torch.exp(-(torch.abs(weights - weights.T) / temperature_weight))
     weight_similarity = torch.where(
@@ -134,6 +145,8 @@ def multi_wcl(
     embeddings: Mapping[str, Tensor],
     weights: Mapping[str, Tensor],
     terms: tuple[WCLTerm, ...] = DEFAULT_WCL_TERMS,
+    *,
+    normalize_embeddings: bool = False,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Sum the active WCL terms; skip any term whose embedding/weight is absent.
 
@@ -147,6 +160,9 @@ def multi_wcl(
         embeddings: ``{key: (B, d)}`` (e.g. ``ecg_embeddings``, ``text_embeddings``).
         weights: ``{key: (B,) | (B, 1)}`` raw label tensors.
         terms: term configs to sum (default = MD-ViSCo's six-term multi-WCL).
+        normalize_embeddings: L2-normalize embeddings before the similarity
+            (cosine InfoNCE) — see :func:`weighted_contrastive_loss`. Applied
+            uniformly to every term.
 
     Returns:
         ``(total_loss, per_term)`` where ``total_loss`` is a scalar tensor (0.0
@@ -167,6 +183,7 @@ def multi_wcl(
             temperature_weight=t.temperature_weight,
             threshold=t.threshold,
             scale_factor=t.scale_factor,
+            normalize_embeddings=normalize_embeddings,
         )
         per_term[t.name] = term_loss.detach()
         total = term_loss if total is None else total + term_loss
