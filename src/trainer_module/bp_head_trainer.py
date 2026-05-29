@@ -391,6 +391,35 @@ def _evaluate(
 
 
 @torch.no_grad()
+def _embedding_diagnostics(emb: Tensor, max_n: int = 512) -> dict[str, float]:
+    """Geometry of an embedding batch ``(B, d)`` — collapse indicators.
+
+    - ``cos_mean``: mean off-diagonal cosine; ``-> 1`` = directional collapse
+      (all embeddings align, WCL similarities equalize, loss pins at log(B)).
+    - ``erank``: effective rank (entropy of the centered singular spectrum);
+      ``-> 1`` = rank collapse.
+    - ``std``: mean across-batch per-dim std; ``-> 0`` = norm collapse.
+
+    Capped to ``max_n`` rows to bound the O(B^2)/SVD cost at large batch.
+    """
+    e = emb.detach().float()
+    if e.shape[0] > max_n:
+        e = e[:max_n]
+    b = e.shape[0]
+    if b < 2:
+        return {"cos_mean": 0.0, "erank": 0.0, "std": 0.0}
+    std = float(e.std(dim=0).mean())
+    ec = e - e.mean(dim=0, keepdim=True)
+    s = torch.linalg.svdvals(ec)
+    p = s / (s.sum() + 1e-12)
+    erank = float(torch.exp(-(p * (p + 1e-12).log()).sum()))
+    en = torch.nn.functional.normalize(e, dim=1)
+    cos = en @ en.T
+    off = cos[~torch.eye(b, dtype=torch.bool, device=e.device)]
+    return {"cos_mean": float(off.mean()), "erank": erank, "std": std}
+
+
+@torch.no_grad()
 def _evaluate_wcl(
     model: nn.Module,
     val_loader: DataLoader,
@@ -402,16 +431,20 @@ def _evaluate_wcl(
     bp_norm: BPLabelNorm | None = None,
     normalize_embeddings: bool = False,
     max_batches: int | None = None,
-) -> float:
-    """Mean total multi-WCL loss over the val set.
+) -> tuple[float, dict[str, float]]:
+    """Mean total multi-WCL loss over the val set + embedding-collapse diagnostics.
 
     Selection metric for the contrastive *pretraining* stage (``wcl_only``),
     where per-task BP metrics are meaningless (the MlpBP heads are untrained).
-    Runs the encoder-only embedding path (no fusion / heads).
+    Runs the encoder-only embedding path (no fusion / heads). The second return
+    value maps ``"{vital}_{cos_mean|erank|std}"`` (computed once on the first
+    batch) so we can see directly whether the embeddings collapse — the loss
+    alone can't distinguish collapse from a merely-hard contrastive task.
     """
     core = unwrap_model(model)
     core.eval()
     total, n_batches = 0.0, 0
+    diag: dict[str, float] = {}
     for batch_idx, batch in enumerate(val_loader):
         signal, sbp_dbp, demographics, _, age_raw = _unpack_batch(batch, device)
         with torch.autocast(
@@ -420,6 +453,11 @@ def _evaluate_wcl(
             emb = core.encode_embeddings(
                 signal[:, :2, :], demographics, active_vitals=active_vitals
             )
+        if batch_idx == 0:
+            for key, vec in emb.items():
+                vital = key.replace("_embeddings", "")
+                for stat, val in _embedding_diagnostics(vec).items():
+                    diag[f"{vital}_{stat}"] = val
         wcl_total, _ = multi_wcl(
             emb, _wcl_weights(sbp_dbp, demographics, age_raw, bp_norm), terms,
             normalize_embeddings=normalize_embeddings,
@@ -429,7 +467,7 @@ def _evaluate_wcl(
         if max_batches is not None and (batch_idx + 1) >= max_batches:
             break
     core.train()
-    return total / max(n_batches, 1)
+    return total / max(n_batches, 1), diag
 
 
 def _log_eval(prefix: str, per_task: Mapping[str, dict[str, float]]) -> None:
@@ -715,7 +753,7 @@ def train(
             if loss_mode == "wcl_only":
                 # Contrastive pretraining: BP metrics are meaningless (heads
                 # untrained), so select best.pt by the min val WCL loss.
-                sel = _evaluate_wcl(
+                sel, wcl_diag = _evaluate_wcl(
                     model, val_loader, device,
                     active_vitals=active_vitals, terms=wcl_terms,
                     amp_enabled=amp_enabled, bp_norm=bp_norm,
@@ -724,8 +762,12 @@ def train(
                 row["val_loss_mean"] = sel
                 epoch_metrics["val/loss_mean"] = sel
                 epoch_metrics["val/wcl_loss"] = sel
+                for k, v in wcl_diag.items():
+                    epoch_metrics[f"wcl_diag/{k}"] = v
+                diag_str = " ".join(f"{k}={v:.3f}" for k, v in wcl_diag.items())
                 logger.info(
-                    "  val | mean WCL loss %.5f (contrastive-pretrain selection)", sel
+                    "  val | mean WCL loss %.5f (contrastive-pretrain selection) | %s",
+                    sel, diag_str,
                 )
             else:
                 per_task = _evaluate(

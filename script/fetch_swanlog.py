@@ -118,6 +118,14 @@ def _metric_keys() -> list[str]:
                 "text_gender_wcl", "text_age_wcl",
             )
         ],
+        # WCL embedding-collapse diagnostics (wcl_only stage; logged on the
+        # first val batch per epoch). cos_mean->1 = directional collapse,
+        # erank->1 = rank collapse, std->0 = norm collapse.
+        *[
+            f"wcl_diag/{vital}_{stat}"
+            for vital in ("ecg", "ppg", "text")
+            for stat in ("cos_mean", "erank", "std")
+        ],
         # Validation: 5 nested stats per task + cross-task mean
         # ``val/loss_mean`` (already listed in the RF section). Per-task L1 /
         # MAE components are CSV-only, not logged to SwanLab.
