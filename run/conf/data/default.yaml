@@ -48,11 +48,14 @@ pulsedb:
 split_seed: 42
 
 # BP head 回归目标的 SBP/DBP 来源（仅 BP head 训练/评估读取）：
-#   segment_minmax  —— 用本段 ABP 的 max/min（= abp_minmax），对齐 MD-ViSCo
-#                      "SBP/DBP = max/min of ABP" 的定义，使 ME/SD 与其 Table III
-#                      测同一量（默认）。
-#   per_cycle_mean  —— 用 CSV 的 PulseDB 官方 per-cycle-mean 标签（legacy）。
-bp_label_source: segment_minmax
+#   per_cycle_mean  —— 用 CSV 的 PulseDB 官方 SegSBP/SegDBP 标签（默认）。这才是
+#                      MD-ViSCo 的目标 & 评测参照：其 pulsedb_preprocessor.py 直读
+#                      .mat 的 SBP/DBP 字段（= 我方 CSV，convert_h5_to_npy_csv.py
+#                      取自同一 bp_raw），从不取波形 max/min。与其 Table III 同口径。
+#   segment_minmax  —— 用本段 ABP 的 raw max/min（= abp_minmax）。这是更噪的不同量
+#                      （单点极值，受离群拍/噪声影响），并非 MD-ViSCo 的定义；保留作
+#                      实验对照，勿用于对标 Table III。
+bp_label_source: per_cycle_mean
 
 batch_size: 512
 num_workers: 8

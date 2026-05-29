@@ -10,16 +10,17 @@ ECG / PPG 保持 raw scale。
 
 * ``signal``: ``(3, L)`` float32，ABP slot ∈ [0, 1]，其它 slot 为原始尺度。
 * ``sbp_dbp``: ``(2,)`` float32 = ``(sbp_mmHg, dbp_mmHg)`` 从 CSV 读取
-  （PulseDB 的 ground-truth per-cycle mean，不是 segment max/min）。当
-  ``data.bp_label_source='segment_minmax'`` 时，BP-head trainer / bp_metrics
-  改从 ``abp_minmax`` 派生 (SBP, DBP)=(sbp_seg, dbp_seg) 作目标（与 MD-ViSCo
-  "SBP/DBP = max/min of ABP" 对齐），本字段则不参与训练。
+  （PulseDB 的 ground-truth SegSBP/SegDBP，与 MD-ViSCo `data["SBP"/"DBP"]`
+  取自同一字段；``bp_label_norm`` 开启时已归一化到 [0,1]）。默认
+  ``data.bp_label_source='per_cycle_mean'`` 时这就是 BP-head 回归目标，也是
+  WCL 波形项 raw 权重的来源（trainer 会反归一化回 mmHg 再喂 WCL 核）。当
+  ``='segment_minmax'`` 时，目标改从 ``abp_minmax`` 派生（更噪的 segment 极值，
+  非 MD-ViSCo 口径，仅作实验对照）。
 * ``demographics``: ``(6,)`` float32 = ``[age_z, gender, height_z, weight_z, bmi_z, mask]``
 * ``abp_minmax``: ``(2,)`` float32 = ``(dbp_seg, sbp_seg)`` —— 本段 ABP 做 min-max
   归一化时用的逐段原始极值（``abp.min()`` / ``abp.max()``，mmHg）。eval 用它精确
-  反归一化、还原 **raw ABP** 作为指标 target；也作为 ``segment_minmax`` 目标 +
-  WCL 波形项的 raw SBP/DBP 权重来源。注意它是 segment 极值，与 ``sbp_dbp``
-  的 per-cycle-mean 定义不同。
+  反归一化、还原 **raw ABP** 作为指标 target；也作为 ``segment_minmax`` 目标来源。
+  注意它是 segment 极值，与 ``sbp_dbp`` 的 PulseDB 标签定义不同。
 * ``age_raw``: ``(1,)`` float32 —— raw 年龄（岁，缺失→均值），供 MD-ViSCo
   WCL ``text_age_wcl`` 项（阈值 0.0235@temp_w=4 ⇔ "年龄差 ≤ ~15 岁"，须 raw
   单位）。非 WCL 消费方忽略这一项。

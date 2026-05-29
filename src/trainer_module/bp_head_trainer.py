@@ -146,20 +146,29 @@ def _resolve_target(
 
 
 def _wcl_weights(
-    abp_minmax: Tensor,
+    sbp_dbp: Tensor,
     demographics: Tensor | None,
     age_raw: Tensor | None,
+    bp_norm: BPLabelNorm | None = None,
 ) -> dict[str, Tensor]:
     """Build the raw-label weight dict for :func:`multi_wcl`.
 
-    Waveform terms weight by raw mmHg SBP/DBP (= per-segment extrema in
-    ``abp_minmax``); PI terms by raw gender (``demographics[:, 1]``) and raw
-    age (years). Missing inputs simply omit their keys, so ``multi_wcl`` skips
-    the corresponding terms.
+    Waveform terms weight by raw mmHg SBP/DBP from the PulseDB CSV labels
+    ``sbp_dbp`` (column order ``(SBP, DBP)``) — matching MD-ViSCo's
+    ``y_sbp_raw = get_sbp(bp_raw)`` (it weights by the same PulseDB SegSBP/SegDBP
+    field, never by per-segment waveform extrema). ``sbp_dbp`` arrives in *label
+    space* (normalized to ``[0, 1]`` when ``bp_norm`` is set), so it is
+    denormalized back to **raw mmHg** here: the WCL kernel
+    ``exp(-|w_i - w_j| / temperature_weight)`` uses ``temperature_weight=1.0``
+    calibrated for mmHg (MD-ViSCo), and feeding normalized values would soften it
+    by the ``bp_norm.scale`` factor (~140×) and wash out the SBP/DBP structure.
+    PI terms weight by raw gender (``demographics[:, 1]``) and raw age (years).
+    Missing inputs simply omit their keys, so ``multi_wcl`` skips them.
     """
+    sbp_dbp_mmhg = bp_norm.denormalize(sbp_dbp) if bp_norm is not None else sbp_dbp
     weights: dict[str, Tensor] = {
-        "y_sbp_raw": abp_minmax[:, 1],
-        "y_dbp_raw": abp_minmax[:, 0],
+        "y_sbp_raw": sbp_dbp_mmhg[:, 0],
+        "y_dbp_raw": sbp_dbp_mmhg[:, 1],
     }
     if demographics is not None:
         weights["gender_raw"] = demographics[:, 1]
@@ -372,6 +381,7 @@ def _evaluate_wcl(
     active_vitals: Sequence[str],
     terms: tuple[WCLTerm, ...],
     amp_enabled: bool,
+    bp_norm: BPLabelNorm | None = None,
     max_batches: int | None = None,
 ) -> float:
     """Mean total multi-WCL loss over the val set.
@@ -384,16 +394,16 @@ def _evaluate_wcl(
     core.eval()
     total, n_batches = 0.0, 0
     for batch_idx, batch in enumerate(val_loader):
-        signal, _, demographics, abp_minmax, age_raw = _unpack_batch(batch, device)
-        if abp_minmax is None:
-            raise RuntimeError("WCL eval needs abp_minmax (batch[3]) for raw weights.")
+        signal, sbp_dbp, demographics, _, age_raw = _unpack_batch(batch, device)
         with torch.autocast(
             device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled
         ):
             emb = core.encode_embeddings(
                 signal[:, :2, :], demographics, active_vitals=active_vitals
             )
-        wcl_total, _ = multi_wcl(emb, _wcl_weights(abp_minmax, demographics, age_raw), terms)
+        wcl_total, _ = multi_wcl(
+            emb, _wcl_weights(sbp_dbp, demographics, age_raw, bp_norm), terms
+        )
         total += float(wcl_total.item())
         n_batches += 1
         if max_batches is not None and (batch_idx + 1) >= max_batches:
@@ -577,7 +587,7 @@ def train(
                         signal[:, :2, :], demographics, active_vitals=active_vitals
                     )
                     wcl_total, wcl_vals = multi_wcl(
-                        emb, _wcl_weights(abp_minmax, demographics, age_raw), wcl_terms
+                        emb, _wcl_weights(sbp_dbp, demographics, age_raw, bp_norm), wcl_terms
                     )
                 else:  # "l1+wcl"
                     pred, emb = core(
@@ -586,7 +596,7 @@ def train(
                     )
                     l1 = (pred - target).abs().mean()
                     wcl_total, wcl_vals = multi_wcl(
-                        emb, _wcl_weights(abp_minmax, demographics, age_raw), wcl_terms
+                        emb, _wcl_weights(sbp_dbp, demographics, age_raw, bp_norm), wcl_terms
                     )
                 # MD-ViSCo L_ref = L1 + wcl_weight * WCL (wcl_weight=1.0 for the
                 # wcl_only stage; raw wcl_total is still logged for comparability).
@@ -683,7 +693,7 @@ def train(
                 sel = _evaluate_wcl(
                     model, val_loader, device,
                     active_vitals=active_vitals, terms=wcl_terms,
-                    amp_enabled=amp_enabled,
+                    amp_enabled=amp_enabled, bp_norm=bp_norm,
                 )
                 row["val_loss_mean"] = sel
                 epoch_metrics["val/loss_mean"] = sel
