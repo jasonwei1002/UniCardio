@@ -113,6 +113,21 @@ def test_dataset_returns_five_tuple_with_age(synthetic_data):
     assert abp_minmax[0] <= abp_minmax[1]
 
 
+def test_resolve_wcl_weight():
+    """MD-ViSCo L_ref = L1 + wcl_weight * WCL: weight applies only to l1+wcl."""
+    rww = bp_head_trainer._resolve_wcl_weight
+    # l1+wcl: default 0.2, and honors an explicit override.
+    assert rww({"wcl": {}}, "l1+wcl") == pytest.approx(0.2)
+    assert rww({"wcl": {"weight": 0.5}}, "l1+wcl") == pytest.approx(0.5)
+    # Non-finetune modes optimize pure WCL (or pure L1) -> coefficient 1.0,
+    # regardless of any configured weight (it would only be LR-absorbed).
+    assert rww({"wcl": {"weight": 0.5}}, "wcl_only") == pytest.approx(1.0)
+    assert rww({"wcl": {"weight": 0.5}}, "l1") == pytest.approx(1.0)
+    # Negative weight is rejected (matches MD-ViSCo's non-negative validation).
+    with pytest.raises(ValueError):
+        rww({"wcl": {"weight": -0.1}}, "l1+wcl")
+
+
 @pytest.mark.parametrize(
     "wcl_enabled,contrastive_only,expected_mode",
     [(False, True, "l1"), (True, True, "wcl_only"), (True, False, "l1+wcl")],

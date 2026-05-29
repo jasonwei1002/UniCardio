@@ -20,7 +20,8 @@ Loss mode (MD-ViSCo §6.2.2, ``L_ref = L_MAE + L_WCL``), resolved from
 - ``wcl_only`` — self-supervised contrastive pretraining (stage-1): only the
   multi-WCL terms, training the encoders/projection + demo MLP (skips the
   fusion encoders + MlpBP heads). Selected by min val WCL loss.
-- ``l1+wcl`` — L1 + multi-WCL (stage-2 finetune). Selected by min val L1.
+- ``l1+wcl`` — ``L1 + trainer.wcl.weight * multi-WCL`` (stage-2 finetune;
+  ``weight`` defaults to MD-ViSCo's 0.2). Selected by min val L1.
 
 Batch contract (5-tuple): each batch is ``(signal: (B, 3, L), sbp_dbp: (B, 2),
 demographics: (B, 6), abp_minmax: (B, 2), age_raw: (B, 1))``. The trainer slices
@@ -93,6 +94,24 @@ def _wcl_terms(cfg: Mapping[str, Any]) -> tuple[WCLTerm, ...]:
     if not raw:
         return DEFAULT_WCL_TERMS
     return tuple(WCLTerm(**dict(t)) for t in raw)
+
+
+def _resolve_wcl_weight(cfg: Mapping[str, Any], loss_mode: str) -> float:
+    """Global WCL coefficient for ``loss = L1 + weight * WCL`` (the optimized loss).
+
+    Mirrors MD-ViSCo's ``L_ref = regression_weight * L1 + wcl_weight * WCL``
+    (``multi_regression_multi_wcl_loss.py``; ``wcl_weight`` defaults to 0.2).
+    The coefficient applies only to the ``l1+wcl`` finetune stage — ``wcl_only``
+    contrastive pretraining optimizes pure WCL (a constant scale is absorbed by
+    the LR there), so it returns ``1.0`` for any non-``l1+wcl`` mode. Per-term
+    ``scale_factor`` (1e-3/1e-2) is separate and lives inside the WCL terms.
+    """
+    if loss_mode != "l1+wcl":
+        return 1.0
+    weight = float((cfg.get("wcl", {}) or {}).get("weight", 0.2))
+    if weight < 0:
+        raise ValueError(f"trainer.wcl.weight must be non-negative; got {weight}")
+    return weight
 
 
 def _segment_minmax_target(abp_minmax: Tensor, bp_norm: BPLabelNorm | None) -> Tensor:
@@ -478,13 +497,14 @@ def train(
         )
     loss_mode = _resolve_loss_mode(cfg_dict, stage)
     wcl_terms = _wcl_terms(cfg_dict) if loss_mode != "l1" else ()
+    wcl_weight = _resolve_wcl_weight(cfg_dict, loss_mode)
     # WCL forward paths return a dict of embeddings; route them through the
     # unwrapped module so torch.compile (which dislikes dict outputs) is bypassed
     # only for those calls. The pure-L1 path keeps the (compiled) ``model``.
     core = unwrap_model(model)
     logger.info(
-        "BP head loss_mode=%s | bp_label_source=%s | wcl_terms=%d",
-        loss_mode, bp_label_source, len(wcl_terms),
+        "BP head loss_mode=%s | bp_label_source=%s | wcl_terms=%d | wcl_weight=%.3g",
+        loss_mode, bp_label_source, len(wcl_terms), wcl_weight,
     )
 
     optimizer = _build_optimizer(model, cfg_dict)
@@ -568,7 +588,9 @@ def train(
                     wcl_total, wcl_vals = multi_wcl(
                         emb, _wcl_weights(abp_minmax, demographics, age_raw), wcl_terms
                     )
-                loss = l1 + wcl_total
+                # MD-ViSCo L_ref = L1 + wcl_weight * WCL (wcl_weight=1.0 for the
+                # wcl_only stage; raw wcl_total is still logged for comparability).
+                loss = l1 + wcl_weight * wcl_total
             loss.backward()
             if grad_clip_norm > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)

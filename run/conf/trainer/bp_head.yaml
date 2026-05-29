@@ -51,7 +51,14 @@ bp_task: ecgppg2abp
 # DEFAULT_WCL_TERMS (src/trainer_module/wcl.py); override via `wcl.terms`
 # (list of {name, embedding_key, weight_key, temperature_embeddings,
 # temperature_weight, threshold, scale_factor}).
+#
+# `weight` is the global WCL coefficient in L_ref = L_MAE + weight * L_WCL
+# (MD-ViSCo multi_regression_multi_wcl_loss.py: regression_weight=1.0,
+# wcl_weight=0.2). Applied ONLY in the l1+wcl finetune stage; the wcl_only
+# contrastive-pretraining stage optimizes pure WCL (a constant scale there is
+# absorbed by the LR). Per-term scale_factors (1e-3/1e-2) live inside the terms.
 wcl:
   enabled: true
   pretrain_contrastive_only: true
+  weight: 0.2
   terms: null
