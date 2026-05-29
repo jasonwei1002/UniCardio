@@ -11,6 +11,13 @@
 #   - best.pt 按 val WCL loss 选（heads 未训，BP 指标此阶段无意义）。
 #   - 关掉 WCL（trainer.wcl.enabled=false）即回退旧的纯 L1 监督预训练。
 #
+# 超参锚点（MD-ViSCo, IEEE JBHI 2026, 正文 Sec III 末）：
+#   batch size = 2048, lr = 1e-3, scheduler patience 3, early-stop 5, max 30K steps。
+#   WCL 波形项核 exp(-|ΔmmHg|/1) 很尖，小 batch 正样本饿（512→有效正样本~29，
+#   2048→~114），故对比预训练吃大 batch；这里走 wcl_only 路径（跳过 fusion/MlpBP 头）
+#   较轻，2048 可行。若 OOM 退 data.batch_size=1024。lr 保持 1e-3 不要随 batch 上调
+#   （原文就是 2048+1e-3）。
+#
 # 用法：
 #   bash train_bp_head.sh
 #   bash train_bp_head.sh trainer.lr=5e-4 trainer.epochs=50
@@ -30,7 +37,7 @@ python run/pipeline/train_bp_head.py \
     trainer.lr=1.0e-3 \
     trainer.epochs=100 \
     device=cuda \
-    data.batch_size=512 \
+    data.batch_size=2048 \
     data.num_workers=12 \
     swanlab.experiment_name=bp_head_pretrain \
     "$@" \

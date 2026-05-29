@@ -10,6 +10,11 @@
 #   - 训练完成后自动在 10% test split 上跑一次 BP MAE 评估
 #     （目标按 data.bp_label_source，默认 segment_minmax = 对齐 MD-ViSCo）。
 #
+# 超参锚点（MD-ViSCo, IEEE JBHI 2026, 正文 Sec III 末）：batch size = 2048。
+#   注意：stage-2 走全模型路径（fusion + MlpBP 头都参与），比 stage-1 的 wcl_only
+#   重，2048 更易 OOM——若 OOM 退 data.batch_size=1024。lr 用 1e-4（finetune，
+#   低于 pretrain 的 1e-3，属正常微调档）。
+#
 # 用法：
 #   bash finetune_bp_head.sh <pretrain_ckpt>
 #   bash finetune_bp_head.sh <pretrain_ckpt> trainer.lr=5e-5 trainer.epochs=80
@@ -38,7 +43,7 @@ python run/pipeline/train_bp_head.py \
     trainer.lr=1.0e-4 \
     trainer.epochs=100 \
     device=cuda \
-    data.batch_size=512 \
+    data.batch_size=2048 \
     data.num_workers=8 \
     swanlab.experiment_name=bp_head_finetune_calfree \
     "$@" \
