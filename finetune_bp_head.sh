@@ -40,10 +40,10 @@ echo "Extra overrides: $*" | tee -a "$LOG_FILE"
 python run/pipeline/train_bp_head.py \
     trainer.stage=finetune \
     trainer.init_from="$CHECKPOINT" \
-    trainer.lr=1.0e-4 \
+    trainer.lr=5.0e-4 \
     trainer.epochs=100 \
     device=cuda \
-    data.batch_size=2048 \
+    data.batch_size=1024 \
     data.num_workers=8 \
     swanlab.experiment_name=bp_head_finetune_calfree \
     "$@" \
